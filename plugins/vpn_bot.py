@@ -7,6 +7,7 @@ from uuid import uuid4, uuid5, NAMESPACE_DNS
 import http.server
 import csv
 import ipaddress
+import base64
 import json
 import logging
 import re
@@ -97,6 +98,9 @@ class ServerConfig:
     verify_ssl: bool = True
     sub_port: int = 2096
     subscription_url_base: str = ""  # хост для subscription URL, пусто = address
+    temp_profile_enabled: bool = False
+    temp_profile_port: int = 8081
+    temp_inbound_id: int = 0
 
 
 @dataclass
@@ -311,6 +315,9 @@ class VPNStorage:
             "verify_ssl": server.verify_ssl,
             "sub_port": server.sub_port,
             "subscription_url_base": server.subscription_url_base,
+            "temp_profile_enabled": server.temp_profile_enabled,
+            "temp_profile_port": server.temp_profile_port,
+            "temp_inbound_id": server.temp_inbound_id,
         }
         self.save_config()
 
@@ -514,12 +521,30 @@ class VPNStorage:
 
     def _sub_from_dict(self, data: dict[str, Any]) -> Subscription:
         fields = {f for f in Subscription.__dataclass_fields__}
-        return Subscription(**{k: v for k, v in data.items() if k in fields})
+        filtered = {k: v for k, v in data.items() if k in fields}
+        now = time.time()
+        min_ts = 1577836800.0  # 2020-01-01
+        max_ts = now + 10 * 365 * 86400
+        created = filtered.get("created_at")
+        if not isinstance(created, (int, float)) or created < min_ts or created > max_ts:
+            filtered["created_at"] = now
+        expires = filtered.get("expires_at")
+        if not isinstance(expires, (int, float)) or expires < min_ts or expires > max_ts:
+            filtered["expires_at"] = filtered["created_at"] + 3 * 86400
+        return Subscription(**filtered)
 
     def active_subscriptions(self, user_id: int) -> list[Subscription]:
         out = []
         for sub in self.subscriptions["subs"].values():
             if sub.get("user_id") == user_id and sub.get("active") and not self._sub_from_dict(sub).is_expired:
+                out.append(self._sub_from_dict(sub))
+        out.sort(key=lambda s: s.expires_at, reverse=True)
+        return out
+
+    def active_subscriptions_all(self) -> list[Subscription]:
+        out = []
+        for sub in self.subscriptions["subs"].values():
+            if sub.get("active") and not self._sub_from_dict(sub).is_expired:
                 out.append(self._sub_from_dict(sub))
         out.sort(key=lambda s: s.expires_at, reverse=True)
         return out
@@ -1250,6 +1275,221 @@ class DeviceAuthServer:
             self._thread.join(timeout=5)
 
 
+TEMP_SESSIONS: dict[str, dict[str, Any]] = {}
+TEMP_LOCK = threading.RLock()
+_temp_profile_server: "TempProfileServer | None" = None
+
+
+class TempProfileHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP-эндпоинт для 30-минутных временных VLESS профилей."""
+
+    def _text_response(self, status: int, text: str, content_type: str = "text/html; charset=utf-8") -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, url: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.end_headers()
+
+    def _get_session_id(self) -> str | None:
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) == 2 and kv[0] == "temp_session":
+                return kv[1]
+        return None
+
+    def _set_session_cookie(self, session_id: str) -> None:
+        self.send_header("Set-Cookie", f"temp_session={session_id}; Path=/; Max-Age=1800")
+
+    def _create_temp_session(self) -> dict[str, Any]:
+        server = storage.server()
+        session_id = str(uuid4())
+        email = f"temp_{session_id}"
+        xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
+        client_uuid = str(uuid4())
+        now = time.time()
+        expires_at = now + 30 * 60
+        inbound_id = server.temp_inbound_id if server.temp_inbound_id else server.inbound_id
+        expiry_ms = XrayAPI._timestamp_to_xray_ms(expires_at)
+        XrayAPI.add_or_update_client_raw(
+            client_uuid=client_uuid,
+            email=email,
+            xray_sub_id=xray_sub_id,
+            expiry_ms=expiry_ms,
+            enable=True,
+            inbound_id=inbound_id,
+        )
+        session = {
+            "session_id": session_id,
+            "email": email,
+            "xray_sub_id": xray_sub_id,
+            "client_uuid": client_uuid,
+            "inbound_id": inbound_id,
+            "expires_at": expires_at,
+        }
+        with TEMP_LOCK:
+            TEMP_SESSIONS[session_id] = session
+        return session
+
+    def _get_or_create_session(self) -> dict[str, Any] | None:
+        session_id = self._get_session_id()
+        with TEMP_LOCK:
+            session = TEMP_SESSIONS.get(session_id) if session_id else None
+        if session and session["expires_at"] > time.time():
+            return session
+        try:
+            return self._create_temp_session()
+        except Exception:
+            logger.exception("TempProfileHandler create session error")
+        return None
+
+    def _render_page(self, session: dict[str, Any]) -> str:
+        server = storage.server()
+        vless_url = generate_vless_url_raw(
+            session["client_uuid"], session["email"], session["xray_sub_id"], server
+        )
+        sub_url = generate_subscription_url_raw(session["xray_sub_id"], server)
+        expires = datetime.fromtimestamp(session["expires_at"]).strftime("%H:%M:%S")
+        qr_bytes = _generate_qr_code(vless_url)
+        qr_b64 = base64.b64encode(qr_bytes).decode("ascii") if qr_bytes else ""
+        qr_img = f'<img src="data:image/png;base64,{qr_b64}" alt="QR" style="max-width:280px;">' if qr_b64 else ""
+        return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Пробный VPN 30 минут</title>
+<style>
+body {{ font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f5f5f5; }}
+.box {{ background: #fff; border-radius: 12px; padding: 20px; max-width: 420px; margin: auto; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+a.button {{ display: inline-block; margin: 8px 4px; padding: 12px 18px; background: #28a745; color: #fff; text-decoration: none; border-radius: 8px; }}
+a.link {{ display: block; margin: 10px 0; word-break: break-all; color: #007bff; }}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>Бесплатный VPN 30 минут</h1>
+<p>Действует до: <b>{expires}</b></p>
+{qr_img}
+<br>
+<a class="button" href="{vless_url}">Подключиться (VLESS)</a>
+<a class="button" href="{sub_url}">Подписка</a>
+<br>
+<a class="link" href="{vless_url}">{vless_url}</a>
+<p>1. Установите v2rayNG / V2Box / Streisand.<br>2. Отсканируйте QR или нажмите кнопку.</p>
+</div>
+</body>
+</html>"""
+
+    def do_GET(self) -> None:
+        path = self.path.split("?")[0]
+        if path == "/health":
+            self._text_response(200, "ok", "text/plain")
+            return
+        if path == "/favicon.ico":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if path.startswith("/sub/"):
+            self._serve_sub(path)
+            return
+        session = self._get_or_create_session()
+        if not session:
+            self._text_response(500, "Не удалось создать временный профиль. Проверьте настройки 3X-UI.")
+            return
+        html = self._render_page(session)
+        self.send_response(200)
+        self._set_session_cookie(session["session_id"])
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+    def _serve_sub(self, path: str) -> None:
+        # /sub/<session_id> or use cookie
+        session_id = self._get_session_id()
+        with TEMP_LOCK:
+            session = TEMP_SESSIONS.get(session_id) if session_id else None
+        if not session:
+            parts = path.split("/")
+            session_id = parts[-1] if len(parts) >= 2 else ""
+            with TEMP_LOCK:
+                session = TEMP_SESSIONS.get(session_id)
+        if not session or session["expires_at"] <= time.time():
+            self._text_response(403, "Профиль истёк или не найден.", "text/plain")
+            return
+        server = storage.server()
+        vless_url = generate_vless_url_raw(
+            session["client_uuid"], session["email"], session["xray_sub_id"], server
+        )
+        text = f"{vless_url}\n"
+        self._text_response(200, text, "text/plain; charset=utf-8")
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        logger.debug(fmt, *args)
+
+
+class TempProfileServer:
+    """Фоновый HTTP-сервер временных 30-минутных профилей."""
+
+    def __init__(self, port: int = 8081) -> None:
+        self.port = port
+        self._server: socketserver.ThreadingTCPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        try:
+            self._server = socketserver.ThreadingTCPServer(("0.0.0.0", self.port), TempProfileHandler)
+        except OSError as e:
+            logger.error("TempProfileServer cannot bind to port %s: %s", self.port, e)
+            return
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+        logger.info("TempProfileServer started on port %s", self.port)
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop.is_set():
+            self._cleanup_expired()
+            self._stop.wait(60)
+
+    def _cleanup_expired(self) -> None:
+        now = time.time()
+        with TEMP_LOCK:
+            expired = [sid for sid, s in TEMP_SESSIONS.items() if s["expires_at"] <= now]
+        for sid in expired:
+            session = TEMP_SESSIONS.pop(sid, {})
+            email = session.get("email")
+            inbound_id = session.get("inbound_id")
+            if email:
+                try:
+                    XrayAPI.remove_client_by_email(email, inbound_id)
+                    logger.info("TempProfileServer removed expired profile %s", email)
+                except Exception:
+                    logger.exception("TempProfileServer cleanup error for %s", email)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread:
+            self._thread.join(timeout=5)
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=5)
+
+
 class StarsPayment:
     """Реальная отправка инвойса Telegram Stars."""
 
@@ -1362,61 +1602,56 @@ class XrayAPI:
             sub.xray_sub_id = str(uuid5(NAMESPACE_DNS, sub.email))
 
     @staticmethod
-    def _expiry_ms(sub: Subscription) -> int:
+    def _timestamp_to_xray_ms(ts: float) -> int:
         now = time.time()
-        ts = sub.effective_expires_at
         if ts <= now:
             return 0
-        # 3X-UI хранит expiryTime в миллисекундах
         ms = int(ts * 1000)
         if ms < 1577836800000 or ms > 2000000000000:
             return 0
         return ms
 
     @staticmethod
-    def add_or_update_client(sub: Subscription, enable: bool = True) -> bool:
-        server = storage.server()
-        if not server.panel_url:
-            logger.info("3X-UI panel URL not configured, skipping client sync for sub #%s", sub.sub_id)
-            return False
-        XrayAPI._ensure_email_and_sub_id(sub)
-        session = requests.Session()
-        if not XrayAPI._login(session, server):
-            logger.error("3X-UI login failed for sub #%s", sub.sub_id)
-            return False
-        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
-        if not inbound:
-            logger.error("3X-UI inbound %s not found for sub #%s", server.inbound_id, sub.sub_id)
-            return False
+    def _expiry_ms(sub: Subscription) -> int:
+        return XrayAPI._timestamp_to_xray_ms(sub.effective_expires_at)
+
+    @staticmethod
+    def _build_client_data(
+        client_uuid: str,
+        email: str,
+        xray_sub_id: str,
+        expiry_ms: int,
+        enable: bool,
+        server: ServerConfig,
+        flow: str,
+    ) -> dict[str, Any]:
+        return {
+            "id": client_uuid,
+            "flow": flow,
+            "email": email,
+            "limitIp": 0,
+            "totalGB": 0,
+            "expiryTime": expiry_ms,
+            "enable": enable,
+            "tgId": "",
+            "subId": xray_sub_id,
+            "reset": 0,
+            "fingerprint": server.fingerprint,
+            "publicKey": server.public_key,
+            "shortId": server.short_id,
+            "spiderX": server.spider_x,
+        }
+
+    @staticmethod
+    def _update_inbound_clients(
+        session: requests.Session,
+        server: ServerConfig,
+        inbound_id: int,
+        inbound: dict[str, Any],
+        clients: list[dict[str, Any]],
+    ) -> bool:
         try:
             settings = json.loads(inbound.get("settings", "{}"))
-            clients = settings.get("clients", [])
-            flow = XrayAPI._get_flow_from_inbound(inbound)
-            expiry_ms = XrayAPI._expiry_ms(sub) if enable else 0
-            client_data = {
-                "id": sub.client_uuid,
-                "flow": flow,
-                "email": sub.email,
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": expiry_ms,
-                "enable": enable,
-                "tgId": "",
-                "subId": sub.xray_sub_id,
-                "reset": 0,
-                "fingerprint": server.fingerprint,
-                "publicKey": server.public_key,
-                "shortId": server.short_id,
-                "spiderX": server.spider_x,
-            }
-            updated = False
-            for c in clients:
-                if c.get("email") == sub.email:
-                    c.update(client_data)
-                    updated = True
-                    break
-            if not updated:
-                clients.append(client_data)
             settings["clients"] = clients
             update_data = {
                 "up": inbound.get("up", 0),
@@ -1433,13 +1668,115 @@ class XrayAPI:
                 "sniffing": inbound.get("sniffing", "{}"),
                 "allocate": inbound.get("allocate", ""),
             }
-            if XrayAPI._update_inbound(session, server, server.inbound_id, update_data):
-                sub.xray_synced = True
-                storage.update_subscription(sub)
-                logger.info("3X-UI client synced for sub #%s (email=%s)", sub.sub_id, sub.email)
-                return True
+            return XrayAPI._update_inbound(session, server, inbound_id, update_data)
         except Exception:
-            logger.exception("3X-UI add_or_update_client error for sub #%s", sub.sub_id)
+            logger.exception("3X-UI _update_inbound_clients error")
+        return False
+
+    @staticmethod
+    def get_clients(inbound_id: int | None = None) -> list[dict[str, Any]]:
+        server = storage.server()
+        if not server.panel_url:
+            return []
+        if inbound_id is None:
+            inbound_id = server.inbound_id
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return []
+        inbound = XrayAPI._get_inbound(session, server, inbound_id)
+        if not inbound:
+            return []
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            return settings.get("clients", [])
+        except Exception:
+            logger.exception("3X-UI get_clients error")
+        return []
+
+    @staticmethod
+    def add_or_update_client_raw(
+        client_uuid: str,
+        email: str,
+        xray_sub_id: str,
+        expiry_ms: int,
+        enable: bool = True,
+        inbound_id: int | None = None,
+    ) -> bool:
+        server = storage.server()
+        if not server.panel_url:
+            return False
+        if inbound_id is None:
+            inbound_id = server.inbound_id
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return False
+        inbound = XrayAPI._get_inbound(session, server, inbound_id)
+        if not inbound:
+            return False
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            flow = XrayAPI._get_flow_from_inbound(inbound)
+            client_data = XrayAPI._build_client_data(
+                client_uuid, email, xray_sub_id, expiry_ms, enable, server, flow
+            )
+            updated = False
+            for c in clients:
+                if c.get("email") == email:
+                    c.update(client_data)
+                    updated = True
+                    break
+            if not updated:
+                clients.append(client_data)
+            return XrayAPI._update_inbound_clients(session, server, inbound_id, inbound, clients)
+        except Exception:
+            logger.exception("3X-UI add_or_update_client_raw error (email=%s)", email)
+        return False
+
+    @staticmethod
+    def remove_client_by_email(email: str, inbound_id: int | None = None) -> bool:
+        server = storage.server()
+        if not server.panel_url or not email:
+            return False
+        if inbound_id is None:
+            inbound_id = server.inbound_id
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return False
+        inbound = XrayAPI._get_inbound(session, server, inbound_id)
+        if not inbound:
+            return False
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            new_clients = [c for c in clients if c.get("email") != email]
+            if len(new_clients) == len(clients):
+                return True
+            return XrayAPI._update_inbound_clients(session, server, inbound_id, inbound, new_clients)
+        except Exception:
+            logger.exception("3X-UI remove_client_by_email error (email=%s)", email)
+        return False
+
+    @staticmethod
+    def add_or_update_client(sub: Subscription, enable: bool = True) -> bool:
+        server = storage.server()
+        if not server.panel_url:
+            logger.info("3X-UI panel URL not configured, skipping client sync for sub #%s", sub.sub_id)
+            return False
+        XrayAPI._ensure_email_and_sub_id(sub)
+        expiry_ms = XrayAPI._expiry_ms(sub) if enable else 0
+        if XrayAPI.add_or_update_client_raw(
+            sub.client_uuid,
+            sub.email,
+            sub.xray_sub_id,
+            expiry_ms,
+            enable,
+            server.inbound_id,
+        ):
+            sub.xray_synced = True
+            storage.update_subscription(sub)
+            logger.info("3X-UI client synced for sub #%s (email=%s)", sub.sub_id, sub.email)
+            return True
         return False
 
     @staticmethod
@@ -1447,41 +1784,11 @@ class XrayAPI:
         server = storage.server()
         if not server.panel_url or not sub.email:
             return False
-        session = requests.Session()
-        if not XrayAPI._login(session, server):
-            return False
-        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
-        if not inbound:
-            return False
-        try:
-            settings = json.loads(inbound.get("settings", "{}"))
-            clients = settings.get("clients", [])
-            new_clients = [c for c in clients if c.get("email") != sub.email]
-            if len(new_clients) == len(clients):
-                return True  # не найден — считаем удалённым
-            settings["clients"] = new_clients
-            update_data = {
-                "up": inbound.get("up", 0),
-                "down": inbound.get("down", 0),
-                "total": inbound.get("total", 0),
-                "remark": inbound.get("remark", ""),
-                "enable": inbound.get("enable", True),
-                "expiryTime": inbound.get("expiryTime", 0),
-                "listen": inbound.get("listen", ""),
-                "port": inbound.get("port", 0),
-                "protocol": inbound.get("protocol", "vless"),
-                "settings": json.dumps(settings, indent=2),
-                "streamSettings": inbound.get("streamSettings", "{}"),
-                "sniffing": inbound.get("sniffing", "{}"),
-                "allocate": inbound.get("allocate", ""),
-            }
-            if XrayAPI._update_inbound(session, server, server.inbound_id, update_data):
-                sub.xray_synced = False
-                storage.update_subscription(sub)
-                logger.info("3X-UI client removed for sub #%s", sub.sub_id)
-                return True
-        except Exception:
-            logger.exception("3X-UI remove_client error for sub #%s", sub.sub_id)
+        if XrayAPI.remove_client_by_email(sub.email, server.inbound_id):
+            sub.xray_synced = False
+            storage.update_subscription(sub)
+            logger.info("3X-UI client removed for sub #%s", sub.sub_id)
+            return True
         return False
 
     @staticmethod
@@ -1522,12 +1829,74 @@ class XrayAPI:
             return {"upload": int(inbound.get("up", 0)), "download": int(inbound.get("down", 0))}
         return {"upload": 0, "download": 0}
 
+    @staticmethod
+    def sync_subscriptions() -> dict[str, Any]:
+        """Сравнивает активные подписки в JSON и клиентов в 3X-UI."""
+        result: dict[str, Any] = {"ok": [], "mismatch": [], "missing": [], "orphan": []}
+        server = storage.server()
+        if not server.panel_url:
+            result["error"] = "3X-UI panel URL not configured"
+            return result
+        clients = XrayAPI.get_clients(server.inbound_id)
+        by_email = {c.get("email"): c for c in clients if c.get("email")}
+        for sub in storage.active_subscriptions_all():
+            XrayAPI._ensure_email_and_sub_id(sub)
+            client = by_email.pop(sub.email, None)
+            if not client:
+                result["missing"].append({"sub_id": sub.sub_id, "email": sub.email})
+                continue
+            xray_ms = client.get("expiryTime", 0) or 0
+            expected_ms = XrayAPI._expiry_ms(sub)
+            if expected_ms and abs(xray_ms - expected_ms) > 60000:
+                result["mismatch"].append({
+                    "sub_id": sub.sub_id,
+                    "email": sub.email,
+                    "xray": xray_ms,
+                    "expected": expected_ms,
+                })
+            else:
+                result["ok"].append({"sub_id": sub.sub_id, "email": sub.email})
+        # Оставшиеся клиенты, которых нет в активных подписках
+        result["orphan"] = [{"email": email, "id": c.get("id")} for email, c in by_email.items()]
+        return result
+
+    @staticmethod
+    def fix_subscriptions() -> dict[str, Any]:
+        """Добавляет/обновляет клиентов в 3X-UI по актуальным подпискам."""
+        result = {"added": 0, "updated": 0, "failed": 0, "details": []}
+        server = storage.server()
+        if not server.panel_url:
+            return result
+        for sub in storage.active_subscriptions_all():
+            XrayAPI._ensure_email_and_sub_id(sub)
+            was_synced = sub.xray_synced
+            ok = XrayAPI.add_or_update_client(sub)
+            if ok:
+                if was_synced:
+                    result["updated"] += 1
+                else:
+                    result["added"] += 1
+            else:
+                result["failed"] += 1
+        storage.save_subscriptions()
+        return result
+
 
 def generate_vless_url(sub: Subscription, server: ServerConfig) -> str:
     """Собирает vless:// ссылку по данным подписки и сервера."""
+    return generate_vless_url_raw(
+        client_uuid=sub.client_uuid,
+        email=sub.email,
+        xray_sub_id=sub.xray_sub_id,
+        server=server,
+    )
+
+
+def generate_vless_url_raw(client_uuid: str, email: str, xray_sub_id: str, server: ServerConfig) -> str:
+    """Собирает vless:// ссылку по сырым параметрам."""
     host = server.address
     sni = server.server_name or host
-    remark = f"{server.server_name or 'VPN'}-{sub.email}"
+    remark = f"{server.server_name or 'VPN'}-{email}"
     params = {
         "type": server.network,
         "security": server.security,
@@ -1538,14 +1907,19 @@ def generate_vless_url(sub: Subscription, server: ServerConfig) -> str:
         "spx": server.spider_x,
     }
     query = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"vless://{sub.client_uuid}@{host}:{server.port}?{query}#{remark}"
+    return f"vless://{client_uuid}@{host}:{server.port}?{query}#{remark}"
 
 
 def generate_subscription_url(sub: Subscription, server: ServerConfig) -> str:
     """Формирует URL подписки /sub/{subId}."""
+    return generate_subscription_url_raw(sub.xray_sub_id, server)
+
+
+def generate_subscription_url_raw(xray_sub_id: str, server: ServerConfig) -> str:
+    """Формирует URL подписки /sub/{subId} по сырому subId."""
     base = server.subscription_url_base or server.address
     scheme = "https" if server.sub_port == 443 else "http"
-    return f"{scheme}://{base}:{server.sub_port}/sub/{sub.xray_sub_id}"
+    return f"{scheme}://{base}:{server.sub_port}/sub/{xray_sub_id}"
 
 
 def _generate_qr_code(url: str) -> bytes | None:
@@ -1581,6 +1955,7 @@ class UserBot:
         self._scheduler: SubscriptionScheduler | None = None
         self._rates_fetcher: RatesFetcher | None = None
         self._device_auth_server: DeviceAuthServer | None = None
+        self._temp_profile_server: TempProfileServer | None = None
         self._register_handlers()
 
     # ---- state helpers ----
@@ -2722,6 +3097,10 @@ class UserBot:
         self._rates_fetcher.start()
         self._device_auth_server = DeviceAuthServer(storage.config.get("device_auth_port", 8080))
         self._device_auth_server.start()
+        server_cfg = storage.server()
+        if server_cfg.temp_profile_enabled:
+            self._temp_profile_server = TempProfileServer(server_cfg.temp_profile_port)
+            self._temp_profile_server.start()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -2746,6 +3125,8 @@ class UserBot:
             self._rates_fetcher.stop()
         if self._device_auth_server:
             self._device_auth_server.stop()
+        if self._temp_profile_server:
+            self._temp_profile_server.stop()
         if self._thread:
             self._thread.join(timeout=10)
 
@@ -2873,6 +3254,22 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
                 server.subscription_url_base = parts[11]
             storage.set_server(server)
             bot.send_message(m.chat.id, "Сервер и 3X-UI сохранены.")
+        except Exception as e:
+            bot.send_message(m.chat.id, f"Ошибка: {e}")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_temp_profiles(m: Message):
+        parts = m.text.strip().split()
+        if len(parts) < 3:
+            bot.send_message(m.chat.id, "Формат: <code>включено(true/false) порт inbound_id</code>\nПример: <code>true 8081 2</code>")
+            return
+        try:
+            server = storage.server()
+            server.temp_profile_enabled = parts[0].lower() in ("true", "1", "yes", "on")
+            server.temp_profile_port = int(parts[1])
+            server.temp_inbound_id = int(parts[2])
+            storage.set_server(server)
+            bot.send_message(m.chat.id, "Настройки временных профилей сохранены. Перезапустите user-бота.")
         except Exception as e:
             bot.send_message(m.chat.id, f"Ошибка: {e}")
         tg.clear_state(m.chat.id, m.from_user.id)
@@ -3263,6 +3660,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_support, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_support"))
     tg.msg_handler(state_set_crypto_token, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_crypto_token"))
     tg.msg_handler(state_set_server, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_server"))
+    tg.msg_handler(state_set_temp_profiles, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_temp_profiles"))
     tg.msg_handler(state_set_welcome_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_welcome_media"))
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
     tg.msg_handler(state_admin_plan_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_name"))
@@ -3322,6 +3720,8 @@ def _admin_main_keyboard() -> K:
     kb.add(B("Экспорт", callback_data=f"{CB_PREFIX}admin:export"))
     kb.add(B("Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications"))
     kb.add(B("Жалобы", callback_data=f"{CB_PREFIX}admin:complaints"))
+    kb.add(B("Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray"))
+    kb.add(B("Временные профили", callback_data=f"{CB_PREFIX}admin:temp"))
     maintenance = "Вкл" if storage.config.get("maintenance") else "Выкл"
     kb.add(B(f"Тех. работы: {maintenance}", callback_data=f"{CB_PREFIX}admin:maintenance"))
     return kb
@@ -3750,6 +4150,83 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                     kb.add(B(f"Закрыть #{comp.get('id')}", callback_data=f"{CB_PREFIX}admin_close_complaint:{comp.get('id')}"))
             kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            return
+
+        if section == "sync_xray":
+            text = "<b>Синхронизация подписок с 3X-UI</b>\n\nПроверка сверяет JSON-хранилище и клиентов в 3X-UI, исправление добавляет/обновляет недостающих."
+            kb = K()
+            kb.add(B("Проверить", callback_data=f"{CB_PREFIX}admin:sync_check"))
+            kb.add(B("Исправить", callback_data=f"{CB_PREFIX}admin:sync_fix"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            return
+
+        if section == "sync_check":
+            result = XrayAPI.sync_subscriptions()
+            lines = ["<b>Проверка синхронизации</b>"]
+            if "error" in result:
+                lines.append(result["error"])
+            else:
+                lines.append(f"OK: {len(result['ok'])}")
+                lines.append(f"Несовпадение: {len(result['mismatch'])}")
+                for m in result["mismatch"][:5]:
+                    lines.append(f"  #{m['sub_id']} {m['email']}: xray={m['xray']} expected={m['expected']}")
+                lines.append(f"Отсутствуют в 3X-UI: {len(result['missing'])}")
+                for m in result["missing"][:5]:
+                    lines.append(f"  #{m['sub_id']} {m['email']}")
+                lines.append(f"Лишние в 3X-UI: {len(result['orphan'])}")
+                for o in result["orphan"][:5]:
+                    lines.append(f"  {o['email']}")
+            text = "\n".join(lines)[:3500]
+            bot.edit_message_text(text, chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:sync_xray")))
+            return
+
+        if section == "sync_fix":
+            result = XrayAPI.fix_subscriptions()
+            text = (f"<b>Исправление синхронизации</b>\n\n"
+                    f"Добавлено: {result['added']}\n"
+                    f"Обновлено: {result['updated']}\n"
+                    f"Ошибок: {result['failed']}")
+            bot.edit_message_text(text, chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:sync_xray")))
+            return
+
+        if section == "temp":
+            srv = storage.server()
+            url = f"http://{srv.address}:{srv.temp_profile_port}/" if srv.temp_profile_enabled else "—"
+            text = (f"<b>Временные профили (30 мин)</b>\n\n"
+                    f"Статус: {'Вкл' if srv.temp_profile_enabled else 'Выкл'}\n"
+                    f"Порт: {srv.temp_profile_port}\n"
+                    f"Inbound: {srv.temp_inbound_id or 'основной'}\n"
+                    f"URL: <code>{url}</code>\n\n"
+                    f"После изменения перезапустите user-бота.")
+            kb = K()
+            toggle = "Выкл" if srv.temp_profile_enabled else "Вкл"
+            kb.add(B(toggle, callback_data=f"{CB_PREFIX}admin:temp_toggle"))
+            kb.add(B("Изменить", callback_data=f"{CB_PREFIX}admin:temp_edit"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            return
+
+        if section == "temp_toggle":
+            srv = storage.server()
+            srv.temp_profile_enabled = not srv.temp_profile_enabled
+            storage.set_server(srv)
+            status = "Вкл" if srv.temp_profile_enabled else "Выкл"
+            bot.edit_message_text(f"Временные профили: {status}. Перезапустите user-бота.", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:temp")))
+            return
+
+        if section == "temp_edit":
+            srv = storage.server()
+            text = (f"<b>Настройки временных профилей</b>\n\n"
+                    f"Текущие: <code>{'true' if srv.temp_profile_enabled else 'false'} {srv.temp_profile_port} {srv.temp_inbound_id or 0}</code>\n\n"
+                    f"Отправьте: <code>включено(true/false) порт inbound_id</code>\n"
+                    f"0 в inbound_id означает использование основного inbound.")
+            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:temp"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_temp_profiles")
             return
 
         if section == "maintenance":
