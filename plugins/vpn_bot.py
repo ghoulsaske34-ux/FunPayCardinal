@@ -79,6 +79,8 @@ _user_bot_instance: "UserBot | None" = None
 
 @dataclass
 class ServerConfig:
+    host_id: str = "main"
+    name: str = "Основной"
     address: str = "vpn.example.com"
     port: int = 443
     public_key: str = ""
@@ -109,6 +111,7 @@ class Plan:
     name: str
     max_devices: int
     prices: dict[str, float]
+    host_id: str = "main"
 
     @property
     def device_text(self) -> str:
@@ -134,6 +137,7 @@ class Subscription:
     email: str = ""  # email клиента в 3X-UI
     xray_sub_id: str = ""  # subId для subscription URL
     xray_synced: bool = False  # успешно создан/обновлён в 3X-UI
+    host_id: str = "main"
 
     @property
     def is_expired(self) -> bool:
@@ -156,6 +160,7 @@ class VPNStorage:
         self._lock = threading.RLock()
         self.config: dict[str, Any] = self._load_json(CONFIG_FILE, self._default_config)
         self._ensure_config_defaults(self.config, self._default_config())
+        self._migrate_config()
         self.users: dict[str, Any] = self._load_json(USERS_FILE, self._default_users)
         self.subscriptions: dict[str, Any] = self._load_json(SUBS_FILE, self._default_subscriptions)
         self.transactions: dict[str, Any] = self._load_json(TRANS_FILE, self._default_transactions)
@@ -169,9 +174,32 @@ class VPNStorage:
             elif isinstance(value, dict) and isinstance(current[key], dict):
                 self._ensure_config_defaults(current[key], value)
 
+    def _migrate_config(self) -> None:
+        with self._lock:
+            # migrate legacy single server to hosts
+            if not self.config.get("hosts") and self.config.get("server"):
+                legacy = self.config.get("server", {})
+                host_id = "main"
+                host = dict(legacy)
+                host.setdefault("host_id", host_id)
+                host.setdefault("name", "Основной")
+                self.config["hosts"] = {host_id: host}
+                self.config["default_host_id"] = host_id
+                self.save_config()
+            # ensure default host exists
+            default = self.config.get("default_host_id", "main")
+            if default not in self.config.get("hosts", {}):
+                self.config["hosts"] = self.config.get("hosts", {})
+                self.config["hosts"][default] = asdict(ServerConfig(host_id=default, name="Основной"))
+                self.save_config()
+
     def _default_config(self) -> dict[str, Any]:
         return {
-            "server": asdict(ServerConfig()),
+            "server": asdict(ServerConfig()),  # legacy, migrated to hosts
+            "hosts": {},
+            "default_host_id": "main",
+            "expired_cleanup_days": 5,
+            "referral_first_discount": 0,
             "plans": DEFAULT_PLANS,
             "promocodes": {},
             "activation_codes": {},
@@ -292,11 +320,34 @@ class VPNStorage:
             stats[src] = stats.get(src, 0) + 1
         return stats
 
-    def server(self) -> ServerConfig:
-        return ServerConfig(**self.config.get("server", {}))
+    def server(self, host_id: str | None = None) -> ServerConfig:
+        host = self.get_host(host_id or self.config.get("default_host_id", "main"))
+        if not host:
+            return ServerConfig()
+        return host
 
-    def set_server(self, server: ServerConfig) -> None:
-        self.config["server"] = {
+    def default_host_id(self) -> str:
+        return self.config.get("default_host_id", "main")
+
+    def set_default_host(self, host_id: str) -> None:
+        if host_id in self.config.get("hosts", {}):
+            self.config["default_host_id"] = host_id
+            self.save_config()
+
+    def get_host(self, host_id: str | None = None) -> ServerConfig | None:
+        host_id = host_id or self.config.get("default_host_id", "main")
+        data = self.config.get("hosts", {}).get(host_id)
+        if not data:
+            if host_id == "main" and self.config.get("server"):
+                # legacy fallback
+                return ServerConfig(**self.config["server"])
+            return None
+        return ServerConfig(**data)
+
+    def set_host(self, server: ServerConfig) -> None:
+        self.config.setdefault("hosts", {})[server.host_id] = {
+            "host_id": server.host_id,
+            "name": server.name,
             "address": server.address,
             "port": server.port,
             "public_key": server.public_key,
@@ -319,31 +370,58 @@ class VPNStorage:
             "temp_profile_port": server.temp_profile_port,
             "temp_inbound_id": server.temp_inbound_id,
         }
+        if not self.config.get("default_host_id"):
+            self.config["default_host_id"] = server.host_id
+        # keep legacy server in sync for older code paths
+        if server.host_id == self.config.get("default_host_id"):
+            self.config["server"] = self.config["hosts"][server.host_id]
         self.save_config()
 
-    def plans(self) -> dict[str, Plan]:
+    def delete_host(self, host_id: str) -> bool:
+        hosts = self.config.get("hosts", {})
+        if host_id in hosts and len(hosts) > 1:
+            del hosts[host_id]
+            if self.config.get("default_host_id") == host_id:
+                self.config["default_host_id"] = next(iter(hosts), "main")
+            self.save_config()
+            return True
+        return False
+
+    def list_hosts(self) -> list[ServerConfig]:
+        return [ServerConfig(**data) for data in self.config.get("hosts", {}).values()]
+
+    def set_server(self, server: ServerConfig) -> None:
+        self.set_host(server)
+
+    def plans(self, host_id: str | None = None) -> dict[str, Plan]:
         result = {}
         for pid, pdata in self.config.get("plans", DEFAULT_PLANS).items():
+            plan_host = pdata.get("host_id", "main")
+            if host_id and plan_host != host_id:
+                continue
             result[pid] = Plan(
                 id=pid,
                 name=pdata.get("name", pid),
                 max_devices=int(pdata.get("max_devices", 1)),
                 prices={str(k): float(v) for k, v in pdata.get("prices", {}).items()},
+                host_id=plan_host,
             )
         return result
 
     def plan(self, plan_id: str) -> Plan | None:
         return self.plans().get(plan_id)
 
-    def update_plan(self, plan_id: str, name: str | None = None, max_devices: int | None = None, prices: dict[str, float] | None = None) -> None:
+    def update_plan(self, plan_id: str, name: str | None = None, max_devices: int | None = None, prices: dict[str, float] | None = None, host_id: str | None = None) -> None:
         plans = self.config.setdefault("plans", DEFAULT_PLANS)
-        plan_data = plans.setdefault(plan_id, {"name": plan_id, "max_devices": 1, "prices": {}})
+        plan_data = plans.setdefault(plan_id, {"name": plan_id, "max_devices": 1, "prices": {}, "host_id": "main"})
         if name is not None:
             plan_data["name"] = name
         if max_devices is not None:
             plan_data["max_devices"] = max_devices
         if prices is not None:
             plan_data["prices"] = {str(k): float(v) for k, v in prices.items()}
+        if host_id is not None:
+            plan_data["host_id"] = host_id
         self.save_config()
 
     def delete_plan(self, plan_id: str) -> None:
@@ -462,6 +540,10 @@ class VPNStorage:
                 "trial_used": False,
                 "joined_at": time.time(),
                 "channel_ok": False,
+                "is_banned": False,
+                "total_spent": 0.0,
+                "total_months": 0,
+                "first_purchase_discount_used": False,
             }
             self.save_users()
         return self.users[key]
@@ -469,6 +551,19 @@ class VPNStorage:
     def update_user(self, user: dict[str, Any]) -> None:
         self.users[str(user["user_id"])] = user
         self.save_users()
+
+    def ban_user(self, user_id: int) -> None:
+        user = self.get_user(user_id)
+        user["is_banned"] = True
+        self.update_user(user)
+
+    def unban_user(self, user_id: int) -> None:
+        user = self.get_user(user_id)
+        user["is_banned"] = False
+        self.update_user(user)
+
+    def is_banned(self, user_id: int) -> bool:
+        return bool(self.get_user(user_id).get("is_banned", False))
 
     def get_user_lang(self, user_id: int) -> str:
         return self.get_user(user_id).get("settings", {}).get("lang", "ru")
@@ -503,6 +598,27 @@ class VPNStorage:
         user["balance"] = round(user["balance"] - amount, 2)
         self.update_user(user)
         self._add_transaction(user_id, -amount, "purchase", method, payload)
+
+    def apply_referral_discount(self, user_id: int, base_price: float) -> float:
+        user = self.get_user(user_id)
+        if not user.get("referred_by") or user.get("first_purchase_discount_used"):
+            return base_price
+        discount = float(self.config.get("referral_first_discount", 0))
+        if discount <= 0 or discount >= 100:
+            return base_price
+        return round(base_price * (100 - discount) / 100, 2)
+
+    def mark_first_purchase_discount_used(self, user_id: int) -> None:
+        user = self.get_user(user_id)
+        if user.get("referred_by") and not user.get("first_purchase_discount_used"):
+            user["first_purchase_discount_used"] = True
+            self.update_user(user)
+
+    def add_purchase_stats(self, user_id: int, amount: float, months: int) -> None:
+        user = self.get_user(user_id)
+        user["total_spent"] = round(user.get("total_spent", 0.0) + amount, 2)
+        user["total_months"] = int(user.get("total_months", 0)) + months
+        self.update_user(user)
 
     def _add_transaction(self, user_id: int, amount: float, tx_type: str, method: str, payload: str) -> None:
         with self._lock:
@@ -555,7 +671,7 @@ class VPNStorage:
             return None
         return self._sub_from_dict(data)
 
-    def create_subscription(self, user_id: int, plan_id: str, months: int, is_trial: bool = False) -> Subscription:
+    def create_subscription(self, user_id: int, plan_id: str, months: int, is_trial: bool = False, host_id: str | None = None) -> Subscription:
         with self._lock:
             sid = str(self.subscriptions["next_id"])
             self.subscriptions["next_id"] += 1
@@ -566,7 +682,10 @@ class VPNStorage:
             months = 0
         else:
             expires = now + months * 30 * 86400
-        email = f"vpn_{user_id}_{sid}"
+        if not host_id:
+            plan = self.plan(plan_id)
+            host_id = plan.host_id if plan else self.default_host_id()
+        email = f"vpn_{host_id}_{user_id}_{sid}"
         xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
         sub = Subscription(
             sub_id=sid,
@@ -580,6 +699,7 @@ class VPNStorage:
             active=True,
             email=email,
             xray_sub_id=xray_sub_id,
+            host_id=host_id,
         )
         self.subscriptions["subs"][sid] = asdict(sub)
         self.save_subscriptions()
@@ -899,9 +1019,12 @@ def format_subscription(sub: Subscription) -> str:
         status = f"Заморожена до {_format_time(sub.frozen_until)}"
     else:
         status = "Активна" if sub.active and not sub.is_expired else "Истекла/неактивна"
+    host = storage.get_host(sub.host_id) or storage.server()
+    host_name = host.name if host else sub.host_id
     lines = [
         f"<b>Подписка #{sub.sub_id}</b>",
         f"Тариф: {plan.name if plan else sub.plan_id}",
+        f"Сервер: {host_name}",
         f"Срок: {sub.months} мес." if sub.months else f"Пробный период",
         f"Статус: {status}",
         f"Действует до: {_format_time(sub.effective_expires_at)}",
@@ -1063,6 +1186,18 @@ class SubscriptionScheduler:
 
     def _tick(self) -> None:
         now = time.time()
+        # cleanup expired subscriptions after grace period
+        grace = max(0, int(storage.config.get("expired_cleanup_days", 5))) * 86400
+        for sub_id, data in list(storage.subscriptions["subs"].items()):
+            sub = storage._sub_from_dict(data)
+            if sub.is_expired and not sub.active and grace and (now - sub.expires_at) > grace:
+                try:
+                    XrayAPI.remove_client(sub)
+                except Exception:
+                    pass
+                del storage.subscriptions["subs"][sub_id]
+                storage.save_subscriptions()
+                continue
         for sub_id, data in list(storage.subscriptions["subs"].items()):
             sub = storage._sub_from_dict(data)
             if not sub.active and not sub.frozen_until:
@@ -1122,6 +1257,7 @@ class SubscriptionScheduler:
                 sub.active = True
                 storage.update_subscription(sub)
                 storage.process_referral_rewards(sub.user_id, price)
+                storage.add_purchase_stats(sub.user_id, price, months)
                 XrayAPI.add_or_update_client(sub)
                 self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {price}₽.")
 
@@ -1674,9 +1810,13 @@ class XrayAPI:
         return False
 
     @staticmethod
-    def get_clients(inbound_id: int | None = None) -> list[dict[str, Any]]:
-        server = storage.server()
-        if not server.panel_url:
+    def _get_host(host_id: str | None = None) -> ServerConfig | None:
+        return storage.get_host(host_id) or storage.server()
+
+    @staticmethod
+    def get_clients(inbound_id: int | None = None, host_id: str | None = None) -> list[dict[str, Any]]:
+        server = XrayAPI._get_host(host_id)
+        if not server or not server.panel_url:
             return []
         if inbound_id is None:
             inbound_id = server.inbound_id
@@ -1701,9 +1841,10 @@ class XrayAPI:
         expiry_ms: int,
         enable: bool = True,
         inbound_id: int | None = None,
+        host_id: str | None = None,
     ) -> bool:
-        server = storage.server()
-        if not server.panel_url:
+        server = XrayAPI._get_host(host_id)
+        if not server or not server.panel_url:
             return False
         if inbound_id is None:
             inbound_id = server.inbound_id
@@ -1734,9 +1875,9 @@ class XrayAPI:
         return False
 
     @staticmethod
-    def remove_client_by_email(email: str, inbound_id: int | None = None) -> bool:
-        server = storage.server()
-        if not server.panel_url or not email:
+    def remove_client_by_email(email: str, inbound_id: int | None = None, host_id: str | None = None) -> bool:
+        server = XrayAPI._get_host(host_id)
+        if not server or not server.panel_url or not email:
             return False
         if inbound_id is None:
             inbound_id = server.inbound_id
@@ -1759,8 +1900,8 @@ class XrayAPI:
 
     @staticmethod
     def add_or_update_client(sub: Subscription, enable: bool = True) -> bool:
-        server = storage.server()
-        if not server.panel_url:
+        server = XrayAPI._get_host(sub.host_id)
+        if not server or not server.panel_url:
             logger.info("3X-UI panel URL not configured, skipping client sync for sub #%s", sub.sub_id)
             return False
         XrayAPI._ensure_email_and_sub_id(sub)
@@ -1772,22 +1913,23 @@ class XrayAPI:
             expiry_ms,
             enable,
             server.inbound_id,
+            sub.host_id,
         ):
             sub.xray_synced = True
             storage.update_subscription(sub)
-            logger.info("3X-UI client synced for sub #%s (email=%s)", sub.sub_id, sub.email)
+            logger.info("3X-UI client synced for sub #%s host=%s (email=%s)", sub.sub_id, sub.host_id, sub.email)
             return True
         return False
 
     @staticmethod
     def remove_client(sub: Subscription) -> bool:
-        server = storage.server()
-        if not server.panel_url or not sub.email:
+        server = XrayAPI._get_host(sub.host_id)
+        if not server or not server.panel_url or not sub.email:
             return False
-        if XrayAPI.remove_client_by_email(sub.email, server.inbound_id):
+        if XrayAPI.remove_client_by_email(sub.email, server.inbound_id, sub.host_id):
             sub.xray_synced = False
             storage.update_subscription(sub)
-            logger.info("3X-UI client removed for sub #%s", sub.sub_id)
+            logger.info("3X-UI client removed for sub #%s host=%s", sub.sub_id, sub.host_id)
             return True
         return False
 
@@ -1797,8 +1939,8 @@ class XrayAPI:
 
     @staticmethod
     def get_client_stats(sub: Subscription) -> dict[str, int]:
-        server = storage.server()
-        if not server.panel_url or not sub.email:
+        server = XrayAPI._get_host(sub.host_id)
+        if not server or not server.panel_url or not sub.email:
             return {"upload": 0, "download": 0}
         session = requests.Session()
         if not XrayAPI._login(session, server):
@@ -1818,7 +1960,7 @@ class XrayAPI:
 
     @staticmethod
     def get_global_stats() -> dict[str, int]:
-        server = storage.server()
+        server = storage.server()  # default host
         if not server.panel_url:
             return {"upload": 0, "download": 0}
         session = requests.Session()
@@ -1831,41 +1973,44 @@ class XrayAPI:
 
     @staticmethod
     def sync_subscriptions() -> dict[str, Any]:
-        """Сравнивает активные подписки в JSON и клиентов в 3X-UI."""
+        """Сравнивает активные подписки в JSON и клиентов в 3X-UI (multi-host)."""
         result: dict[str, Any] = {"ok": [], "mismatch": [], "missing": [], "orphan": []}
-        server = storage.server()
-        if not server.panel_url:
+        hosts = [h for h in storage.list_hosts() if h.panel_url]
+        if not hosts:
             result["error"] = "3X-UI panel URL not configured"
             return result
-        clients = XrayAPI.get_clients(server.inbound_id)
-        by_email = {c.get("email"): c for c in clients if c.get("email")}
-        for sub in storage.active_subscriptions_all():
-            XrayAPI._ensure_email_and_sub_id(sub)
-            client = by_email.pop(sub.email, None)
-            if not client:
-                result["missing"].append({"sub_id": sub.sub_id, "email": sub.email})
-                continue
-            xray_ms = client.get("expiryTime", 0) or 0
-            expected_ms = XrayAPI._expiry_ms(sub)
-            if expected_ms and abs(xray_ms - expected_ms) > 60000:
-                result["mismatch"].append({
-                    "sub_id": sub.sub_id,
-                    "email": sub.email,
-                    "xray": xray_ms,
-                    "expected": expected_ms,
-                })
-            else:
-                result["ok"].append({"sub_id": sub.sub_id, "email": sub.email})
-        # Оставшиеся клиенты, которых нет в активных подписках
-        result["orphan"] = [{"email": email, "id": c.get("id")} for email, c in by_email.items()]
+        for host in hosts:
+            clients = XrayAPI.get_clients(host.inbound_id, host.host_id)
+            by_email = {c.get("email"): c for c in clients if c.get("email")}
+            for sub in storage.active_subscriptions_all():
+                if sub.host_id != host.host_id:
+                    continue
+                XrayAPI._ensure_email_and_sub_id(sub)
+                client = by_email.pop(sub.email, None)
+                if not client:
+                    result["missing"].append({"sub_id": sub.sub_id, "email": sub.email, "host": host.host_id})
+                    continue
+                xray_ms = client.get("expiryTime", 0) or 0
+                expected_ms = XrayAPI._expiry_ms(sub)
+                if expected_ms and abs(xray_ms - expected_ms) > 60000:
+                    result["mismatch"].append({
+                        "sub_id": sub.sub_id,
+                        "email": sub.email,
+                        "host": host.host_id,
+                        "xray": xray_ms,
+                        "expected": expected_ms,
+                    })
+                else:
+                    result["ok"].append({"sub_id": sub.sub_id, "email": sub.email, "host": host.host_id})
+            result["orphan"].extend([{"email": email, "id": c.get("id"), "host": host.host_id} for email, c in by_email.items()])
         return result
 
     @staticmethod
     def fix_subscriptions() -> dict[str, Any]:
-        """Добавляет/обновляет клиентов в 3X-UI по актуальным подпискам."""
+        """Добавляет/обновляет клиентов в 3X-UI по актуальным подпискам (multi-host)."""
         result = {"added": 0, "updated": 0, "failed": 0, "details": []}
-        server = storage.server()
-        if not server.panel_url:
+        hosts = [h for h in storage.list_hosts() if h.panel_url]
+        if not hosts:
             return result
         for sub in storage.active_subscriptions_all():
             XrayAPI._ensure_email_and_sub_id(sub)
@@ -2123,6 +2268,9 @@ class UserBot:
             self.bot.send_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main())
 
     def _check_maintenance(self, user_id: int, chat_id: int) -> bool:
+        if storage.is_banned(user_id):
+            self.bot.send_message(chat_id, "Вы заблокированы и не можете использовать этого бота.")
+            return True
         if not storage.maintenance_mode() or storage.is_admin_user(user_id):
             return False
         self.bot.send_message(chat_id, "Бот временно на обслуживании. Попробуйте позже.")
@@ -2253,6 +2401,10 @@ class UserBot:
 
         if action == "buy":
             self._buy_menu(chat_id, c.message.message_id)
+            return
+
+        if action == "host" and args:
+            self._plan_menu(chat_id, c.message.message_id, args[0])
             return
 
         if action == "plan":
@@ -2451,8 +2603,22 @@ class UserBot:
                                    reply_markup=self._keyboard_main())
 
     def _buy_menu(self, chat_id: int, message_id: int) -> None:
+        hosts = storage.list_hosts()
+        if len(hosts) > 1:
+            kb = K()
+            for host in hosts:
+                text = host.name or host.host_id
+                if host.host_id == storage.default_host_id():
+                    text = f"{text} (по умолч.)"
+                kb.add(B(text, callback_data=f"{CB_PREFIX}host:{host.host_id}"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+            self.bot.edit_message_text("Выберите сервер:", chat_id, message_id, reply_markup=kb)
+        else:
+            self._plan_menu(chat_id, message_id)
+
+    def _plan_menu(self, chat_id: int, message_id: int, host_id: str | None = None) -> None:
         kb = K()
-        for pid, plan in storage.plans().items():
+        for pid, plan in storage.plans(host_id).items():
             if pid == "trial":
                 continue
             kb.add(B(plan.name, callback_data=f"{CB_PREFIX}plan:{pid}"))
@@ -2468,7 +2634,7 @@ class UserBot:
         self.bot.edit_message_text(f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:",
                                    chat_id, message_id, reply_markup=kb)
 
-    def _confirm_purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: str) -> None:
+    def _confirm_purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: str, host_id: str | None = None) -> None:
         plan = storage.plan(plan_id)
         base_price = storage.price(plan_id, int(months))
         state = self.get_state(user_id)
@@ -2476,10 +2642,17 @@ class UserBot:
         if state and state.get("state") in ("confirm_purchase", "enter_promo") and state.get("data", {}).get("plan_id") == plan_id and str(state.get("data", {}).get("months")) == str(months):
             discount = state["data"].get("discount", 0.0)
             message_id = message_id or state["data"].get("message_id")
-        price = round(base_price - discount, 2) if base_price else 0.0
+        # apply referral first-purchase discount once
+        ref_discount = storage.apply_referral_discount(user_id, base_price or 0.0) if not discount else 0.0
+        if ref_discount and ref_discount < (base_price or 0.0):
+            discount = round((base_price or 0.0) - ref_discount, 2)
+        price = round((base_price or 0.0) - discount, 2)
         user = storage.get_user(user_id)
+        host = storage.get_host(plan.host_id) if plan and plan.host_id else storage.server()
+        host_text = f"Сервер: {host.name}\n" if host and host.name and len(storage.list_hosts()) > 1 else ""
         price_text = f"<s>{base_price}₽</s> {price}₽ (скидка {discount}₽)" if discount else f"{price}₽"
         text = (f"<b>{_escape(plan.name)}</b>\n"
+                f"{host_text}"
                 f"Срок: {months} мес.\n"
                 f"Цена: {price_text}\n"
                 f"Ваш баланс: {user['balance']}₽\n\n"
@@ -2491,7 +2664,7 @@ class UserBot:
         if user["balance"] < price:
             kb.add(B("Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}plan:{plan_id}"))
-        self.set_state(user_id, "confirm_purchase", {"plan_id": plan_id, "months": months, "discount": discount, "message_id": message_id})
+        self.set_state(user_id, "confirm_purchase", {"plan_id": plan_id, "months": months, "discount": discount, "message_id": message_id, "host_id": plan.host_id if plan else host_id})
         if message_id:
             self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
         else:
@@ -2508,6 +2681,10 @@ class UserBot:
         if state and state.get("state") == "confirm_purchase" and state.get("data", {}).get("plan_id") == plan_id and str(state.get("data", {}).get("months")) == str(months):
             discount = state["data"].get("discount", 0.0)
             promo_code = state["data"].get("promo_code")
+        # referral first-purchase discount
+        ref_discount = storage.apply_referral_discount(user_id, base_price) if not discount else 0.0
+        if ref_discount and ref_discount < base_price:
+            discount = round(base_price - ref_discount, 2)
         price = round(base_price - discount, 2)
         user = storage.get_user(user_id)
         if user["balance"] < price:
@@ -2519,7 +2696,9 @@ class UserBot:
             storage.use_promocode(promo_code)
         storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}" + (f" promo:{promo_code}" if promo_code else ""))
         sub = storage.create_subscription(user_id, plan_id, months)
+        storage.mark_first_purchase_discount_used(user_id)
         storage.process_referral_rewards(user_id, price)
+        storage.add_purchase_stats(user_id, price, months)
         XrayAPI.add_or_update_client(sub)
         self.clear_state(user_id)
         self.bot.edit_message_text(f"Подписка оформлена!\n{format_subscription(sub)}", chat_id, message_id,
@@ -2560,8 +2739,8 @@ class UserBot:
             self.bot.edit_message_text("Подписка неактивна или истекла.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
-        server = storage.server()
-        if not server.address or not server.public_key or not server.short_id:
+        server = storage.get_host(sub.host_id) or storage.server()
+        if not server or not server.address or not server.public_key or not server.short_id:
             self.bot.edit_message_text("Сервер VPN не настроен. Обратитесь к администратору.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
@@ -2630,6 +2809,7 @@ class UserBot:
         storage.update_subscription(sub)
         XrayAPI.update_expiry(sub)
         storage.process_referral_rewards(user_id, price)
+        storage.add_purchase_stats(user_id, price, months)
         self.bot.edit_message_text(f"Подписка продлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
 
@@ -2978,6 +3158,10 @@ class UserBot:
             lines.append("Активных подписок нет.")
         if user.get("trial_used"):
             lines.append("Пробный период использован.")
+        total_spent = user.get("total_spent", 0.0)
+        total_months = user.get("total_months", 0)
+        if total_spent or total_months:
+            lines.append(f"Всего потрачено: {total_spent}₽ (куплено {total_months} мес.)")
         earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": 0.0, "level2": 0.0})
         total_earn = earnings.get("level1", 0.0) + earnings.get("level2", 0.0)
         if total_earn:
@@ -3364,10 +3548,23 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         try:
             max_devices = int(m.text.strip())
             state["data"]["max_devices"] = max_devices
-            tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_prices", state["data"])
-            bot.send_message(m.chat.id, f"Отправьте цены через пробел для {', '.join(DURATIONS)} мес. (например: 100 270 500 900):")
+            hosts = ", ".join(h.host_id for h in storage.list_hosts()) or "main"
+            tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_host", state["data"])
+            bot.send_message(m.chat.id, f"Выберите сервер ({hosts}), по умолчанию <code>main</code>:")
         except ValueError:
             bot.send_message(m.chat.id, "Введите число.")
+
+    def state_admin_plan_add_host(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        host_id = m.text.strip() or storage.default_host_id()
+        if host_id not in storage.config.get("hosts", {}) and storage.list_hosts():
+            bot.send_message(m.chat.id, "Сервер не найден. Введите существующий host_id.")
+            return
+        state["data"]["host_id"] = host_id
+        tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_prices", state["data"])
+        bot.send_message(m.chat.id, f"Отправьте цены через пробел для {', '.join(DURATIONS)} мес. (например: 100 270 500 900):")
 
     def state_admin_plan_add_prices(m: Message):
         state = tg.get_state(m.chat.id, m.from_user.id)
@@ -3381,9 +3578,23 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             prices = {str(DURATIONS[i]): float(parts[i].replace(",", ".")) for i in range(len(DURATIONS))}
             data = state["data"]
             storage.add_plan(data["plan_id"], data["name"], data["max_devices"], prices)
+            storage.update_plan(data["plan_id"], host_id=data.get("host_id", storage.default_host_id()))
             bot.send_message(m.chat.id, f"Тариф {data['name']} добавлен.")
         except ValueError:
             bot.send_message(m.chat.id, "Введите числовые цены.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_admin_plan_host(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        plan_id = state["data"].get("plan_id")
+        host_id = m.text.strip()
+        if host_id not in storage.config.get("hosts", {}):
+            bot.send_message(m.chat.id, "Сервер не найден. Введите существующий host_id.")
+            return
+        storage.update_plan(plan_id, host_id=host_id)
+        bot.send_message(m.chat.id, f"Сервер для тарифа {plan_id} обновлён.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
     def state_admin_promo_add(m: Message):
@@ -3655,11 +3866,115 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         bot.send_message(m.chat.id, f"Рассылка завершена. Отправлено: {sent}, не удалось: {failed}.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
+    def _parse_host_line(parts: list[str], host_id: str) -> ServerConfig | None:
+        if len(parts) < 6:
+            return None
+        try:
+            server = ServerConfig(
+                host_id=host_id,
+                name=parts[0],
+                address=parts[1],
+                port=int(parts[2]),
+                public_key=parts[3],
+                short_id=parts[4],
+                server_name=parts[5],
+            )
+            if len(parts) >= 9:
+                server.panel_url = parts[6]
+                server.panel_username = parts[7]
+                server.panel_password = parts[8]
+            if len(parts) >= 10:
+                server.inbound_id = int(parts[9])
+            if len(parts) >= 11:
+                server.verify_ssl = parts[10].lower() in ("true", "1", "yes")
+            if len(parts) >= 12:
+                server.sub_port = int(parts[11])
+            if len(parts) >= 13:
+                server.subscription_url_base = parts[12]
+            return server
+        except (ValueError, TypeError):
+            return None
+
+    def state_admin_host_add(m: Message):
+        host_id = m.text.strip()
+        if not host_id or not host_id.isalnum():
+            bot.send_message(m.chat.id, "Введите корректный host_id (латиница/цифры).")
+            return
+        if host_id in storage.config.get("hosts", {}):
+            bot.send_message(m.chat.id, "Такой host_id уже существует.")
+            return
+        tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_host_data", {"host_id": host_id})
+        bot.send_message(m.chat.id, "Отправьте полные данные сервера:\n"
+                         "<code>name address port public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base]</code>")
+
+    def state_admin_host_data(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        host_id = state["data"].get("host_id")
+        parts = m.text.strip().split()
+        server = _parse_host_line(parts, host_id)
+        if not server:
+            bot.send_message(m.chat.id, "Недостаточно данных или неверный формат.")
+            return
+        storage.set_host(server)
+        bot.send_message(m.chat.id, f"Сервер {host_id} добавлен.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_admin_host_edit(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        host_id = state["data"].get("host_id")
+        parts = m.text.strip().split()
+        server = _parse_host_line(parts, host_id)
+        if not server:
+            bot.send_message(m.chat.id, "Недостаточно данных или неверный формат.")
+            return
+        storage.set_host(server)
+        bot.send_message(m.chat.id, f"Сервер {host_id} обновлён.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_admin_ban_user(m: Message):
+        text = m.text.strip()
+        u = storage.search_user(text)
+        if not u:
+            bot.send_message(m.chat.id, "Пользователь не найден.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        uid = int(u["user_id"])
+        if storage.is_banned(uid):
+            storage.unban_user(uid)
+            bot.send_message(m.chat.id, f"Пользователь {uid} разблокирован.")
+        else:
+            storage.ban_user(uid)
+            bot.send_message(m.chat.id, f"Пользователь {uid} заблокирован.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_admin_settings(m: Message):
+        parts = m.text.strip().split()
+        if len(parts) < 2:
+            bot.send_message(m.chat.id, "Нужно два числа: <code>referral_discount cleanup_days</code>")
+            return
+        try:
+            discount = float(parts[0].replace(",", "."))
+            cleanup = int(parts[1])
+            storage.config["referral_first_discount"] = max(0.0, min(100.0, discount))
+            storage.config["expired_cleanup_days"] = max(0, cleanup)
+            storage.save_config()
+            bot.send_message(m.chat.id, "Настройки сохранены.")
+        except ValueError:
+            bot.send_message(m.chat.id, "Введите числа.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
     tg.msg_handler(state_set_token, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_user_token"))
     tg.msg_handler(state_set_channel, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_channel"))
     tg.msg_handler(state_set_support, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_support"))
     tg.msg_handler(state_set_crypto_token, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_crypto_token"))
     tg.msg_handler(state_set_server, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_server"))
+    tg.msg_handler(state_admin_host_add, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_add"))
+    tg.msg_handler(state_admin_host_data, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_data"))
+    tg.msg_handler(state_admin_host_edit, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_edit"))
     tg.msg_handler(state_set_temp_profiles, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_temp_profiles"))
     tg.msg_handler(state_set_welcome_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_welcome_media"))
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
@@ -3669,7 +3984,9 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_plan_add_id, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_id"))
     tg.msg_handler(state_admin_plan_add_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_name"))
     tg.msg_handler(state_admin_plan_add_devices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_devices"))
+    tg.msg_handler(state_admin_plan_add_host, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_host"))
     tg.msg_handler(state_admin_plan_add_prices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_add_prices"))
+    tg.msg_handler(state_admin_plan_host, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_host"))
     tg.msg_handler(state_admin_promo_add, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_promo_add"))
     tg.msg_handler(state_admin_code_add, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_code_add"))
     tg.msg_handler(state_give_uid, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_give_uid"))
@@ -3683,6 +4000,8 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_security_cooldown, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_security_cooldown"))
     tg.msg_handler(state_admin_security_traffic, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_security_traffic"))
     tg.msg_handler(state_admin_search_query, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_search_query"))
+    tg.msg_handler(state_admin_ban_user, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_ban_user"))
+    tg.msg_handler(state_admin_settings, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_settings"))
     tg.msg_handler(state_admin_bulk_extend, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_extend"))
     tg.msg_handler(state_admin_bulk_balance, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_balance"))
     tg.msg_handler(state_admin_bulk_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_text"))
@@ -3704,13 +4023,14 @@ def _admin_main_keyboard() -> K:
     kb.add(B("Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token"))
     kb.add(B("Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media"))
     kb.add(B("Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq"))
-    kb.add(B("Настройки сервера", callback_data=f"{CB_PREFIX}admin:server"))
+    kb.add(B("Серверы", callback_data=f"{CB_PREFIX}admin:hosts"))
     kb.add(B("Планы и цены", callback_data=f"{CB_PREFIX}admin:plans"))
     kb.add(B("Промокоды", callback_data=f"{CB_PREFIX}admin:promos"))
     kb.add(B("Подарочные коды", callback_data=f"{CB_PREFIX}admin:codes"))
     kb.add(B("Выдать подписку", callback_data=f"{CB_PREFIX}admin:give"))
     kb.add(B("Баланс пользователя", callback_data=f"{CB_PREFIX}admin:balance"))
     kb.add(B("Пользователи", callback_data=f"{CB_PREFIX}admin:users"))
+    kb.add(B("Баны", callback_data=f"{CB_PREFIX}admin:bans"))
     kb.add(B("Подписки", callback_data=f"{CB_PREFIX}admin:subs"))
     kb.add(B("Источники", callback_data=f"{CB_PREFIX}admin:sources"))
     kb.add(B("Выводы", callback_data=f"{CB_PREFIX}admin:withdrawals"))
@@ -3718,6 +4038,8 @@ def _admin_main_keyboard() -> K:
     kb.add(B("Поиск", callback_data=f"{CB_PREFIX}admin:search"))
     kb.add(B("Массовые операции", callback_data=f"{CB_PREFIX}admin:bulk"))
     kb.add(B("Экспорт", callback_data=f"{CB_PREFIX}admin:export"))
+    kb.add(B("Статистика", callback_data=f"{CB_PREFIX}admin:stats"))
+    kb.add(B("Настройки", callback_data=f"{CB_PREFIX}admin:settings"))
     kb.add(B("Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications"))
     kb.add(B("Жалобы", callback_data=f"{CB_PREFIX}admin:complaints"))
     kb.add(B("Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray"))
@@ -3758,6 +4080,8 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
         f"Баланс: {user.get('balance', 0)}₽",
         f"Реферальный баланс: {user.get('referral_balance', 0)}₽",
         f"Рефералы: {len(level1)} / {len(level2)} — заработок {earnings.get('level1', 0) + earnings.get('level2', 0)}₽",
+        f"Всего потрачено: {user.get('total_spent', 0)}₽ (месяцев: {user.get('total_months', 0)})",
+        f"Бан: {'да' if user.get('is_banned') else 'нет'}",
         f"Подписок: {len(subs)}",
     ]
     for s in subs:
@@ -3768,6 +4092,8 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
     kb = K()
     for s in subs:
         kb.add(B(f"Подписка #{s.get('sub_id')}", callback_data=f"{CB_PREFIX}admin_sub:{s.get('sub_id')}"))
+    ban_label = "Разблокировать" if user.get("is_banned") else "Заблокировать"
+    kb.add(B(ban_label, callback_data=f"{CB_PREFIX}admin_ban:{target_uid}"))
     kb.add(B("История платежей", callback_data=f"{CB_PREFIX}admin_user_payments:{target_uid}"))
     kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
     return "\n".join(lines), kb
@@ -3790,6 +4116,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
     parts = data.split(":")
     action = parts[0]
     args = parts[1:]
+    section = args[0] if action == "admin" and args else ""
 
     if not is_admin(cardinal, user_id):
         bot.send_message(chat_id, "Нет доступа.")
@@ -3867,32 +4194,89 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                                   reply_markup=_admin_main_keyboard())
             return
 
-        if section == "server":
-            srv = storage.server()
-            text = (f"<b>Настройки сервера (Xray/3X-UI)</b>\n"
-                    f"Адрес: <code>{srv.address}</code>\n"
-                    f"Порт: {srv.port}\n"
-                    f"publicKey: <code>{srv.public_key}</code>\n"
-                    f"shortId: <code>{srv.short_id}</code>\n"
-                    f"serverName: <code>{srv.server_name}</code>\n"
-                    f"flow: <code>{srv.flow}</code> | fp: <code>{srv.fingerprint}</code>\n"
-                    f"spx: <code>{srv.spider_x}</code>\n\n"
-                    f"<b>3X-UI панель</b>\n"
-                    f"URL: <code>{srv.panel_url}</code>\n"
-                    f"Inbound: {srv.inbound_id} | verify SSL: {srv.verify_ssl}\n"
-                    f"Подписка: <code>{srv.subscription_url_base or srv.address}:{srv.sub_port}/sub/{'...'}</code>\n\n"
-                    f"Отправьте:\n"
-                    f"<code>адрес порт public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base]</code>")
-            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+        if section == "hosts":
+            hosts = storage.list_hosts()
+            lines = ["<b>Серверы</b>"]
+            for host in hosts:
+                default = " (по умолч.)" if host.host_id == storage.default_host_id() else ""
+                lines.append(f"{host.name or host.host_id}{default} — {host.address}:{host.port}")
+            text = "\n".join(lines) if hosts else "Серверы не настроены."
+            kb = K()
+            for host in hosts:
+                kb.add(B(host.name or host.host_id, callback_data=f"{CB_PREFIX}admin:host:{host.host_id}"))
+            kb.add(B("Добавить сервер", callback_data=f"{CB_PREFIX}admin:host_add"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_server")
+            return
+
+        if section == "host" and len(args) >= 2:
+            host_id = args[1]
+            host = storage.get_host(host_id)
+            if not host:
+                bot.edit_message_text("Сервер не найден.", chat_id, c.message.message_id,
+                                      reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:hosts")))
+                return
+            text = (f"<b>{host.name or host.host_id}</b>\n"
+                    f"ID: <code>{host.host_id}</code>\n"
+                    f"Адрес: <code>{host.address}</code>\n"
+                    f"Порт: {host.port}\n"
+                    f"publicKey: <code>{host.public_key}</code>\n"
+                    f"shortId: <code>{host.short_id}</code>\n"
+                    f"serverName: <code>{host.server_name}</code>\n"
+                    f"flow: <code>{host.flow}</code> | fp: <code>{host.fingerprint}</code>\n"
+                    f"spx: <code>{host.spider_x}</code>\n\n"
+                    f"<b>3X-UI панель</b>\n"
+                    f"URL: <code>{host.panel_url}</code>\n"
+                    f"Inbound: {host.inbound_id} | verify SSL: {host.verify_ssl}\n"
+                    f"Подписка: <code>{host.subscription_url_base or host.address}:{host.sub_port}/sub/{'...'}</code>")
+            kb = K()
+            kb.add(B("Изменить", callback_data=f"{CB_PREFIX}admin:host_edit:{host_id}"))
+            if host_id != storage.default_host_id():
+                kb.add(B("Сделать основным", callback_data=f"{CB_PREFIX}admin:host_default:{host_id}"))
+            if len(storage.list_hosts()) > 1:
+                kb.add(B("Удалить", callback_data=f"{CB_PREFIX}admin:host_delete:{host_id}"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:hosts"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            return
+
+        if section == "host_add":
+            bot.edit_message_text("Отправьте ID нового сервера (латиницей, например nl1):", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:hosts")))
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_host_add")
+            return
+
+        if section == "host_edit" and len(args) >= 2:
+            host_id = args[1]
+            bot.edit_message_text(
+                f"Отправьте полные данные для сервера <code>{host_id}</code> одной строкой:\n"
+                f"<code>host_id name address port public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base]</code>",
+                chat_id, c.message.message_id,
+                reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:hosts")))
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_host_edit", {"host_id": host_id})
+            return
+
+        if section == "host_default" and len(args) >= 2:
+            storage.set_default_host(args[1])
+            bot.edit_message_text("Основной сервер обновлён.", chat_id, c.message.message_id,
+                                  reply_markup=_admin_main_keyboard())
+            return
+
+        if section == "host_delete" and len(args) >= 2:
+            if storage.delete_host(args[1]):
+                bot.edit_message_text("Сервер удалён.", chat_id, c.message.message_id,
+                                      reply_markup=_admin_main_keyboard())
+            else:
+                bot.edit_message_text("Нельзя удалить единственный сервер или сервер не найден.", chat_id, c.message.message_id,
+                                      reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:hosts")))
             return
 
         if section == "plans":
             lines = ["<b>Текущие планы</b>"]
             for pid, plan in storage.plans().items():
                 prices = ", ".join(f"{m}м:{plan.prices[m]}" for m in DURATIONS if m in plan.prices)
-                lines.append(f"{plan.name} ({pid}) — {plan.device_text} — {prices}")
+                host = storage.get_host(plan.host_id)
+                host_name = host.name if host else plan.host_id
+                lines.append(f"{plan.name} ({pid}) — {plan.device_text} — {prices} — сервер {host_name}")
             text = "\n".join(lines)
             kb = K()
             for pid in storage.plans():
@@ -3912,12 +4296,16 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:plans")))
                 return
             prices = ", ".join(f"{m}м:{plan.prices.get(m, '?')}" for m in DURATIONS)
+            host = storage.get_host(plan.host_id)
+            host_name = host.name if host else plan.host_id
             text = (f"<b>Тариф {plan.name} ({plan_id})</b>\n"
                     f"Устройств: {plan.device_text}\n"
+                    f"Сервер: {host_name}\n"
                     f"Цены: {prices}")
             kb = K()
             kb.add(B("Изменить название", callback_data=f"{CB_PREFIX}admin:plan_name:{plan_id}"))
             kb.add(B("Изменить устройства", callback_data=f"{CB_PREFIX}admin:plan_devices:{plan_id}"))
+            kb.add(B("Сменить сервер", callback_data=f"{CB_PREFIX}admin:plan_host:{plan_id}"))
             for m in DURATIONS:
                 kb.add(B(f"Цена {m} мес.", callback_data=f"{CB_PREFIX}admin:plan_price:{plan_id}:{m}"))
             kb.add(B("Удалить", callback_data=f"{CB_PREFIX}admin:plan_delete:{plan_id}"))
@@ -3943,6 +4331,14 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             plan_id, months = args[1], args[2]
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_plan_price", {"plan_id": plan_id, "months": months})
             bot.edit_message_text(f"Отправьте цену для {months} мес.:", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:plan:{plan_id}")))
+            return
+
+        if section == "plan_host" and len(args) >= 2:
+            plan_id = args[1]
+            hosts = ", ".join(h.host_id for h in storage.list_hosts()) or "main"
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_plan_host", {"plan_id": plan_id})
+            bot.edit_message_text(f"Отправьте host_id сервера ({hosts}):", chat_id, c.message.message_id,
                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:plan:{plan_id}")))
             return
 
@@ -4488,6 +4884,61 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             storage.update_subscription(sub)
             bot.edit_message_text("Все устройства удалены.", chat_id, c.message.message_id,
                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:subs")))
+        return
+
+    if action == "admin_ban" and len(args) >= 1:
+        target_uid = int(args[0])
+        if storage.is_banned(target_uid):
+            storage.unban_user(target_uid)
+            bot.edit_message_text(f"Пользователь {target_uid} разблокирован.", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
+        else:
+            storage.ban_user(target_uid)
+            bot.edit_message_text(f"Пользователь {target_uid} заблокирован.", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
+        return
+
+    if section == "bans":
+        bot.edit_message_text("Введите <code>user_id</code> или <code>@username</code> для блокировки/разблокировки:",
+                              chat_id, c.message.message_id,
+                              reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
+        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_ban_user")
+        return
+
+    if section == "stats":
+        total_users = len(storage.users)
+        total_subs = len(storage.subscriptions.get("subs", {}))
+        active_subs = len(storage.active_subscriptions_all())
+        total_spent = sum(u.get("total_spent", 0.0) for u in storage.users.values())
+        total_months = sum(u.get("total_months", 0) for u in storage.users.values())
+        hosts = len(storage.list_hosts())
+        text = (f"<b>Статистика</b>\n\n"
+                f"Пользователей: {total_users}\n"
+                f"Подписок: {total_subs}\n"
+                f"Активных подписок: {active_subs}\n"
+                f"Всего потрачено: {total_spent:.2f}₽\n"
+                f"Всего куплено месяцев: {total_months}\n"
+                f"Серверов: {hosts}")
+        top = sorted(storage.users.values(), key=lambda u: u.get("total_spent", 0.0), reverse=True)[:5]
+        if top:
+            text += "\n\n<b>Топ по тратам:</b>"
+            for u in top:
+                text += f"\n{u['user_id']} — {u.get('total_spent', 0):.2f}₽"
+        bot.edit_message_text(text, chat_id, c.message.message_id,
+                              reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
+        return
+
+    if section == "settings":
+        discount = storage.config.get("referral_first_discount", 0)
+        cleanup = storage.config.get("expired_cleanup_days", 5)
+        text = (f"<b>Настройки</b>\n\n"
+                f"Реферальная скидка на первую покупку: {discount}%\n"
+                f"Автоудаление истёкших подписок через: {cleanup} дн.\n\n"
+                f"Отправьте одной строкой: <code>referral_discount cleanup_days</code>")
+        kb = K()
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+        bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_settings")
         return
 
 
