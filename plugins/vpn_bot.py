@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
-from uuid import uuid4
+from uuid import uuid4, uuid5, NAMESPACE_DNS
 import http.server
 import csv
 import ipaddress
@@ -87,6 +87,16 @@ class ServerConfig:
     network: str = "tcp"
     security: str = "reality"
     fingerprint: str = "chrome"
+    spider_x: str = "/"
+    # 3X-UI панель
+    panel_url: str = ""  # http://ip:2053 (без /panel)
+    panel_path: str = "/panel"
+    panel_username: str = "admin"
+    panel_password: str = "admin"
+    inbound_id: int = 1
+    verify_ssl: bool = True
+    sub_port: int = 2096
+    subscription_url_base: str = ""  # хост для subscription URL, пусто = address
 
 
 @dataclass
@@ -117,6 +127,9 @@ class Subscription:
     frozen_until: float | None = None
     freeze_started: float | None = None
     warnings: dict[str, bool] = field(default_factory=dict)
+    email: str = ""  # email клиента в 3X-UI
+    xray_sub_id: str = ""  # subId для subscription URL
+    xray_synced: bool = False  # успешно создан/обновлён в 3X-UI
 
     @property
     def is_expired(self) -> bool:
@@ -289,6 +302,15 @@ class VPNStorage:
             "network": server.network,
             "security": server.security,
             "fingerprint": server.fingerprint,
+            "spider_x": server.spider_x,
+            "panel_url": server.panel_url,
+            "panel_path": server.panel_path,
+            "panel_username": server.panel_username,
+            "panel_password": server.panel_password,
+            "inbound_id": server.inbound_id,
+            "verify_ssl": server.verify_ssl,
+            "sub_port": server.sub_port,
+            "subscription_url_base": server.subscription_url_base,
         }
         self.save_config()
 
@@ -393,6 +415,7 @@ class VPNStorage:
         sub.freeze_started = now
         sub.frozen_until = now + days * 86400
         self.update_subscription(sub)
+        XrayAPI.update_expiry(sub, enable=False)
 
     def unfreeze_subscription(self, sub: Subscription) -> None:
         if sub.frozen_until and sub.freeze_started and time.time() >= sub.frozen_until:
@@ -400,6 +423,7 @@ class VPNStorage:
         sub.frozen_until = None
         sub.freeze_started = None
         self.update_subscription(sub)
+        XrayAPI.add_or_update_client(sub, enable=True)
 
     def refund_subscription(self, sub: Subscription, refund_amount: float) -> None:
         user = self.get_user(sub.user_id)
@@ -408,6 +432,7 @@ class VPNStorage:
         self._add_transaction(sub.user_id, refund_amount, "refund", "admin", f"sub:{sub.sub_id}")
         sub.active = False
         self.update_subscription(sub)
+        XrayAPI.remove_client(sub)
 
     def price(self, plan_id: str, months: int) -> float | None:
         plan = self.plan(plan_id)
@@ -516,6 +541,8 @@ class VPNStorage:
             months = 0
         else:
             expires = now + months * 30 * 86400
+        email = f"vpn_{user_id}_{sid}"
+        xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
         sub = Subscription(
             sub_id=sid,
             user_id=user_id,
@@ -526,6 +553,8 @@ class VPNStorage:
             expires_at=expires,
             devices=[],
             active=True,
+            email=email,
+            xray_sub_id=xray_sub_id,
         )
         self.subscriptions["subs"][sid] = asdict(sub)
         self.save_subscriptions()
@@ -1042,6 +1071,7 @@ class SubscriptionScheduler:
                     sub.active = False
                     data["active"] = False
                     storage.save_subscriptions()
+                    XrayAPI.remove_client(sub)
                     self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Пополните баланс и продлите.")
                     continue
                 # try renew same plan/months, fallback to 1 month
@@ -1056,6 +1086,7 @@ class SubscriptionScheduler:
                     sub.active = False
                     data["active"] = False
                     storage.save_subscriptions()
+                    XrayAPI.remove_client(sub)
                     self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Недостаточно средств для автопродления.")
                     continue
                 user["balance"] = round(user["balance"] - price, 2)
@@ -1066,7 +1097,7 @@ class SubscriptionScheduler:
                 sub.active = True
                 storage.update_subscription(sub)
                 storage.process_referral_rewards(sub.user_id, price)
-                XrayAPI.add_client(sub)
+                XrayAPI.add_or_update_client(sub)
                 self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {price}₽.")
 
     def stop(self) -> None:
@@ -1244,17 +1275,294 @@ class StarsPayment:
 
 
 class XrayAPI:
-    """Заглушка для будущей интеграции с Xray/3x-ui панелью."""
+    """Реальная синхронизация подписок с панелью 3X-UI через HTTP API."""
 
     @staticmethod
-    def add_client(sub: Subscription) -> bool:
-        logger.info("XrayAPI.add_client stub called for sub #%s", sub.sub_id)
-        return True
+    def _panel_api_base(server: ServerConfig) -> str:
+        base = server.panel_url.rstrip("/")
+        path = (server.panel_path or "").strip("/")
+        if path:
+            return f"{base}/{path}"
+        return base
+
+    @staticmethod
+    def _login(session: requests.Session, server: ServerConfig) -> bool:
+        if not server.panel_url:
+            return False
+        url = f"{server.panel_url.rstrip('/')}/login"
+        try:
+            r = session.post(
+                url,
+                data={"username": server.panel_username, "password": server.panel_password},
+                verify=server.verify_ssl,
+                timeout=15,
+            )
+            if r.status_code != 200:
+                logger.error("3X-UI login failed: %s", r.status_code)
+                return False
+            try:
+                data = r.json()
+                if data.get("success"):
+                    return True
+            except Exception:
+                return "success" in r.text.lower()
+        except Exception:
+            logger.exception("3X-UI login error")
+        return False
+
+    @staticmethod
+    def _get_inbound(session: requests.Session, server: ServerConfig, inbound_id: int) -> dict[str, Any] | None:
+        url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/get/{inbound_id}"
+        try:
+            r = session.get(url, verify=server.verify_ssl, timeout=15)
+            if r.status_code != 200:
+                logger.error("3X-UI get_inbound failed: %s", r.status_code)
+                return None
+            data = r.json()
+            if data.get("success"):
+                return data.get("obj")
+        except Exception:
+            logger.exception("3X-UI get_inbound error")
+        return None
+
+    @staticmethod
+    def _update_inbound(session: requests.Session, server: ServerConfig, inbound_id: int, data: dict[str, Any]) -> bool:
+        url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/update/{inbound_id}"
+        try:
+            r = session.post(url, json=data, verify=server.verify_ssl, timeout=30)
+            if r.status_code != 200:
+                logger.error("3X-UI update_inbound failed: %s", r.status_code)
+                return False
+            try:
+                resp = r.json()
+                return resp.get("success", False)
+            except Exception:
+                return "success" in r.text.lower()
+        except Exception:
+            logger.exception("3X-UI update_inbound error")
+        return False
+
+    @staticmethod
+    def _get_flow_from_inbound(inbound: dict[str, Any]) -> str:
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            if clients and clients[0].get("flow"):
+                return clients[0]["flow"]
+            stream = json.loads(inbound.get("streamSettings", "{}"))
+            return stream.get("realitySettings", {}).get("flow", "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _ensure_email_and_sub_id(sub: Subscription) -> None:
+        if not sub.email:
+            sub.email = f"vpn_{sub.user_id}_{sub.sub_id}"
+        if not sub.xray_sub_id:
+            sub.xray_sub_id = str(uuid5(NAMESPACE_DNS, sub.email))
+
+    @staticmethod
+    def _expiry_ms(sub: Subscription) -> int:
+        now = time.time()
+        ts = sub.effective_expires_at
+        if ts <= now:
+            return 0
+        # 3X-UI хранит expiryTime в миллисекундах
+        ms = int(ts * 1000)
+        if ms < 1577836800000 or ms > 2000000000000:
+            return 0
+        return ms
+
+    @staticmethod
+    def add_or_update_client(sub: Subscription, enable: bool = True) -> bool:
+        server = storage.server()
+        if not server.panel_url:
+            logger.info("3X-UI panel URL not configured, skipping client sync for sub #%s", sub.sub_id)
+            return False
+        XrayAPI._ensure_email_and_sub_id(sub)
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            logger.error("3X-UI login failed for sub #%s", sub.sub_id)
+            return False
+        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
+        if not inbound:
+            logger.error("3X-UI inbound %s not found for sub #%s", server.inbound_id, sub.sub_id)
+            return False
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            flow = XrayAPI._get_flow_from_inbound(inbound)
+            expiry_ms = XrayAPI._expiry_ms(sub) if enable else 0
+            client_data = {
+                "id": sub.client_uuid,
+                "flow": flow,
+                "email": sub.email,
+                "limitIp": 0,
+                "totalGB": 0,
+                "expiryTime": expiry_ms,
+                "enable": enable,
+                "tgId": "",
+                "subId": sub.xray_sub_id,
+                "reset": 0,
+                "fingerprint": server.fingerprint,
+                "publicKey": server.public_key,
+                "shortId": server.short_id,
+                "spiderX": server.spider_x,
+            }
+            updated = False
+            for c in clients:
+                if c.get("email") == sub.email:
+                    c.update(client_data)
+                    updated = True
+                    break
+            if not updated:
+                clients.append(client_data)
+            settings["clients"] = clients
+            update_data = {
+                "up": inbound.get("up", 0),
+                "down": inbound.get("down", 0),
+                "total": inbound.get("total", 0),
+                "remark": inbound.get("remark", ""),
+                "enable": inbound.get("enable", True),
+                "expiryTime": inbound.get("expiryTime", 0),
+                "listen": inbound.get("listen", ""),
+                "port": inbound.get("port", 0),
+                "protocol": inbound.get("protocol", "vless"),
+                "settings": json.dumps(settings, indent=2),
+                "streamSettings": inbound.get("streamSettings", "{}"),
+                "sniffing": inbound.get("sniffing", "{}"),
+                "allocate": inbound.get("allocate", ""),
+            }
+            if XrayAPI._update_inbound(session, server, server.inbound_id, update_data):
+                sub.xray_synced = True
+                storage.update_subscription(sub)
+                logger.info("3X-UI client synced for sub #%s (email=%s)", sub.sub_id, sub.email)
+                return True
+        except Exception:
+            logger.exception("3X-UI add_or_update_client error for sub #%s", sub.sub_id)
+        return False
 
     @staticmethod
     def remove_client(sub: Subscription) -> bool:
-        logger.info("XrayAPI.remove_client stub called for sub #%s", sub.sub_id)
-        return True
+        server = storage.server()
+        if not server.panel_url or not sub.email:
+            return False
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return False
+        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
+        if not inbound:
+            return False
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            new_clients = [c for c in clients if c.get("email") != sub.email]
+            if len(new_clients) == len(clients):
+                return True  # не найден — считаем удалённым
+            settings["clients"] = new_clients
+            update_data = {
+                "up": inbound.get("up", 0),
+                "down": inbound.get("down", 0),
+                "total": inbound.get("total", 0),
+                "remark": inbound.get("remark", ""),
+                "enable": inbound.get("enable", True),
+                "expiryTime": inbound.get("expiryTime", 0),
+                "listen": inbound.get("listen", ""),
+                "port": inbound.get("port", 0),
+                "protocol": inbound.get("protocol", "vless"),
+                "settings": json.dumps(settings, indent=2),
+                "streamSettings": inbound.get("streamSettings", "{}"),
+                "sniffing": inbound.get("sniffing", "{}"),
+                "allocate": inbound.get("allocate", ""),
+            }
+            if XrayAPI._update_inbound(session, server, server.inbound_id, update_data):
+                sub.xray_synced = False
+                storage.update_subscription(sub)
+                logger.info("3X-UI client removed for sub #%s", sub.sub_id)
+                return True
+        except Exception:
+            logger.exception("3X-UI remove_client error for sub #%s", sub.sub_id)
+        return False
+
+    @staticmethod
+    def update_expiry(sub: Subscription, enable: bool = True) -> bool:
+        return XrayAPI.add_or_update_client(sub, enable=enable)
+
+    @staticmethod
+    def get_client_stats(sub: Subscription) -> dict[str, int]:
+        server = storage.server()
+        if not server.panel_url or not sub.email:
+            return {"upload": 0, "download": 0}
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return {"upload": 0, "download": 0}
+        url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/getClientTraffics/{sub.email}"
+        try:
+            r = session.get(url, verify=server.verify_ssl, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success"):
+                    obj = data.get("obj") or {}
+                    if isinstance(obj, dict):
+                        return {"upload": int(obj.get("up", 0)), "download": int(obj.get("down", 0))}
+        except Exception:
+            logger.exception("3X-UI get_client_stats error for sub #%s", sub.sub_id)
+        return {"upload": 0, "download": 0}
+
+    @staticmethod
+    def get_global_stats() -> dict[str, int]:
+        server = storage.server()
+        if not server.panel_url:
+            return {"upload": 0, "download": 0}
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return {"upload": 0, "download": 0}
+        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
+        if inbound:
+            return {"upload": int(inbound.get("up", 0)), "download": int(inbound.get("down", 0))}
+        return {"upload": 0, "download": 0}
+
+
+def generate_vless_url(sub: Subscription, server: ServerConfig) -> str:
+    """Собирает vless:// ссылку по данным подписки и сервера."""
+    host = server.address
+    sni = server.server_name or host
+    remark = f"{server.server_name or 'VPN'}-{sub.email}"
+    params = {
+        "type": server.network,
+        "security": server.security,
+        "pbk": server.public_key,
+        "fp": server.fingerprint,
+        "sni": sni,
+        "sid": server.short_id,
+        "spx": server.spider_x,
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"vless://{sub.client_uuid}@{host}:{server.port}?{query}#{remark}"
+
+
+def generate_subscription_url(sub: Subscription, server: ServerConfig) -> str:
+    """Формирует URL подписки /sub/{subId}."""
+    base = server.subscription_url_base or server.address
+    scheme = "https" if server.sub_port == 443 else "http"
+    return f"{scheme}://{base}:{server.sub_port}/sub/{sub.xray_sub_id}"
+
+
+def _generate_qr_code(url: str) -> bytes | None:
+    """Генерирует PNG QR-код, если установлен qrcode."""
+    try:
+        import qrcode
+        from PIL import Image
+        import io as _io
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 # ==================== User Bot ====================
@@ -1613,6 +1921,16 @@ class UserBot:
             self._sub_detail(user_id, chat_id, c.message.message_id, sub_id)
             return
 
+        if action == "sub_connect":
+            sub_id = args[0]
+            self._connect(user_id, chat_id, c.message.message_id, sub_id)
+            return
+
+        if action == "sub_stats":
+            sub_id = args[0]
+            self._sub_stats(user_id, chat_id, c.message.message_id, sub_id)
+            return
+
         if action == "sub_renew":
             sub_id = args[0]
             self._renew_menu(user_id, chat_id, c.message.message_id, sub_id)
@@ -1753,7 +2071,7 @@ class UserBot:
         user["trial_used"] = True
         storage.update_user(user)
         storage._add_transaction(user_id, 0, "trial", "trial", f"sub_{sub.sub_id}")
-        XrayAPI.add_client(sub)
+        XrayAPI.add_or_update_client(sub)
         self.bot.edit_message_text(f"Пробный период активирован!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
 
@@ -1827,7 +2145,7 @@ class UserBot:
         storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}" + (f" promo:{promo_code}" if promo_code else ""))
         sub = storage.create_subscription(user_id, plan_id, months)
         storage.process_referral_rewards(user_id, price)
-        XrayAPI.add_client(sub)
+        XrayAPI.add_or_update_client(sub)
         self.clear_state(user_id)
         self.bot.edit_message_text(f"Подписка оформлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
@@ -1851,11 +2169,64 @@ class UserBot:
             self.bot.edit_message_text("Подписка не найдена.", chat_id, message_id, reply_markup=self._keyboard_main())
             return
         kb = K()
+        kb.add(B("Подключить", callback_data=f"{CB_PREFIX}sub_connect:{sub_id}"))
+        kb.add(B("Статистика", callback_data=f"{CB_PREFIX}sub_stats:{sub_id}"))
         kb.add(B("Продлить", callback_data=f"{CB_PREFIX}sub_renew:{sub_id}"))
         kb.add(B("Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
         kb.add(B("Заморозка", callback_data=f"{CB_PREFIX}sub_freeze:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}my_subs"))
         self.bot.edit_message_text(format_subscription(sub), chat_id, message_id, reply_markup=kb)
+
+    def _connect(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return
+        if not sub.active or sub.is_expired:
+            self.bot.edit_message_text("Подписка неактивна или истекла.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
+        server = storage.server()
+        if not server.address or not server.public_key or not server.short_id:
+            self.bot.edit_message_text("Сервер VPN не настроен. Обратитесь к администратору.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
+        # синхронизируем с 3X-UI, если настроена панель
+        if server.panel_url and not sub.xray_synced:
+            XrayAPI.add_or_update_client(sub)
+            sub = storage.get_subscription(sub_id)
+        vless_url = generate_vless_url(sub, server)
+        sub_url = generate_subscription_url(sub, server)
+        text = (
+            f"<b>Подключение к VPN</b>\n\n"
+            f"1. Установите приложение (v2rayNG, V2Box, Streisand и т.п.)\n"
+            f"2. Отсканируйте QR-код или нажмите ссылку/подписку.\n\n"
+            f"<b>VLESS ссылка:</b>\n<code>{vless_url}</code>\n\n"
+            f"<b>Подписка:</b>\n<code>{sub_url}</code>"
+        )
+        qr = _generate_qr_code(vless_url)
+        kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
+        try:
+            if qr:
+                self.bot.send_photo(chat_id, qr, caption=text, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb)
+        except Exception:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _sub_stats(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return
+        stats = XrayAPI.get_client_stats(sub)
+        upload = stats.get("upload", 0) / (1024 * 1024)
+        download = stats.get("download", 0) / (1024 * 1024)
+        text = (
+            f"<b>Статистика #{sub.sub_id}</b>\n\n"
+            f"🔼 Upload: {upload:.2f} MB\n"
+            f"🔽 Download: {download:.2f} MB"
+        )
+        kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     def _renew_menu(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
@@ -1882,6 +2253,7 @@ class UserBot:
         storage.deduct_balance(user_id, price, "renew", f"sub:{sub_id}:{months}")
         sub.expires_at = sub.expires_at + months * 30 * 86400
         storage.update_subscription(sub)
+        XrayAPI.update_expiry(sub)
         storage.process_referral_rewards(user_id, price)
         self.bot.edit_message_text(f"Подписка продлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
@@ -2117,7 +2489,7 @@ class UserBot:
                 storage.update_user(user)
             storage.process_referral_rewards(user_id, 0.0)
         sub = storage.create_subscription(user_id, plan_id, months)
-        XrayAPI.add_client(sub)
+        XrayAPI.add_or_update_client(sub)
         self.clear_state(user_id)
         self.bot.send_message(m.chat.id, f"Код активирован!\n{format_subscription(sub)}", reply_markup=self._keyboard_main())
 
@@ -2470,18 +2842,37 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     def state_set_server(m: Message):
         parts = m.text.strip().split()
         if len(parts) < 5:
-            bot.send_message(m.chat.id, "Формат: адрес порт public_key short_id server_name")
+            bot.send_message(
+                m.chat.id,
+                "Формат:\n"
+                "<code>адрес порт public_key short_id server_name [panel_url panel_username panel_password inbound_id verify_ssl sub_port subscription_url_base]</code>\n\n"
+                "Пример:\n"
+                "<code>vpn.example.com 443 PUBKEY SHORTID teamdocs.su http://1.2.3.4:2053 admin admin 1 true 2096 sub.example.com</code>"
+            )
             return
         try:
-            server = ServerConfig(
-                address=parts[0],
-                port=int(parts[1]),
-                public_key=parts[2],
-                short_id=parts[3],
-                server_name=parts[4],
-            )
+            server = storage.server()
+            server.address = parts[0]
+            server.port = int(parts[1])
+            server.public_key = parts[2]
+            server.short_id = parts[3]
+            server.server_name = parts[4]
+            if len(parts) >= 6:
+                server.panel_url = parts[5]
+            if len(parts) >= 7:
+                server.panel_username = parts[6]
+            if len(parts) >= 8:
+                server.panel_password = parts[7]
+            if len(parts) >= 9:
+                server.inbound_id = int(parts[8])
+            if len(parts) >= 10:
+                server.verify_ssl = parts[9].lower() in ("true", "1", "yes", "on")
+            if len(parts) >= 11:
+                server.sub_port = int(parts[10])
+            if len(parts) >= 12:
+                server.subscription_url_base = parts[11]
             storage.set_server(server)
-            bot.send_message(m.chat.id, "Сервер сохранен.")
+            bot.send_message(m.chat.id, "Сервер и 3X-UI сохранены.")
         except Exception as e:
             bot.send_message(m.chat.id, f"Ошибка: {e}")
         tg.clear_state(m.chat.id, m.from_user.id)
@@ -3078,13 +3469,20 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
 
         if section == "server":
             srv = storage.server()
-            text = (f"<b>Настройки сервера (Xray)</b>\n"
-                    f"Адрес: {srv.address}\n"
+            text = (f"<b>Настройки сервера (Xray/3X-UI)</b>\n"
+                    f"Адрес: <code>{srv.address}</code>\n"
                     f"Порт: {srv.port}\n"
                     f"publicKey: <code>{srv.public_key}</code>\n"
                     f"shortId: <code>{srv.short_id}</code>\n"
-                    f"serverName: {srv.server_name}\n\n"
-                    f"Отправьте: <code>адрес порт public_key short_id server_name</code>")
+                    f"serverName: <code>{srv.server_name}</code>\n"
+                    f"flow: <code>{srv.flow}</code> | fp: <code>{srv.fingerprint}</code>\n"
+                    f"spx: <code>{srv.spider_x}</code>\n\n"
+                    f"<b>3X-UI панель</b>\n"
+                    f"URL: <code>{srv.panel_url}</code>\n"
+                    f"Inbound: {srv.inbound_id} | verify SSL: {srv.verify_ssl}\n"
+                    f"Подписка: <code>{srv.subscription_url_base or srv.address}:{srv.sub_port}/sub/{'...'}</code>\n\n"
+                    f"Отправьте:\n"
+                    f"<code>адрес порт public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base]</code>")
             kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_server")
