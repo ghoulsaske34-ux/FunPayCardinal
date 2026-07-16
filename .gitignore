@@ -6,7 +6,8 @@
 /logs
 /storage
 /configs
-/plugins
+/plugins/*
+!/plugins/vpn_bot.py
 /build
 /dist
 test.py
