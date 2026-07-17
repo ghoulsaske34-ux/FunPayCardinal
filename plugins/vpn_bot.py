@@ -10,6 +10,8 @@ import copy
 import csv
 import ipaddress
 import base64
+import hashlib
+import hmac
 import json
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import logging
@@ -22,6 +24,20 @@ import time
 from urllib.parse import urlencode, quote
 
 import requests
+
+try:
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    HAS_FASTAPI = True
+except Exception:
+    FastAPI = None  # type: ignore
+    Request = None  # type: ignore
+    HTTPException = None  # type: ignore
+    JSONResponse = None  # type: ignore
+    uvicorn = None  # type: ignore
+    HAS_FASTAPI = False
+
 import telebot
 from telebot.types import InlineKeyboardMarkup as _InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton, Message, CallbackQuery, LabeledPrice
 
@@ -304,6 +320,7 @@ class VPNStorage:
             "channel_id": "",
             "support_id": "",
             "crypto_bot_token": "",
+            "crypto_bot_webhook_enabled": True,
             "welcome": "Добро пожаловать в VPN-бот!",
             "support": "@support",
             "bot_username": "",
@@ -1867,6 +1884,67 @@ class RatesFetcher:
             self._thread.join(timeout=5)
 
 
+
+_DEVICE_RATE_LIMIT: dict[str, list[float]] = {}
+
+
+def _verify_crypto_signature(token: str, body: str, signature: str) -> bool:
+    """Проверяет подпись вебхука CryptoBot: HMAC-SHA256(SHA256(token), body)."""
+    if not token or not signature:
+        return False
+    try:
+        secret = hashlib.sha256(token.encode("utf-8")).digest()
+        expected = hmac.new(secret, body.encode("utf-8"), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature.strip()):
+            return True
+        # fallback на base64-кодированную подпись
+        b64_sig = base64.b64encode(hmac.new(secret, body.encode("utf-8"), hashlib.sha256).digest()).decode("ascii")
+        return hmac.compare_digest(b64_sig, signature.strip())
+    except Exception:
+        logger.exception("CryptoBot signature check failed")
+        return False
+
+
+def _handle_crypto_invoice_paid(invoice: dict[str, Any]) -> None:
+    iid = str(invoice.get("invoice_id"))
+    if not iid:
+        return
+    try:
+        info = json.loads(invoice.get("payload") or "{}")
+    except Exception:
+        info = {}
+    uid = info.get("user_id")
+    if not uid:
+        local = storage.get_crypto_invoice(iid)
+        uid = local.get("user_id") if local else None
+    paid_amount = _to_dec(invoice.get("paid_amount") or invoice.get("amount") or 0)
+    paid_asset = invoice.get("paid_asset") or invoice.get("asset") or info.get("asset")
+    if not uid or not paid_amount or not paid_asset:
+        logger.warning("CryptoBot webhook missing data: invoice_id=%s uid=%s amount=%s asset=%s", iid, uid, paid_amount, paid_asset)
+        return
+
+    rub_amount = None
+    local = storage.get_crypto_invoice(iid)
+    if local and local.get("rub_amount"):
+        rub_amount = _to_dec(local["rub_amount"])
+    else:
+        rate = RatesFetcher().get_rate(paid_asset)
+        if rate:
+            rub_amount = _money_round(paid_amount * rate)
+    if rub_amount is None or rub_amount <= 0:
+        logger.error("No rub rate for %s, cannot credit invoice %s", paid_asset, iid)
+        return
+
+    credited = storage.add_balance(int(uid), rub_amount, "Crypto Bot", f"cryptobot:{paid_asset}", iid)
+    if credited:
+        storage.mark_crypto_invoice(iid, "paid", paid_amount, paid_asset)
+        try:
+            msg = f"Баланс пополнен на {_money_str(rub_amount)}₽ (~{paid_amount} {paid_asset}) через Crypto Bot."
+            if _user_bot_instance and _user_bot_instance.bot:
+                _user_bot_instance.bot.send_message(int(uid), msg)
+        except Exception:
+            pass
+
 class DeviceAuthHandler(http.server.BaseHTTPRequestHandler):
     """HTTP-эндпоинт для регистрации подключений устройств."""
 
@@ -1932,38 +2010,122 @@ class DeviceAuthHandler(http.server.BaseHTTPRequestHandler):
 
 
 class DeviceAuthServer:
-    """Фоновый HTTP-сервер авторизации устройств."""
+    """FastAPI-сервер авторизации устройств и вебхуков CryptoBot."""
 
     def __init__(self, port: int = 8080) -> None:
         self.port = port
-        self._server: socketserver.ThreadingTCPServer | None = None
+        self._app: Any = None
+        self._server: Any = None
         self._thread: threading.Thread | None = None
 
+    @staticmethod
+    def _rate_limit(ip: str, max_req: int = 20, window: int = 60) -> bool:
+        now = time.time()
+        history = _DEVICE_RATE_LIMIT.get(ip, [])
+        history = [t for t in history if now - t < window]
+        if len(history) >= max_req:
+            _DEVICE_RATE_LIMIT[ip] = history
+            return False
+        history.append(now)
+        _DEVICE_RATE_LIMIT[ip] = history
+        return True
+
+    def _build_app(self) -> Any:
+        if not HAS_FASTAPI or FastAPI is None:
+            raise RuntimeError("fastapi/uvicorn not installed")
+        app = FastAPI()
+
+        @app.get("/health")
+        async def health() -> dict:
+            return {"ok": True}
+
+        @app.post("/connect")
+        async def connect(request: Request) -> Any:
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip):
+                raise HTTPException(status_code=429, detail="rate_limit")
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid_json")
+
+            auth = request.headers.get("Authorization", "")
+            token = ""
+            if auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+            if not token:
+                token = str(body.get("token", "")).strip()
+
+            expected = storage.config.get("device_auth_token", "")
+            if not expected:
+                return JSONResponse({"allowed": False, "reason": "auth_not_configured"}, status_code=503)
+            if token != expected:
+                return JSONResponse({"allowed": False, "reason": "invalid_token"}, status_code=403)
+
+            sub_id = str(body.get("sub_id", "")).strip()
+            user_agent = str(body.get("user_agent", "")).strip() or "unknown"
+            try:
+                traffic_bytes = int(body.get("traffic_bytes", 0) or 0)
+            except (ValueError, TypeError):
+                traffic_bytes = 0
+            if not sub_id:
+                return JSONResponse({"allowed": False, "reason": "missing sub_id"}, status_code=400)
+
+            try:
+                result = storage.record_connection(sub_id, ip, user_agent, time.time(), traffic_bytes)
+                return JSONResponse(result)
+            except Exception:
+                logger.exception("DeviceAuthServer connect error")
+                return JSONResponse({"allowed": False, "reason": "server_error"}, status_code=500)
+
+        @app.post("/cryptobot/webhook")
+        async def cryptobot_webhook(request: Request) -> dict:
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=100, window=60):
+                raise HTTPException(status_code=429)
+            token = storage.config.get("crypto_bot_token", "")
+            if not token:
+                raise HTTPException(status_code=503, detail="crypto_bot_token not set")
+            raw = await request.body()
+            raw_str = raw.decode("utf-8")
+            signature = request.headers.get("crypto-pay-api-signature", "")
+            if not _verify_crypto_signature(token, raw_str, signature):
+                raise HTTPException(status_code=401, detail="invalid signature")
+            try:
+                data = json.loads(raw_str)
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            if data.get("update_type") == "invoice_paid":
+                _handle_crypto_invoice_paid(data.get("payload", {}))
+            return {"ok": True}
+
+        return app
+
     def start(self) -> None:
-        try:
-            self._server = socketserver.ThreadingTCPServer(("0.0.0.0", self.port), DeviceAuthHandler)
-        except OSError as e:
-            logger.error("DeviceAuthServer cannot bind to port %s: %s", self.port, e)
+        if not HAS_FASTAPI or uvicorn is None:
+            logger.error("fastapi/uvicorn not installed, cannot start DeviceAuthServer")
             return
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        try:
+            self._app = self._build_app()
+            config = uvicorn.Config(self._app, host="0.0.0.0", port=self.port, log_level="info", loop="asyncio")
+            self._server = uvicorn.Server(config)
+        except Exception as e:
+            logger.error("DeviceAuthServer cannot configure: %s", e)
+            return
+        self._thread = threading.Thread(target=self._server.run, daemon=True)
         self._thread.start()
-        logger.info("DeviceAuthServer started on port %s", self.port)
+        logger.info("DeviceAuthServer (FastAPI) started on port %s", self.port)
 
     def stop(self) -> None:
         if self._server:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
+            try:
+                self._server.should_exit = True
+            except Exception:
+                pass
         if self._thread:
             self._thread.join(timeout=5)
-
-
-TEMP_SESSIONS: dict[str, dict[str, Any]] = {}
-TEMP_LOCK = threading.RLock()
-TEMP_LAST_CREATE: dict[str, float] = {}
-TEMP_RATE_LIMIT_WINDOW = 3600
-_temp_profile_server: "TempProfileServer | None" = None
-
+        self._server = None
+        self._thread = None
 
 class TempProfileHandler(http.server.BaseHTTPRequestHandler):
     """HTTP-эндпоинт для 30-минутных временных VLESS профилей."""
@@ -4065,8 +4227,11 @@ class UserBot:
                 storage.save_config()
         except Exception:
             logger.exception("Не удалось получить username user-бота")
-        self._crypto_poller = CryptoBotPoller(self)
-        self._crypto_poller.start()
+        if storage.config.get("crypto_bot_webhook_enabled", True):
+            self._crypto_poller = None  # webhooks обрабатывает DeviceAuthServer
+        else:
+            self._crypto_poller = CryptoBotPoller(self)
+            self._crypto_poller.start()
         self._scheduler = SubscriptionScheduler(self)
         self._scheduler.start()
         self._rates_fetcher = RatesFetcher()
