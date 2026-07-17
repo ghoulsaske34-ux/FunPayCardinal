@@ -23,7 +23,7 @@ import socketserver
 import sqlite3
 import threading
 import time
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, parse_qsl
 
 import requests
 
@@ -97,6 +97,27 @@ MEDIA_DIR = STORAGE_DIR / "media"
 DB_FILE = STORAGE_DIR / "vpn_bot.db"
 
 CB_PREFIX = "vpn:"
+
+
+def _load_mini_app_html() -> str:
+    """Загружает HTML Mini App из рядом лежащего файла."""
+    plugin_dir = Path(__file__).parent
+    candidates = [
+        plugin_dir / "vpn_bot_mini_app.html",
+        plugin_dir / "vpn_bot (7)_mini_app.html",
+        Path("plugins") / "vpn_bot_mini_app.html",
+        Path("plugins") / "vpn_bot (7)_mini_app.html",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    return "<html><body><h1>Mini App не найден</h1></body></html>"
+
+
+MINI_APP_HTML = _load_mini_app_html()
 
 MESSAGE_MEDIA_LABELS = {
     "welcome": "Приветствие (/start)",
@@ -329,6 +350,8 @@ class VPNStorage:
             "yookassa_webhook_url": "",
             "yookassa_webhook_enabled": False,
             "subscription_public_url": "",
+            "mini_app_public_url": "",
+            "mini_app_enabled": True,
             "backup_enabled": True,
             "backup_interval_hours": 24,
             "backup_keep_count": 7,
@@ -2173,6 +2196,224 @@ class HealthChecker:
             self._thread.join(timeout=5)
 
 
+def _verify_telegram_init_data(init_data: str) -> dict[str, Any] | None:
+    """Проверяет initData Telegram Web App и возвращает данные пользователя."""
+    if not init_data:
+        return None
+    try:
+        params = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = params.pop("hash", "")
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        bot_token = storage.config.get("user_bot_token", "")
+        if not bot_token and _user_bot_instance:
+            bot_token = getattr(_user_bot_instance.bot, "token", "") or ""
+        if not bot_token:
+            return None
+        secret_key = hmac.new(hashlib.sha256(bot_token.encode()).digest(), b"WebAppData", hashlib.sha256).digest()
+        expected = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(received_hash, expected):
+            return None
+        user_raw = params.get("user")
+        if user_raw:
+            user = json.loads(user_raw)
+            if isinstance(user, dict):
+                return user
+    except Exception:
+        logger.exception("Mini App initData verification failed")
+    return None
+
+
+class MiniAppAPI:
+    """API для Telegram Mini App (Web App)."""
+
+    @staticmethod
+    def _user_from_init(init_data: str) -> dict[str, Any] | None:
+        return _verify_telegram_init_data(init_data)
+
+    @staticmethod
+    def config() -> dict[str, Any]:
+        plans = []
+        for pid, plan in storage.plans().items():
+            if pid == "trial":
+                continue
+            prices = {str(m): _money_str(p) for m, p in plan.prices.items() if p is not None}
+            if prices:
+                plans.append({
+                    "id": pid,
+                    "name": plan.name,
+                    "max_devices": plan.max_devices,
+                    "device_text": plan.device_text,
+                    "host_id": plan.host_id,
+                    "prices": prices,
+                })
+        return {
+            "bot_username": storage.config.get("bot_username", ""),
+            "support": storage.config.get("support", "@support"),
+            "support_id": storage.config.get("support_id", ""),
+            "channel_id": storage.config.get("channel_id", ""),
+            "trial_days": storage.config.get("trial_days", TRIAL_DAYS),
+            "mini_app_public_url": storage.config.get("mini_app_public_url", ""),
+            "plans": plans,
+        }
+
+    @staticmethod
+    def _subscription_dict(sub: Subscription) -> dict[str, Any]:
+        plan = storage.plan(sub.plan_id)
+        server = storage.get_host(sub.host_id) or storage.server()
+        vless_url = generate_vless_url(sub, server) if server else ""
+        sub_url = generate_subscription_url(sub, server) if server else ""
+        devices_count = len(sub.devices)
+        return {
+            "sub_id": sub.sub_id,
+            "plan_id": sub.plan_id,
+            "plan_name": plan.name if plan else sub.plan_id,
+            "max_devices": plan.max_devices if plan else 0,
+            "device_text": plan.device_text if plan else "",
+            "months": sub.months,
+            "created_at": sub.created_at,
+            "expires_at": sub.expires_at,
+            "active": sub.active,
+            "devices_count": devices_count,
+            "vless_url": vless_url,
+            "sub_url": sub_url,
+            "singbox_url": f"{sub_url}?format=singbox" if sub_url else "",
+            "clash_url": f"{sub_url}?format=clash" if sub_url else "",
+        }
+
+    @staticmethod
+    def me(user_id: int, tg_user: dict[str, Any] | None = None) -> dict[str, Any]:
+        user = storage.get_user(user_id)
+        if tg_user:
+            username = tg_user.get("username") or user.get("username", "")
+            if username and user.get("username") != username:
+                user["username"] = username
+                storage.update_user(user)
+        subs = [MiniAppAPI._subscription_dict(s) for s in storage.active_subscriptions(user_id)]
+        level1, level2 = storage.get_user_referrals(user_id)
+        earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
+        total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
+        is_admin = storage.is_admin_user(user_id)
+        return {
+            "ok": True,
+            "user": {
+                "user_id": user.get("user_id"),
+                "username": user.get("username", ""),
+                "balance": float(_money_round(_to_dec(user.get("balance", 0)))),
+                "referral_balance": float(_money_round(_to_dec(user.get("referral_balance", 0)))),
+                "total_spent": float(_money_round(_to_dec(user.get("total_spent", 0)))),
+                "total_months": int(user.get("total_months", 0)),
+                "referral_code": user.get("referral_code", f"ref_{user_id}"),
+                "trial_used": bool(user.get("trial_used")),
+                "joined_at": float(user.get("joined_at", 0)),
+            },
+            "subscriptions": subs,
+            "plans": MiniAppAPI.config()["plans"],
+            "referrals": {
+                "level1_count": len(level1),
+                "level2_count": len(level2),
+                "earnings": float(_money_round(total_earn)),
+            },
+            "is_admin": is_admin,
+        }
+
+    @staticmethod
+    def purchase(user_id: int, plan_id: str, months: int) -> dict[str, Any]:
+        base_price = storage.price(plan_id, months)
+        if base_price is None:
+            return {"ok": False, "error": "Тариф или срок не найдены"}
+        ref_discount = storage.apply_referral_discount(user_id, base_price)
+        price = _money_round(ref_discount if ref_discount and ref_discount < base_price else base_price)
+        user = storage.get_user(user_id)
+        if _to_dec(user.get("balance", 0)) < price:
+            return {"ok": False, "error": "Недостаточно средств", "need_payment": True}
+        if not storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}"):
+            return {"ok": False, "error": "Ошибка списания средств"}
+        if ref_discount and ref_discount < base_price:
+            storage.mark_first_purchase_discount_used(user_id)
+        sub = storage.create_subscription(user_id, plan_id, months)
+        storage.process_referral_rewards(user_id, price)
+        storage.add_purchase_stats(user_id, price, months)
+        XrayAPI.add_or_update_client(sub)
+        return {"ok": True, "subscription": MiniAppAPI._subscription_dict(sub)}
+
+    @staticmethod
+    def purchase_stars_subscription(user_id: int, plan_id: str) -> dict[str, Any]:
+        plan = storage.plan(plan_id)
+        if not plan:
+            return {"ok": False, "error": "Тариф не найден"}
+        bot = getattr(_user_bot_instance, "bot", None)
+        if not bot:
+            return {"ok": False, "error": "Бот не запущен"}
+        monthly_price = storage.price(plan_id, 1)
+        if monthly_price is None or monthly_price <= 0:
+            for d in DURATIONS:
+                p = storage.price(plan_id, d)
+                if p is not None and d:
+                    monthly_price = _money_round(p / Decimal(d))
+                    break
+        if monthly_price is None or monthly_price <= 0:
+            return {"ok": False, "error": "Цена не установлена"}
+        title = f"Подписка {plan.name}"
+        description = f"Автопродление каждые 30 дней — {_money_str(monthly_price)}₽/мес."
+        link = StarsPayment.create_subscription_link(bot, user_id, plan_id, 1, monthly_price, title, description)
+        if link:
+            return {"ok": True, "payment_url": link}
+        return {"ok": False, "error": "Не удалось создать ссылку на Stars-подписку"}
+
+    @staticmethod
+    def deposit(user_id: int, method: str, amount: int, asset: str | None = None) -> dict[str, Any]:
+        if amount < 10:
+            return {"ok": False, "error": "Минимальная сумма 10₽"}
+        rub_amount = Decimal(str(amount))
+        bot = getattr(_user_bot_instance, "bot", None)
+        if method == "stars":
+            if not bot:
+                return {"ok": False, "error": "Бот не запущен"}
+            link = StarsPayment.create_deposit_link(bot, user_id, rub_amount)
+            if link:
+                return {"ok": True, "payment_url": link}
+            return {"ok": False, "error": "Не удалось создать Stars-инвойс"}
+        if method == "cryptobot":
+            token = storage.config.get("crypto_bot_token", "")
+            if not token:
+                return {"ok": False, "error": "CryptoBot не настроен"}
+            asset = (asset or "USDT").upper()
+            rate = RatesFetcher().get_rate(asset)
+            if not rate:
+                return {"ok": False, "error": f"Курс {asset} не загружен"}
+            crypto_amount = _to_dec(rub_amount / rate).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            if crypto_amount <= 0:
+                return {"ok": False, "error": "Сумма слишком мала"}
+            api = CryptoBotAPI(token)
+            result = api.create_invoice(user_id, crypto_amount, asset)
+            pay_url = result.get("pay_url")
+            invoice_id = result.get("invoice_id")
+            if pay_url and invoice_id:
+                storage.add_crypto_invoice(invoice_id, user_id, crypto_amount, asset, rub_amount)
+                return {"ok": True, "payment_url": pay_url}
+            return {"ok": False, "error": result.get("error", "Не удалось создать счёт")}
+        if method == "yookassa":
+            shop_id = storage.config.get("yookassa_shop_id", "")
+            secret_key = storage.config.get("yookassa_secret_key", "")
+            if not shop_id or not secret_key:
+                return {"ok": False, "error": "YooKassa не настроена"}
+            return_url = storage.config.get("yookassa_return_url") or storage.config.get("mini_app_public_url") or f"https://t.me/{storage.config.get('bot_username', '')}"
+            if not return_url:
+                return_url = "https://t.me"
+            api = YooKassaAPI(shop_id, secret_key)
+            result = api.create_payment(user_id, rub_amount, return_url)
+            if not result.get("ok"):
+                return {"ok": False, "error": result.get("error", "Ошибка создания платежа")}
+            payment = result.get("payment") or {}
+            pay_url = payment.get("confirmation", {}).get("confirmation_url")
+            payment_id = payment.get("id")
+            if not pay_url or not payment_id:
+                return {"ok": False, "error": "YooKassa не вернула ссылку"}
+            storage.add_pending_payment(payment_id, user_id, rub_amount, "yookassa")
+            return {"ok": True, "payment_url": pay_url}
+        return {"ok": False, "error": "Неизвестный способ оплаты"}
+
+
 class MetricsCollector:
     """Собирает метрики для JSON/Prometheus endpoint."""
 
@@ -2592,6 +2833,115 @@ class DeviceAuthServer:
                 return Response(content=build_clash_config(vless_url, server, sub), media_type="text/yaml; charset=utf-8")
             raise HTTPException(status_code=400, detail="unsupported format")
 
+        # ---- Telegram Mini App (Web App) endpoints ----
+        def _get_init_data(request: Request) -> str:
+            q = request.query_params.get("init_data") or request.headers.get("x-telegram-init-data") or ""
+            if q:
+                return q
+            # fallback для POST/Body
+            try:
+                data = request.json()
+                if isinstance(data, dict):
+                    return data.get("init_data") or ""
+            except Exception:
+                pass
+            return ""
+
+        @app.get("/mini-app")
+        async def mini_app_index(request: Request) -> Any:
+            if not storage.config.get("mini_app_enabled", True):
+                raise HTTPException(status_code=503, detail="Mini App disabled")
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=120, window=60):
+                raise HTTPException(status_code=429)
+            html = MINI_APP_HTML or "<html><body>Mini App not configured</body></html>"
+            return Response(content=html, media_type="text/html; charset=utf-8")
+
+        @app.get("/mini-app/api/config")
+        async def mini_app_config_public(request: Request) -> Any:
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=120, window=60):
+                raise HTTPException(status_code=429)
+            return JSONResponse(MiniAppAPI.config())
+
+        @app.get("/mini-app/api/me")
+        async def mini_app_me(request: Request) -> Any:
+            init_data = request.query_params.get("init_data") or request.headers.get("x-telegram-init-data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            return JSONResponse(MiniAppAPI.me(user.get("id", 0), user))
+
+        @app.get("/mini-app/api/qr")
+        async def mini_app_qr(request: Request) -> Any:
+            init_data = request.query_params.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            data = request.query_params.get("data", "")
+            if not data:
+                raise HTTPException(status_code=400, detail="missing data")
+            qr = _generate_qr_code(data)
+            if not qr:
+                raise HTTPException(status_code=500, detail="qrcode not available")
+            return Response(content=qr, media_type="image/png")
+
+        @app.post("/mini-app/api/deposit")
+        async def mini_app_deposit(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            method = str(body.get("method", "")).lower()
+            amount = int(body.get("amount", 0) or 0)
+            asset = str(body.get("asset", "") or "")
+            return JSONResponse(MiniAppAPI.deposit(user_id, method, amount, asset))
+
+        @app.post("/mini-app/api/purchase")
+        async def mini_app_purchase(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            plan_id = str(body.get("plan_id", ""))
+            months = int(body.get("months", 0) or 0)
+            return JSONResponse(MiniAppAPI.purchase(user_id, plan_id, months))
+
+        @app.post("/mini-app/api/purchase-stars-sub")
+        async def mini_app_purchase_stars_sub(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            plan_id = str(body.get("plan_id", ""))
+            return JSONResponse(MiniAppAPI.purchase_stars_subscription(user_id, plan_id))
+
+        @app.get("/mini-app/api/metrics")
+        async def mini_app_metrics(request: Request) -> Any:
+            init_data = request.query_params.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            if not storage.is_admin_user(user_id):
+                raise HTTPException(status_code=403, detail="admin only")
+            return JSONResponse(MetricsCollector.collect())
+
         return app
 
     def start(self) -> None:
@@ -2908,6 +3258,26 @@ class StarsPayment:
         except Exception as e:
             logger.exception("Stars invoice creation failed: %s", e)
             return False
+
+    @staticmethod
+    def create_deposit_link(bot, user_id: int, rub_amount: Decimal) -> str | None:
+        """Создаёт одноразовую ссылку на инвойс Stars для пополнения баланса."""
+        stars_amount = StarsPayment._rub_to_stars(rub_amount)
+        if stars_amount <= 0 or not bot:
+            return None
+        payload = f"stars_{user_id}_{int(rub_amount)}"
+        params = {
+            "title": f"Пополнение на {_money_str(rub_amount)}₽",
+            "description": "Баланс VPN-бота",
+            "payload": payload,
+            "provider_token": "",
+            "currency": "XTR",
+            "prices": [{"label": "Звёзды", "amount": stars_amount}],
+        }
+        result = StarsPayment._api_call(bot, "createInvoiceLink", params)
+        if isinstance(result, str) and result.startswith(("http://", "https://")):
+            return result
+        return None
 
     @staticmethod
     def create_subscription_link(bot, user_id: int, plan_id: str, months: int, rub_amount: Decimal, title: str, description: str) -> str | None:
@@ -5035,6 +5405,34 @@ class UserBot:
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
+    def _setup_mini_app_button(self) -> None:
+        """Устанавливает кнопку MenuButtonWebApp в user-боте, если задан URL Mini App."""
+        try:
+            if not storage.config.get("mini_app_enabled", True):
+                return
+            url = storage.config.get("mini_app_public_url", "")
+            if not url:
+                return
+            bot_token = storage.config.get("user_bot_token", "")
+            if not bot_token and self.bot and getattr(self.bot, "token", None):
+                bot_token = self.bot.token
+            if not bot_token:
+                return
+            menu = {
+                "type": "web_app",
+                "text": "Личный кабинет",
+                "web_app": {"url": url},
+            }
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/setMyDefaultMenuButton",
+                json={"menu_button": menu},
+                timeout=30,
+            )
+            if r.status_code == 200 and r.json().get("ok"):
+                logger.info("Mini App menu button set to %s", url)
+        except Exception:
+            logger.exception("Mini App button setup failed")
+
     # ---- lifecycle ----
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -5046,6 +5444,7 @@ class UserBot:
                 storage.save_config()
         except Exception:
             logger.exception("Не удалось получить username user-бота")
+        self._setup_mini_app_button()
         if storage.config.get("crypto_bot_webhook_enabled", True):
             self._crypto_poller = None  # webhooks обрабатывает DeviceAuthServer
         else:
@@ -5235,6 +5634,23 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             storage.config["subscription_public_url"] = url.rstrip("/")
             storage.save_config()
             bot.send_message(m.chat.id, "Публичный URL подписок сохранён.")
+        else:
+            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://, или <code>-</code> для сброса.")
+            return
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_mini_app_url(m: Message):
+        url = m.text.strip()
+        if url in ("-", "", "none"):
+            storage.config["mini_app_public_url"] = ""
+            storage.save_config()
+            bot.send_message(m.chat.id, "URL Mini App сброшен.")
+        elif url.startswith(("http://", "https://")):
+            storage.config["mini_app_public_url"] = url.rstrip("/")
+            storage.save_config()
+            bot.send_message(m.chat.id, "URL Mini App сохранён. Перезапустите user-бота, чтобы обновить кнопку меню.")
+            if _user_bot_instance:
+                _user_bot_instance._setup_mini_app_button()
         else:
             bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://, или <code>-</code> для сброса.")
             return
@@ -5921,6 +6337,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_yookassa_return, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_return"))
     tg.msg_handler(state_set_yookassa_webhook, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_webhook"))
     tg.msg_handler(state_set_sub_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_sub_url"))
+    tg.msg_handler(state_set_mini_app_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_mini_app_url"))
     tg.msg_handler(state_set_server, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_server"))
     tg.msg_handler(state_admin_host_add, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_add"))
     tg.msg_handler(state_admin_host_data, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_data"))
@@ -6007,6 +6424,7 @@ def _admin_main_keyboard() -> K:
         B("📈 Статистика", callback_data=f"{CB_PREFIX}admin:stats", style="success"),
         B("⚙️ Настройки", callback_data=f"{CB_PREFIX}admin:settings", style="primary"),
         B("🌐 URL подписок", callback_data=f"{CB_PREFIX}admin:sub_url", style="primary"),
+        B("🚀 Mini App", callback_data=f"{CB_PREFIX}admin:mini_app", style="primary"),
         B("💾 Бэкапы", callback_data=f"{CB_PREFIX}admin:backup", style="primary"),
         B("🔔 Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications", style="success"),
         B("📝 Жалобы", callback_data=f"{CB_PREFIX}admin:complaints", style="danger"),
@@ -7004,6 +7422,36 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
         bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
         tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_sub_url")
+        return
+
+    if section == "mini_app":
+        if len(args) >= 2 and args[1] == "toggle":
+            storage.config["mini_app_enabled"] = not storage.config.get("mini_app_enabled", True)
+            storage.save_config()
+            status = "включён" if storage.config["mini_app_enabled"] else "выключён"
+            bot.answer_callback_query(c.id, f"Mini App {status}.")
+            bot.edit_message_text(f"Mini App {status}.", chat_id, c.message.message_id,
+                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:mini_app")))
+            return
+        if len(args) >= 2 and args[1] == "reload":
+            global MINI_APP_HTML
+            MINI_APP_HTML = _load_mini_app_html()
+            bot.answer_callback_query(c.id, "HTML Mini App перезагружен.")
+            return
+        enabled = storage.config.get("mini_app_enabled", True)
+        current = storage.config.get("mini_app_public_url", "") or "не задан"
+        text = (f"<b>🚀 Mini App</b>\n\n"
+                f"Статус: {'Вкл' if enabled else 'Выкл'}\n"
+                f"URL: <code>{current}</code>\n\n"
+                f"Отправьте публичный URL, по которому открывается Mini App "
+                f"(например, https://ваш_домен/mini-app).\n"
+                f"Отправьте <code>-</code>, чтобы сбросить.")
+        kb = K()
+        kb.add(B("Выключить" if enabled else "Включить", callback_data=f"{CB_PREFIX}admin:mini_app:toggle"))
+        kb.add(B("Обновить HTML", callback_data=f"{CB_PREFIX}admin:mini_app:reload"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+        bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_mini_app_url")
         return
 
     if section == "backup" and len(args) <= 1:

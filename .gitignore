@@ -8,6 +8,7 @@
 /configs
 /plugins/*
 !/plugins/vpn_bot.py
+!/plugins/vpn_bot_mini_app.html
 /build
 /dist
 test.py
