@@ -322,6 +322,7 @@ class VPNStorage:
             "yookassa_secret_key": "",
             "yookassa_return_url": "",
             "yookassa_webhook_url": "",
+            "yookassa_webhook_enabled": False,
             "welcome": "Добро пожаловать в VPN-бот!",
             "support": "@support",
             "bot_username": "",
@@ -2229,6 +2230,8 @@ class DeviceAuthServer:
             ip = request.client.host if request.client else "unknown"
             if not DeviceAuthServer._rate_limit(ip, max_req=100, window=60):
                 raise HTTPException(status_code=429)
+            if not storage.config.get("yookassa_webhook_enabled", False):
+                raise HTTPException(status_code=503, detail="yookassa webhooks disabled")
             try:
                 data = await request.json()
             except Exception:
