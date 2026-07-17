@@ -4788,8 +4788,8 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             bot.edit_message_text("<b>🖼 Медиа сообщений</b>\n\nВыберите сообщение, для которого задать фото/видео:", chat_id, c.message.message_id, reply_markup=kb)
             return
 
-        if section == "msg_media" and len(args) >= 1:
-            key = args[0]
+        if section == "msg_media" and len(args) >= 2:
+            key = args[1]
             label = MESSAGE_MEDIA_LABELS.get(key, key)
             mm = storage.config.setdefault("message_media", {})
             data = mm.get(key, {})
@@ -4806,8 +4806,8 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_msg_media", {"key": key})
             return
 
-        if section == "del_msg_media" and len(args) >= 1:
-            key = args[0]
+        if section == "del_msg_media" and len(args) >= 2:
+            key = args[1]
             mm = storage.config.setdefault("message_media", {})
             if key in mm:
                 del mm[key]
