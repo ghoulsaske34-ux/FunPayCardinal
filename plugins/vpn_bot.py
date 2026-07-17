@@ -2515,6 +2515,10 @@ class UserBot:
                 except Exception:
                     pass
 
+        @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "manual_channel_verify"))
+        def on_manual_channel_verify(m: Message):
+            self._on_manual_channel_verify(m)
+
     # ---- validation helpers ----
     @staticmethod
     def _is_valid_ip(text: str) -> bool:
@@ -2670,7 +2674,8 @@ class UserBot:
     def _prompt_channel(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         channel_id = storage.config.get("channel_id", "")
         channel_text = f"<b>{_escape(channel_id)}</b>" if channel_id else "наш канал"
-        text = f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>"
+        text = (f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>\n\n"
+                f"Если кнопка «Проверить» не срабатывает — перешлите мне любой пост из канала.")
         kb = self._channel_keyboard(channel_id)
         if message_id is not None:
             try:
@@ -2678,6 +2683,7 @@ class UserBot:
             except Exception:
                 pass
         self._send_menu_message(chat_id, text, reply_markup=kb, prefer_welcome_media=False)
+        self.set_state(user_id, "manual_channel_verify", {})
 
     def _on_channel_ok(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         user = storage.get_user(user_id)
@@ -2689,6 +2695,27 @@ class UserBot:
             except Exception:
                 pass
         self._send_welcome(user_id, chat_id)
+
+    def _on_manual_channel_verify(self, m: Message) -> None:
+        user_id = m.from_user.id
+        chat_id = m.chat.id
+        channel_id = storage.config.get("channel_id", "")
+        if not channel_id:
+            self.clear_state(user_id)
+            self._send_welcome(user_id, chat_id)
+            return
+        forwarded = m.forward_from_chat
+        if not forwarded:
+            self.bot.send_message(chat_id, "Перешлите пост из канала, чтобы подтвердить подписку.")
+            return
+        if str(forwarded.id) == str(channel_id).strip():
+            self.clear_state(user_id)
+            self.bot.send_message(chat_id, "✅ Подписка подтверждена!")
+            with self._state_lock:
+                self._channel_cache[user_id] = (True, time.time())
+            self._on_channel_ok(user_id, chat_id)
+        else:
+            self.bot.send_message(chat_id, "❌ Это не тот канал. Перешлите пост из нужного канала.")
 
     def _get_channel_invite(self, channel_id: str) -> str | None:
         """Пытается получить рабочую ссылку-приглашение на канал."""
@@ -2747,6 +2774,14 @@ class UserBot:
 
         if self._check_maintenance(user_id, chat_id):
             return
+
+        if action == "check_channel":
+            if self._channel_check(user_id, chat_id, force=True, message_id=c.message.message_id):
+                self.bot.answer_callback_query(c.id, "✅ Подписка подтверждена!", show_alert=True)
+            else:
+                self.bot.answer_callback_query(c.id, "❌ Подписка не найдена. Нажмите кнопку перехода и попробуйте снова.", show_alert=True)
+            return
+
         if not self._channel_check(user_id, chat_id, message_id=c.message.message_id):
             return
 
@@ -2787,13 +2822,6 @@ class UserBot:
         if action == "toggle" and args:
             storage.toggle_user_setting(user_id, args[0])
             self._settings_menu(user_id, chat_id, c.message.message_id)
-            return
-
-        if action == "check_channel":
-            if self._channel_check(user_id, chat_id, force=True, message_id=c.message.message_id):
-                self.bot.answer_callback_query(c.id, "✅ Подписка подтверждена!", show_alert=True)
-            else:
-                self.bot.answer_callback_query(c.id, "❌ Подписка не найдена. Нажмите кнопку перехода и попробуйте снова.", show_alert=True)
             return
 
         if action == "trial":
