@@ -2422,6 +2422,21 @@ class UserBot:
             logger.exception("Ошибка отправки медиа, отправляю текстом")
             self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
 
+    def _edit_message(self, text: str, chat_id: int, message_id: int, reply_markup=None) -> None:
+        """Редактирует текст или подпись (caption) сообщения в зависимости от типа."""
+        try:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception as e:
+            err = str(e).lower()
+            if "there is no text" in err or "message to edit not found" in err or "wrong file" in err or "object" in err:
+                try:
+                    self.bot.edit_message_caption(text, chat_id, message_id, reply_markup=reply_markup)
+                except Exception:
+                    logger.exception("Ошибка редактирования подписи, отправляю новым сообщением")
+                    self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
+            else:
+                raise
+
     def _send_menu_message(self, chat_id: int, text: str, reply_markup=None, prefer_welcome_media: bool = False, media_key: str | None = None) -> None:
         file_source = ""
         media_type = "photo"
@@ -2784,7 +2799,7 @@ class UserBot:
             return
 
         if action == "main":
-            self.bot.edit_message_text("Главное меню:", chat_id, c.message.message_id, reply_markup=self._keyboard_main())
+            self._edit_message("Главное меню:", chat_id, c.message.message_id, reply_markup=self._keyboard_main())
             return
 
         if action == "profile":
@@ -2801,7 +2816,7 @@ class UserBot:
 
         if action == "complaint":
             self.set_state(user_id, "complaint_text", {})
-            self.bot.edit_message_text("Опишите вашу жалобу/проблему:", chat_id, c.message.message_id,
+            self._edit_message("Опишите вашу жалобу/проблему:", chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}help")))
             return
 
@@ -2856,13 +2871,13 @@ class UserBot:
             if state and state.get("data", {}).get("message_id"):
                 state_data["message_id"] = state["data"]["message_id"]
             self.set_state(user_id, "enter_promo", state_data)
-            self.bot.edit_message_text("Отправьте промокод:", chat_id, c.message.message_id,
+            self._edit_message("Отправьте промокод:", chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}")))
             return
 
         if action == "activate_code":
             self.set_state(user_id, "enter_activation_code", {})
-            self.bot.edit_message_text("Отправьте код активации (подарочный или партнёрский):", chat_id, c.message.message_id,
+            self._edit_message("Отправьте код активации (подарочный или партнёрский):", chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}main")))
             return
 
@@ -2903,14 +2918,14 @@ class UserBot:
         if action == "add_device":
             sub_id = args[0]
             self.set_state(user_id, "add_device_ip", {"sub_id": sub_id})
-            self.bot.edit_message_text("Отправьте IP-адрес устройства (например, 1.2.3.4):", chat_id, c.message.message_id,
+            self._edit_message("Отправьте IP-адрес устройства (например, 1.2.3.4):", chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}")))
             return
 
         if action == "del_device":
             sub_id = args[0]
             self.set_state(user_id, "del_device_ip", {"sub_id": sub_id})
-            self.bot.edit_message_text("Отправьте IP-адрес устройства для удаления:", chat_id, c.message.message_id,
+            self._edit_message("Отправьте IP-адрес устройства для удаления:", chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}")))
             return
 
@@ -2944,17 +2959,17 @@ class UserBot:
             asset = args[0] if args else "USDT"
             rate = RatesFetcher().get_rate(asset)
             if not rate:
-                self.bot.edit_message_text(f"Курс для {asset} ещё не загружен. Попробуйте через минуту.", chat_id, c.message.message_id,
+                self._edit_message(f"Курс для {asset} ещё не загружен. Попробуйте через минуту.", chat_id, c.message.message_id,
                                            reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
                 return
             self.set_state(user_id, "deposit_crypto_rubles", {"asset": asset, "message_id": c.message.message_id})
-            self.bot.edit_message_text(f"Выберите сумму пополнения в рублях ({asset}):", chat_id, c.message.message_id,
+            self._edit_message(f"Выберите сумму пополнения в рублях ({asset}):", chat_id, c.message.message_id,
                                        reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_crypto", f"{CB_PREFIX}deposit", asset))
             return
 
         if action == "deposit_stars":
             self.set_state(user_id, "deposit_stars_rubles", {"message_id": c.message.message_id})
-            self.bot.edit_message_text("Выберите сумму пополнения в рублях (Telegram Stars):", chat_id, c.message.message_id,
+            self._edit_message("Выберите сумму пополнения в рублях (Telegram Stars):", chat_id, c.message.message_id,
                                        reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars", f"{CB_PREFIX}deposit"))
             return
 
@@ -2962,7 +2977,7 @@ class UserBot:
             asset, rub_str = args[0], args[1]
             if rub_str == "custom":
                 self.set_state(user_id, "deposit_crypto_rubles", {"asset": asset, "message_id": c.message.message_id})
-                self.bot.edit_message_text("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
+                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
                                            reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
                 return
             try:
@@ -2976,7 +2991,7 @@ class UserBot:
             rub_str = args[0]
             if rub_str == "custom":
                 self.set_state(user_id, "deposit_stars_rubles", {"message_id": c.message.message_id})
-                self.bot.edit_message_text("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
+                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
                                            reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
                 return
             try:
@@ -2987,7 +3002,7 @@ class UserBot:
             return
 
         if action == "check_crypto":
-            self.bot.edit_message_text("Оплатите счёт выше, затем нажмите «Проверить оплату».\n"
+            self._edit_message("Оплатите счёт выше, затем нажмите «Проверить оплату».\n"
                                        "Если средства поступили, баланс обновится в течение минуты.",
                                        chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Проверить оплату", callback_data=f"{CB_PREFIX}deposit"),
@@ -3002,11 +3017,11 @@ class UserBot:
             user = storage.get_user(user_id)
             ref_balance = _to_dec(user.get("referral_balance", 0))
             if ref_balance < 3000:
-                self.bot.edit_message_text(f"Минимальная сумма вывода 3000₽. Ваш реферальный баланс: {_money_str(ref_balance)}₽.",
+                self._edit_message(f"Минимальная сумма вывода 3000₽. Ваш реферальный баланс: {_money_str(ref_balance)}₽.",
                                            chat_id, c.message.message_id, reply_markup=self._keyboard_main())
                 return
             self.set_state(user_id, "withdraw_amount", {"message_id": c.message.message_id})
-            self.bot.edit_message_text(f"Введите сумму вывода (доступно {_money_str(ref_balance)}₽, минимум 3000₽):",
+            self._edit_message(f"Введите сумму вывода (доступно {_money_str(ref_balance)}₽, минимум 3000₽):",
                                        chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}referral")))
             return
@@ -3015,7 +3030,7 @@ class UserBot:
     def _activate_trial(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
         if user.get("trial_used"):
-            self.bot.edit_message_text("Пробный период уже использован.", chat_id, message_id,
+            self._edit_message("Пробный период уже использован.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         sub = storage.create_subscription(user_id, "trial", 0, is_trial=True)
@@ -3023,7 +3038,7 @@ class UserBot:
         storage.update_user(user)
         storage._add_transaction(user_id, 0, "trial", "trial", f"sub_{sub.sub_id}")
         XrayAPI.add_or_update_client(sub)
-        self.bot.edit_message_text(f"Пробный период активирован!\n{format_subscription(sub)}", chat_id, message_id,
+        self._edit_message(f"Пробный период активирован!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
 
     def _buy_menu(self, chat_id: int, message_id: int) -> None:
@@ -3036,7 +3051,7 @@ class UserBot:
                     text = f"{text} (по умолч.)"
                 kb.add(B(text, callback_data=f"{CB_PREFIX}host:{host.host_id}"))
             kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-            self.bot.edit_message_text("Выберите сервер:", chat_id, message_id, reply_markup=kb)
+            self._edit_message("Выберите сервер:", chat_id, message_id, reply_markup=kb)
         else:
             self._plan_menu(chat_id, message_id)
 
@@ -3047,7 +3062,7 @@ class UserBot:
                 continue
             kb.add(B(plan.name, callback_data=f"{CB_PREFIX}plan:{pid}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text("Выберите тариф:", chat_id, message_id, reply_markup=kb)
+        self._edit_message("Выберите тариф:", chat_id, message_id, reply_markup=kb)
 
     def _duration_menu(self, chat_id: int, message_id: int, plan_id: str) -> None:
         plan = storage.plan(plan_id)
@@ -3056,14 +3071,14 @@ class UserBot:
             if plan.prices.get(months) is not None:
                 kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}buy"))
-        self.bot.edit_message_text(f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:",
+        self._edit_message(f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:",
                                    chat_id, message_id, reply_markup=kb)
 
     def _confirm_purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: str, host_id: str | None = None) -> None:
         plan = storage.plan(plan_id)
         base_price = storage.price(plan_id, int(months))
         if base_price is None:
-            self.bot.edit_message_text("Цена для выбранного срока не установлена.", chat_id, message_id,
+            self._edit_message("Цена для выбранного срока не установлена.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         state = self.get_state(user_id)
@@ -3095,14 +3110,14 @@ class UserBot:
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}plan:{plan_id}"))
         self.set_state(user_id, "confirm_purchase", {"plan_id": plan_id, "months": months, "discount": discount, "message_id": message_id, "host_id": plan.host_id if plan else host_id})
         if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
         else:
             self.bot.send_message(chat_id, text, reply_markup=kb)
 
     def _purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: int) -> None:
         base_price = storage.price(plan_id, months)
         if base_price is None:
-            self.bot.edit_message_text("Ошибка: тариф не найден.", chat_id, message_id, reply_markup=self._keyboard_main())
+            self._edit_message("Ошибка: тариф не найден.", chat_id, message_id, reply_markup=self._keyboard_main())
             return
         state = self.get_state(user_id)
         discount = Decimal("0.00")
@@ -3117,7 +3132,7 @@ class UserBot:
         price = _money_round(base_price - discount)
         user = storage.get_user(user_id)
         if user["balance"] < price:
-            self.bot.edit_message_text("Недостаточно средств. Пополните баланс.", chat_id, message_id,
+            self._edit_message("Недостаточно средств. Пополните баланс.", chat_id, message_id,
                                        reply_markup=K().add(B("Пополнить", callback_data=f"{CB_PREFIX}deposit"),
                                                           B("Назад", callback_data=f"{CB_PREFIX}main")))
             return
@@ -3125,7 +3140,7 @@ class UserBot:
             storage.use_promocode(promo_code)
         deducted = storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}" + (f" promo:{promo_code}" if promo_code else ""))
         if not deducted:
-            self.bot.edit_message_text("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
+            self._edit_message("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         sub = storage.create_subscription(user_id, plan_id, months)
@@ -3135,26 +3150,26 @@ class UserBot:
         storage.add_purchase_stats(user_id, price, months)
         XrayAPI.add_or_update_client(sub)
         self.clear_state(user_id)
-        self.bot.edit_message_text(f"Подписка оформлена!\n{format_subscription(sub)}", chat_id, message_id,
+        self._edit_message(f"Подписка оформлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
 
     def _my_subscriptions(self, user_id: int, chat_id: int, message_id: int) -> None:
         subs = storage.active_subscriptions(user_id)
         if not subs:
             kb = K().add(B("Купить подписку", callback_data=f"{CB_PREFIX}buy")).add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-            self.bot.edit_message_text("У вас нет активных подписок.", chat_id, message_id, reply_markup=kb)
+            self._edit_message("У вас нет активных подписок.", chat_id, message_id, reply_markup=kb)
             return
         kb = K()
         for sub in subs:
             plan = storage.plan(sub.plan_id)
             kb.add(B(f"#{sub.sub_id} — {plan.name if plan else sub.plan_id}", callback_data=f"{CB_PREFIX}sub_detail:{sub.sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text("<b>Мои подписки</b>\n\nВыберите подписку:", chat_id, message_id, reply_markup=kb)
+        self._edit_message("<b>Мои подписки</b>\n\nВыберите подписку:", chat_id, message_id, reply_markup=kb)
 
     def _sub_detail(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
         if not sub or sub.user_id != user_id:
-            self.bot.edit_message_text("Подписка не найдена.", chat_id, message_id, reply_markup=self._keyboard_main())
+            self._edit_message("Подписка не найдена.", chat_id, message_id, reply_markup=self._keyboard_main())
             return
         kb = K()
         kb.add(B("Подключить", callback_data=f"{CB_PREFIX}sub_connect:{sub_id}"))
@@ -3162,19 +3177,19 @@ class UserBot:
         kb.add(B("Продлить", callback_data=f"{CB_PREFIX}sub_renew:{sub_id}"))
         kb.add(B("Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}my_subs"))
-        self.bot.edit_message_text(format_subscription(sub), chat_id, message_id, reply_markup=kb)
+        self._edit_message(format_subscription(sub), chat_id, message_id, reply_markup=kb)
 
     def _connect(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
         if not sub or sub.user_id != user_id:
             return
         if not sub.active or sub.is_expired:
-            self.bot.edit_message_text("Подписка неактивна или истекла.", chat_id, message_id,
+            self._edit_message("Подписка неактивна или истекла.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         server = storage.get_host(sub.host_id) or storage.server()
         if not server or not server.address or not server.public_key or not server.short_id:
-            self.bot.edit_message_text("Сервер VPN не настроен. Обратитесь к администратору.", chat_id, message_id,
+            self._edit_message("Сервер VPN не настроен. Обратитесь к администратору.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         # синхронизируем с 3X-UI, если настроена панель
@@ -3213,7 +3228,7 @@ class UserBot:
             f"🔽 Download: {download:.2f} MB"
         )
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _renew_menu(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
@@ -3225,7 +3240,7 @@ class UserBot:
             if plan.prices.get(months) is not None:
                 kb.add(B(f"+{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}renew_confirm:{sub_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
-        self.bot.edit_message_text("Выберите срок продления:", chat_id, message_id, reply_markup=kb)
+        self._edit_message("Выберите срок продления:", chat_id, message_id, reply_markup=kb)
 
     def _renew(self, user_id: int, chat_id: int, message_id: int, sub_id: str, months: int) -> None:
         sub = storage.get_subscription(sub_id)
@@ -3234,16 +3249,16 @@ class UserBot:
             return
         price = storage.price(sub.plan_id, months)
         if price is None:
-            self.bot.edit_message_text("Цена для выбранного срока не установлена.", chat_id, message_id,
+            self._edit_message("Цена для выбранного срока не установлена.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         user = storage.get_user(user_id)
         if user["balance"] < price:
-            self.bot.edit_message_text("Недостаточно средств.", chat_id, message_id,
+            self._edit_message("Недостаточно средств.", chat_id, message_id,
                                        reply_markup=K().add(B("Пополнить", callback_data=f"{CB_PREFIX}deposit")))
             return
         if not storage.deduct_balance(user_id, price, "renew", f"sub:{sub_id}:{months}"):
-            self.bot.edit_message_text("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
+            self._edit_message("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
                                        reply_markup=self._keyboard_main())
             return
         now = time.time()
@@ -3253,7 +3268,7 @@ class UserBot:
         XrayAPI.update_expiry(sub)
         storage.process_referral_rewards(user_id, price)
         storage.add_purchase_stats(user_id, price, months)
-        self.bot.edit_message_text(f"Подписка продлена!\n{format_subscription(sub)}", chat_id, message_id,
+        self._edit_message(f"Подписка продлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
 
     def _sub_devices(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
@@ -3277,7 +3292,7 @@ class UserBot:
         kb.add(B("Добавить", callback_data=f"{CB_PREFIX}add_device:{sub_id}"))
         kb.add(B("Удалить все", callback_data=f"{CB_PREFIX}del_all_devices:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
-        self.bot.edit_message_text("\n".join(lines), chat_id, message_id, reply_markup=kb)
+        self._edit_message("\n".join(lines), chat_id, message_id, reply_markup=kb)
 
     def _on_add_device_ip(self, m: Message) -> None:
         user_id = m.from_user.id
@@ -3353,7 +3368,7 @@ class UserBot:
         kb.add(B("🌐 Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
         kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _amount_keyboard(self, callback_prefix: str, back_callback: str, asset: str | None = None) -> K:
         kb = K()
@@ -3368,18 +3383,18 @@ class UserBot:
     def _create_crypto_invoice(self, user_id: int, chat_id: int, message_id: int, asset: str, rub_amount: Decimal) -> None:
         token = storage.config.get("crypto_bot_token", "")
         if not token:
-            self.bot.edit_message_text("Crypto Bot не настроен. Обратитесь к администратору.", chat_id, message_id,
+            self._edit_message("Crypto Bot не настроен. Обратитесь к администратору.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
         rate = RatesFetcher().get_rate(asset)
         if not rate:
-            self.bot.edit_message_text(f"Курс для {asset} ещё не загружен.", chat_id, message_id,
+            self._edit_message(f"Курс для {asset} ещё не загружен.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
         rub_amount = _money_round(rub_amount)
         amount = _to_dec(rub_amount / rate).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
         if amount <= 0:
-            self.bot.edit_message_text("Сумма слишком мала.", chat_id, message_id,
+            self._edit_message("Сумма слишком мала.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
         api = CryptoBotAPI(token)
@@ -3392,11 +3407,11 @@ class UserBot:
             kb.add(B("Оплатить", url=pay_url))
             kb.add(B("Проверить оплату", callback_data=f"{CB_PREFIX}check_crypto"))
             kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
-            self.bot.edit_message_text(f"Счёт на {amount} {asset} (~{_money_str(rub_amount)}₽) создан. Оплатите по кнопке ниже.",
+            self._edit_message(f"Счёт на {amount} {asset} (~{_money_str(rub_amount)}₽) создан. Оплатите по кнопке ниже.",
                                        chat_id, message_id, reply_markup=kb)
         else:
             error = result.get("error", "Не удалось создать счёт.")
-            self.bot.edit_message_text(f"Ошибка: {error}", chat_id, message_id,
+            self._edit_message(f"Ошибка: {error}", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
 
     def _on_deposit_crypto_amount(self, m: Message) -> None:
@@ -3419,16 +3434,16 @@ class UserBot:
         rub_amount = _money_round(rub_amount)
         stars_amount = int((rub_amount * Decimal("1.3")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         if stars_amount <= 0:
-            self.bot.edit_message_text("Сумма слишком мала.", chat_id, message_id,
+            self._edit_message("Сумма слишком мала.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
         title = f"Пополнение на {_money_str(rub_amount)}₽"
         if StarsPayment.send_invoice(self.bot, chat_id, user_id, stars_amount, title=title, rub_amount=rub_amount):
-            self.bot.edit_message_text(f"Инвойс на {stars_amount} Stars (~{_money_str(rub_amount)}₽) отправлен. Оплатите его в этом чате.",
+            self._edit_message(f"Инвойс на {stars_amount} Stars (~{_money_str(rub_amount)}₽) отправлен. Оплатите его в этом чате.",
                                        chat_id, message_id,
                                        reply_markup=K().add(B("Главное меню", callback_data=f"{CB_PREFIX}main")))
         else:
-            self.bot.edit_message_text("Не удалось создать Stars-инвойс. Проверьте настройки бота.",
+            self._edit_message("Не удалось создать Stars-инвойс. Проверьте настройки бота.",
                                        chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
 
@@ -3601,7 +3616,7 @@ class UserBot:
         kb.add(B("📜 История операций", callback_data=f"{CB_PREFIX}history"))
         kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}settings"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text("\n".join(lines), chat_id, message_id, reply_markup=kb)
+        self._edit_message("\n".join(lines), chat_id, message_id, reply_markup=kb)
 
     def _history_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         txs = storage.get_transactions(user_id)
@@ -3622,7 +3637,7 @@ class UserBot:
                 date = _format_time(tx.get("created_at", 0))
                 lines.append(f"{date} — {tname}: {amount:+.2f}₽ ({method})")
             text = "\n".join(lines)
-        self.bot.edit_message_text(text, chat_id, message_id,
+        self._edit_message(text, chat_id, message_id,
                                    reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile")))
 
     def _settings_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
@@ -3640,7 +3655,7 @@ class UserBot:
         kb.add(B(f"🔔 Уведомления: {notif}", callback_data=f"{CB_PREFIX}toggle:notifications"))
         kb.add(B(f"🔄 Автопродление: {renew}", callback_data=f"{CB_PREFIX}toggle:auto_renew"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _help_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         text = "<b>❓ Помощь</b>\n\nВыберите раздел:"
@@ -3649,7 +3664,7 @@ class UserBot:
         kb.add(B("🆘 Поддержка", callback_data=f"{CB_PREFIX}support"))
         kb.add(B("📝 Пожаловаться", callback_data=f"{CB_PREFIX}complaint"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _faq_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         faq = storage.config.get("faq_text")
@@ -3662,13 +3677,13 @@ class UserBot:
                 "3. Как пополнить баланс?\nРаздел «Пополнить баланс» → Crypto Bot или Telegram Stars.\n\n"
                 "4. Пробный период?\n3 дня, 1 устройство, один раз на аккаунт."
             )
-        self.bot.edit_message_text(faq, chat_id, message_id,
+        self._edit_message(faq, chat_id, message_id,
                                    reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
 
     def _support_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         support = storage.config.get("support", "@support")
         text = f"<b>🆘 Поддержка</b>\n\nПо всем вопросам обращайтесь: {support}"
-        self.bot.edit_message_text(text, chat_id, message_id,
+        self._edit_message(text, chat_id, message_id,
                                    reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
 
     def _referral_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
@@ -3692,7 +3707,7 @@ class UserBot:
         kb = K()
         kb.add(B("💸 Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     # ---- lifecycle ----
     def start(self) -> None:
