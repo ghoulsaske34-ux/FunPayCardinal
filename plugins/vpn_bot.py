@@ -2636,9 +2636,7 @@ class UserBot:
                 self._channel_cache.pop(user_id, None)
             cached = self._channel_cache.get(user_id)
             if cached and (now - cached[1]) < 60:
-                if cached[0]:
-                    self._on_channel_ok(user_id, chat_id, message_id)
-                else:
+                if not cached[0]:
                     self._prompt_channel(user_id, chat_id, message_id)
                 return cached[0]
         try:
@@ -2646,9 +2644,7 @@ class UserBot:
             ok = member.status in ("member", "administrator", "creator")
             with self._state_lock:
                 self._channel_cache[user_id] = (ok, now)
-            if ok:
-                self._on_channel_ok(user_id, chat_id, message_id)
-            else:
+            if not ok:
                 self._prompt_channel(user_id, chat_id, message_id)
             return ok
         except Exception:
@@ -2777,6 +2773,7 @@ class UserBot:
 
         if action == "check_channel":
             if self._channel_check(user_id, chat_id, force=True, message_id=c.message.message_id):
+                self._on_channel_ok(user_id, chat_id, c.message.message_id)
                 self.bot.answer_callback_query(c.id, "✅ Подписка подтверждена!", show_alert=True)
             else:
                 self.bot.answer_callback_query(c.id, "❌ Подписка не найдена. Нажмите кнопку перехода и попробуйте снова.", show_alert=True)
