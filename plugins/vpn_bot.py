@@ -2622,12 +2622,14 @@ class UserBot:
         except Exception:
             logger.exception("Не удалось отправить приветственное медиа")
 
-    def _channel_check(self, user_id: int, chat_id: int) -> bool:
+    def _channel_check(self, user_id: int, chat_id: int, force: bool = False) -> bool:
         channel_id = storage.config.get("channel_id", "")
         if not channel_id:
             return True
         now = time.time()
         with self._state_lock:
+            if force:
+                self._channel_cache.pop(user_id, None)
             cached = self._channel_cache.get(user_id)
             if cached and (now - cached[1]) < 60:
                 return cached[0]
@@ -2646,23 +2648,50 @@ class UserBot:
         with self._state_lock:
             self._channel_cache[user_id] = (False, now)
         kb = K()
-        invite = None
-        try:
-            chat = self.bot.get_chat(channel_id)
-            invite = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
-        except Exception:
-            pass
-        if not invite and isinstance(channel_id, str):
-            if channel_id.startswith("@"):
-                invite = f"https://t.me/{channel_id.lstrip('@')}"
-            elif channel_id.startswith("https://"):
-                invite = channel_id
+        invite = self._get_channel_invite(channel_id)
         if invite:
             kb.add(B("👉 Перейти в канал", url=invite, style="success"))
+        else:
+            support = storage.config.get("support", "")
+            if support and isinstance(support, str):
+                support_user = support.lstrip("@")
+                kb.add(B("🆘 Написать админу", url=f"https://t.me/{support_user}", style="danger"))
         kb.add(B("🔄 Проверить подписку", callback_data=f"{CB_PREFIX}check_channel", style="primary"))
         channel_text = f"<b>{_escape(channel_id)}</b>" if channel_id else "наш канал"
         self._send_menu_message(chat_id, f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>", reply_markup=kb, prefer_welcome_media=False)
         return False
+
+    def _get_channel_invite(self, channel_id: str) -> str | None:
+        """Пытается получить рабочую ссылку-приглашение на канал."""
+        if not channel_id:
+            return None
+        # Если админ сразу ввёл ссылку
+        if isinstance(channel_id, str) and channel_id.startswith("https://"):
+            return channel_id
+        # Пробуем получить из get_chat
+        try:
+            chat = self.bot.get_chat(channel_id)
+            if chat.invite_link:
+                return chat.invite_link
+            if chat.username:
+                return f"https://t.me/{chat.username}"
+        except Exception:
+            pass
+        # Пробуем экспортировать/создать invite-ссылку (бот должен быть админом)
+        try:
+            return self.bot.export_chat_invite_link(channel_id)
+        except Exception:
+            pass
+        try:
+            link = self.bot.create_chat_invite_link(channel_id)
+            if link and link.invite_link:
+                return link.invite_link
+        except Exception:
+            pass
+        # Публичный канал по @username
+        if isinstance(channel_id, str) and channel_id.startswith("@"):
+            return f"https://t.me/{channel_id.lstrip('@')}"
+        return None
 
     def _keyboard_main(self) -> K:
         kb = K()
@@ -2732,7 +2761,7 @@ class UserBot:
             return
 
         if action == "check_channel":
-            if self._channel_check(user_id, chat_id):
+            if self._channel_check(user_id, chat_id, force=True):
                 self.bot.answer_callback_query(c.id, "Подписка подтверждена!")
                 self._send_welcome(user_id, chat_id)
             else:
