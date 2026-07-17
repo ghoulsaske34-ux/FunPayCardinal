@@ -4,16 +4,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4, uuid5, NAMESPACE_DNS
+import html
 import http.server
+import copy
 import csv
 import ipaddress
 import base64
 import json
 import logging
+import os
 import re
 import socketserver
 import threading
 import time
+from urllib.parse import urlencode, quote
 
 import requests
 import telebot
@@ -200,7 +204,7 @@ class VPNStorage:
             "default_host_id": "main",
             "expired_cleanup_days": 5,
             "referral_first_discount": 0,
-            "plans": DEFAULT_PLANS,
+            "plans": copy.deepcopy(DEFAULT_PLANS),
             "promocodes": {},
             "activation_codes": {},
             "rates": {"USD": 0.0, "TON": 0.0, "updated_at": 0.0},
@@ -220,6 +224,8 @@ class VPNStorage:
             },
             "maintenance": False,
             "device_auth_port": 8080,
+            "device_auth_token": "",
+            "temp_profile_token": "",
             "user_bot_token": "",
             "channel_id": "",
             "support_id": "",
@@ -255,11 +261,22 @@ class VPNStorage:
                 return json.load(f)
         except Exception:
             logger.exception("Ошибка загрузки %s", path)
+            try:
+                backup = path.with_name(f"{path.name}.corrupted.{int(time.time())}")
+                os.replace(path, backup)
+                logger.warning("Сохранён бэкап повреждённого файла: %s", backup)
+            except Exception:
+                pass
             return default_factory()
 
     def _save_json(self, path: Path, data: dict[str, Any]) -> None:
-        with open(path, "w", encoding="utf-8") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def save_config(self) -> None:
         with self._lock:
@@ -395,7 +412,7 @@ class VPNStorage:
 
     def plans(self, host_id: str | None = None) -> dict[str, Plan]:
         result = {}
-        for pid, pdata in self.config.get("plans", DEFAULT_PLANS).items():
+        for pid, pdata in self.config.get("plans", copy.deepcopy(DEFAULT_PLANS)).items():
             plan_host = pdata.get("host_id", "main")
             if host_id and plan_host != host_id:
                 continue
@@ -412,7 +429,7 @@ class VPNStorage:
         return self.plans().get(plan_id)
 
     def update_plan(self, plan_id: str, name: str | None = None, max_devices: int | None = None, prices: dict[str, float] | None = None, host_id: str | None = None) -> None:
-        plans = self.config.setdefault("plans", DEFAULT_PLANS)
+        plans = self.config.setdefault("plans", copy.deepcopy(DEFAULT_PLANS))
         plan_data = plans.setdefault(plan_id, {"name": plan_id, "max_devices": 1, "prices": {}, "host_id": "main"})
         if name is not None:
             plan_data["name"] = name
@@ -585,55 +602,74 @@ class VPNStorage:
         txs.sort(key=lambda x: x.get("created_at", 0), reverse=True)
         return txs[:limit]
 
-    def add_balance(self, user_id: int, amount: float, source: str, method: str, payload: str = "") -> None:
-        user = self.get_user(user_id)
-        user["balance"] = round(user["balance"] + amount, 2)
-        self.update_user(user)
-        self._add_transaction(user_id, amount, "deposit", method, payload)
-        if amount > 0:
-            self._notify_admins(f"Новый платёж: user {user_id} пополнил баланс на {amount}₽ ({method}).", "new_payment")
+    def _is_tx_duplicate(self, user_id: int, method: str, payload: str) -> bool:
+        if not payload:
+            return False
+        for tx in self.transactions.get("txs", {}).values():
+            if tx.get("user_id") == user_id and tx.get("method") == method and str(tx.get("payload")) == str(payload):
+                return True
+        return False
 
-    def deduct_balance(self, user_id: int, amount: float, method: str, payload: str = "") -> None:
-        user = self.get_user(user_id)
-        user["balance"] = round(user["balance"] - amount, 2)
-        self.update_user(user)
-        self._add_transaction(user_id, -amount, "purchase", method, payload)
+    def add_balance(self, user_id: int, amount: float, source: str, method: str, payload: str = "", notify: bool = True) -> bool:
+        with self._lock:
+            if self._is_tx_duplicate(user_id, method, payload):
+                return False
+            user = self.get_user(user_id)
+            user["balance"] = round(user["balance"] + amount, 2)
+            self.update_user(user)
+            self._add_transaction(user_id, amount, "deposit", method, payload)
+        if notify and amount > 0:
+            self._notify_admins(f"Новый платёж: user {user_id} пополнил баланс на {amount}₽ ({method}).", "new_payment")
+        return True
+
+    def deduct_balance(self, user_id: int, amount: float, method: str, payload: str = "") -> bool:
+        with self._lock:
+            user = self.get_user(user_id)
+            if user["balance"] < amount - 1e-9:
+                return False
+            user["balance"] = round(user["balance"] - amount, 2)
+            self.update_user(user)
+            self._add_transaction(user_id, -amount, "purchase", method, payload)
+        return True
 
     def apply_referral_discount(self, user_id: int, base_price: float) -> float:
-        user = self.get_user(user_id)
-        if not user.get("referred_by") or user.get("first_purchase_discount_used"):
-            return base_price
-        discount = float(self.config.get("referral_first_discount", 0))
-        if discount <= 0 or discount >= 100:
-            return base_price
-        return round(base_price * (100 - discount) / 100, 2)
+        with self._lock:
+            user = self.get_user(user_id)
+            if not user.get("referred_by") or user.get("first_purchase_discount_used"):
+                return base_price
+            discount = float(self.config.get("referral_first_discount", 0))
+            if discount <= 0 or discount >= 100:
+                return base_price
+            return round(base_price * (100 - discount) / 100, 2)
 
     def mark_first_purchase_discount_used(self, user_id: int) -> None:
-        user = self.get_user(user_id)
-        if user.get("referred_by") and not user.get("first_purchase_discount_used"):
-            user["first_purchase_discount_used"] = True
-            self.update_user(user)
+        with self._lock:
+            user = self.get_user(user_id)
+            if user.get("referred_by") and not user.get("first_purchase_discount_used"):
+                user["first_purchase_discount_used"] = True
+                self.update_user(user)
 
     def add_purchase_stats(self, user_id: int, amount: float, months: int) -> None:
-        user = self.get_user(user_id)
-        user["total_spent"] = round(user.get("total_spent", 0.0) + amount, 2)
-        user["total_months"] = int(user.get("total_months", 0)) + months
-        self.update_user(user)
+        with self._lock:
+            user = self.get_user(user_id)
+            user["total_spent"] = round(user.get("total_spent", 0.0) + amount, 2)
+            user["total_months"] = int(user.get("total_months", 0)) + months
+            self.update_user(user)
 
     def _add_transaction(self, user_id: int, amount: float, tx_type: str, method: str, payload: str) -> None:
         with self._lock:
             tid = str(self.transactions["next_id"])
             self.transactions["next_id"] += 1
-        self.transactions["txs"][tid] = {
-            "id": tid,
-            "user_id": user_id,
-            "amount": amount,
-            "type": tx_type,
-            "method": method,
-            "payload": payload,
-            "created_at": time.time(),
-        }
-        self.save_transactions()
+            self.transactions["txs"][tid] = {
+                "id": tid,
+                "user_id": user_id,
+                "amount": amount,
+                "type": tx_type,
+                "method": method,
+                "payload": payload,
+                "created_at": time.time(),
+            }
+            self.save_transactions()
 
     def _sub_from_dict(self, data: dict[str, Any]) -> Subscription:
         fields = {f for f in Subscription.__dataclass_fields__}
@@ -836,9 +872,10 @@ class VPNStorage:
                 recipients.add(int(support_id))
             except (ValueError, TypeError):
                 pass
+        safe_text = _escape(text)
         for uid in recipients:
             try:
-                _user_bot_instance.bot.send_message(uid, text)
+                _user_bot_instance.bot.send_message(uid, safe_text)
             except Exception:
                 logger.exception("Failed to notify admin %s", uid)
 
@@ -864,14 +901,14 @@ class VPNStorage:
                     return u
             return None
         if q.startswith("#"):
-            q = q[1:]
-        try:
-            sub_id = str(int(q))
-            sub = self.subscriptions.get("subs", {}).get(sub_id)
-            if sub:
-                return self.users.get(str(sub.get("user_id")))
-        except (ValueError, TypeError):
-            pass
+            try:
+                sub_id = str(int(q[1:]))
+                sub = self.subscriptions.get("subs", {}).get(sub_id)
+                if sub:
+                    return self.users.get(str(sub.get("user_id")))
+            except (ValueError, TypeError):
+                pass
+            return None
         try:
             uid = int(q)
             return self.users.get(str(uid))
@@ -910,7 +947,7 @@ class VPNStorage:
         for u in self.users.values():
             uid = int(u.get("user_id", 0))
             if uid:
-                self.add_balance(uid, amount, "bulk", "admin")
+                self.add_balance(uid, amount, "bulk", "admin", notify=False)
                 count += 1
         return count
 
@@ -922,36 +959,38 @@ class VPNStorage:
             if kind == "users":
                 writer.writerow(["user_id", "username", "source", "balance", "referral_balance", "trial_used", "joined_at", "referred_by"])
                 for u in self.users.values():
-                    writer.writerow([u.get("user_id"), u.get("username"), u.get("source"), u.get("balance"),
-                                     u.get("referral_balance"), u.get("trial_used"),
-                                     _format_time(u.get("joined_at", 0)), u.get("referred_by")])
+                    writer.writerow([_csv_safe(u.get("user_id")), _csv_safe(u.get("username")), _csv_safe(u.get("source")), _csv_safe(u.get("balance")),
+                                     _csv_safe(u.get("referral_balance")), _csv_safe(u.get("trial_used")),
+                                     _csv_safe(_format_time(u.get("joined_at", 0))), _csv_safe(u.get("referred_by"))])
             elif kind == "subscriptions":
                 writer.writerow(["sub_id", "user_id", "plan_id", "months", "created_at", "expires_at", "active", "frozen_until", "devices_count"])
                 for s in self.subscriptions.get("subs", {}).values():
                     sub = self._sub_from_dict(s)
-                    writer.writerow([s.get("sub_id"), s.get("user_id"), s.get("plan_id"), s.get("months"),
-                                     _format_time(s.get("created_at", 0)), _format_time(s.get("expires_at", 0)),
-                                     s.get("active"), s.get("frozen_until"), len(s.get("devices", []))])
+                    writer.writerow([_csv_safe(s.get("sub_id")), _csv_safe(s.get("user_id")), _csv_safe(s.get("plan_id")), _csv_safe(s.get("months")),
+                                     _csv_safe(_format_time(s.get("created_at", 0))), _csv_safe(_format_time(s.get("expires_at", 0))),
+                                     _csv_safe(s.get("active")), _csv_safe(s.get("frozen_until")), _csv_safe(len(s.get("devices", [])))])
             elif kind == "transactions":
                 writer.writerow(["id", "user_id", "type", "amount", "method", "payload", "created_at"])
                 for t in self.transactions.get("txs", {}).values():
-                    writer.writerow([t.get("id"), t.get("user_id"), t.get("type"), t.get("amount"),
-                                     t.get("method"), t.get("payload"), _format_time(t.get("created_at", 0))])
+                    writer.writerow([_csv_safe(t.get("id")), _csv_safe(t.get("user_id")), _csv_safe(t.get("type")), _csv_safe(t.get("amount")),
+                                     _csv_safe(t.get("method")), _csv_safe(t.get("payload")), _csv_safe(_format_time(t.get("created_at", 0)))])
             elif kind == "connections":
                 writer.writerow(["timestamp", "sub_id", "ip", "user_agent", "allowed", "reason", "traffic_bytes"])
                 for l in self.connections.get("logs", []):
-                    writer.writerow([_format_time(l.get("timestamp", 0)), l.get("sub_id"), l.get("ip"),
-                                     l.get("user_agent"), l.get("allowed"), l.get("reason"), l.get("traffic_bytes", 0)])
+                    writer.writerow([_csv_safe(_format_time(l.get("timestamp", 0))), _csv_safe(l.get("sub_id")), _csv_safe(l.get("ip")),
+                                     _csv_safe(l.get("user_agent")), _csv_safe(l.get("allowed")), _csv_safe(l.get("reason")), _csv_safe(l.get("traffic_bytes", 0))])
             elif kind == "complaints":
                 writer.writerow(["id", "user_id", "text", "status", "created_at"])
                 for c in self.config.get("complaints", []):
-                    writer.writerow([c.get("id"), c.get("user_id"), c.get("text"), c.get("status"), _format_time(c.get("created_at", 0))])
+                    writer.writerow([_csv_safe(c.get("id")), _csv_safe(c.get("user_id")), _csv_safe(c.get("text")), _csv_safe(c.get("status")), _csv_safe(_format_time(c.get("created_at", 0)))])
         return path
 
-    def unbind_device(self, sub_id: str, ip: str, user_id: int) -> tuple[bool, str]:
+    def unbind_device(self, sub_id: str, index: int, user_id: int) -> tuple[bool, str]:
         sub = self.get_subscription(sub_id)
         if not sub or sub.user_id != user_id:
             return False, "Подписка не найдена."
+        if index < 0 or index >= len(sub.devices):
+            return False, "Устройство не найдено."
         user = self.get_user(user_id)
         last_unbind = user.get("last_unbind_at", 0.0)
         cooldown = self.security().get("unbind_cooldown", DEFAULT_UNBIND_COOLDOWN)
@@ -959,26 +998,26 @@ class VPNStorage:
         if now - last_unbind < cooldown:
             remaining = int(cooldown - (now - last_unbind))
             return False, f"Отвязать устройство можно через {remaining // 86400}д {remaining % 86400 // 3600}ч."
-        before = len(sub.devices)
-        sub.devices = [d for d in sub.devices if d.get("ip") != ip]
-        if len(sub.devices) == before:
-            return False, "Устройство не найдено."
+        del sub.devices[index]
         user["last_unbind_at"] = now
         self.update_subscription(sub)
         self.update_user(user)
         return True, "Устройство отвязано."
 
     def add_referral_earnings(self, user_id: int, amount: float, from_user_id: int, level: int) -> None:
-        user = self.get_user(user_id)
-        user["referral_balance"] = round(user.get("referral_balance", 0.0) + amount, 2)
-        self.update_user(user)
-        self._add_transaction(user_id, amount, "referral", f"level_{level}", f"from_{from_user_id}")
-        key = str(user_id)
-        self.referrals["earnings"].setdefault(key, {"level1": 0.0, "level2": 0.0})
-        self.referrals["earnings"][key][f"level{level}"] = round(self.referrals["earnings"][key][f"level{level}"] + amount, 2)
-        self.save_referrals()
+        with self._lock:
+            user = self.get_user(user_id)
+            user["referral_balance"] = round(user.get("referral_balance", 0.0) + amount, 2)
+            self.update_user(user)
+            self._add_transaction(user_id, amount, "referral", f"level_{level}", f"from_{from_user_id}")
+            key = str(user_id)
+            self.referrals["earnings"].setdefault(key, {"level1": 0.0, "level2": 0.0})
+            self.referrals["earnings"][key][f"level{level}"] = round(self.referrals["earnings"][key][f"level{level}"] + amount, 2)
+            self.save_referrals()
 
     def process_referral_rewards(self, buyer_id: int, amount: float) -> None:
+        if amount <= 0:
+            return
         user = self.get_user(buyer_id)
         parent_id = user.get("referred_by")
         if parent_id:
@@ -1004,6 +1043,13 @@ def _escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _csv_safe(value: Any) -> str:
+    s = str(value)
+    if s.startswith(("=", "+", "-", "@", "\t", "\r", "\n")) or "\n" in s or "\r" in s:
+        return "'" + s
+    return s
+
+
 def _format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
@@ -1020,15 +1066,15 @@ def format_subscription(sub: Subscription) -> str:
     else:
         status = "Активна" if sub.active and not sub.is_expired else "Истекла/неактивна"
     host = storage.get_host(sub.host_id) or storage.server()
-    host_name = host.name if host else sub.host_id
+    host_name = _escape(host.name if host else sub.host_id)
     lines = [
         f"<b>Подписка #{sub.sub_id}</b>",
-        f"Тариф: {plan.name if plan else sub.plan_id}",
+        f"Тариф: {_escape(plan.name if plan else sub.plan_id)}",
         f"Сервер: {host_name}",
         f"Срок: {sub.months} мес." if sub.months else f"Пробный период",
         f"Статус: {status}",
         f"Действует до: {_format_time(sub.effective_expires_at)}",
-        f"Устройств: {len(sub.devices)} / {plan.device_text if plan else '?'}",
+        f"Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}",
     ]
     return "\n".join(lines)
 
@@ -1138,12 +1184,13 @@ class CryptoBotPoller:
                     if not rub_amount:
                         rate = RatesFetcher().get_rate(paid_asset) or 0
                         rub_amount = round(paid_amount * rate, 2) if rate else 0.0
-                    storage.add_balance(int(uid), rub_amount, "Crypto Bot", f"cryptobot:{paid_asset}", iid)
-                    storage.mark_crypto_invoice(iid, "paid", paid_amount, paid_asset)
-                    try:
-                        self.bot.bot.send_message(int(uid), f"Баланс пополнен на {rub_amount}₽ (~{paid_amount} {paid_asset}) через Crypto Bot.")
-                    except Exception:
-                        pass
+                    credited = storage.add_balance(int(uid), rub_amount, "Crypto Bot", f"cryptobot:{paid_asset}", iid)
+                    if credited:
+                        storage.mark_crypto_invoice(iid, "paid", paid_amount, paid_asset)
+                        try:
+                            self.bot.bot.send_message(int(uid), f"Баланс пополнен на {rub_amount}₽ (~{paid_amount} {paid_asset}) через Crypto Bot.")
+                        except Exception:
+                            pass
             elif status in ("expired", "cancelled"):
                 storage.mark_crypto_invoice(iid, status)
 
@@ -1351,26 +1398,46 @@ class DeviceAuthHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    MAX_BODY_SIZE = 4096
+
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0))
-        if not length:
+        if not length or length > self.MAX_BODY_SIZE:
             return {}
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             return {}
 
+    def _get_token(self) -> str:
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth.split(" ", 1)[1].strip()
+        data = self._read_json() if self.path == "/connect" else {}
+        return str(data.get("token", "")).strip()
+
     def do_POST(self) -> None:
         if self.path != "/connect":
             self._json_response(404, {"error": "not found"})
             return
         data = self._read_json()
+        token = (self.headers.get("Authorization", "") or "").split(" ")[-1] if self.headers.get("Authorization", "").lower().startswith("bearer ") else str(data.get("token", "")).strip()
+        expected = storage.config.get("device_auth_token", "")
+        if not expected:
+            self._json_response(503, {"allowed": False, "reason": "auth_not_configured"})
+            return
+        if token != expected:
+            self._json_response(403, {"allowed": False, "reason": "invalid_token"})
+            return
         sub_id = str(data.get("sub_id", "")).strip()
-        ip = str(data.get("ip", "")).strip()
+        ip = self.client_address[0]
         user_agent = str(data.get("user_agent", "")).strip() or "unknown"
-        traffic_bytes = int(data.get("traffic_bytes", 0) or 0)
-        if not sub_id or not ip:
-            self._json_response(400, {"allowed": False, "reason": "missing sub_id or ip"})
+        try:
+            traffic_bytes = int(data.get("traffic_bytes", 0) or 0)
+        except (ValueError, TypeError):
+            traffic_bytes = 0
+        if not sub_id:
+            self._json_response(400, {"allowed": False, "reason": "missing sub_id"})
             return
         try:
             now = time.time()
@@ -1413,6 +1480,8 @@ class DeviceAuthServer:
 
 TEMP_SESSIONS: dict[str, dict[str, Any]] = {}
 TEMP_LOCK = threading.RLock()
+TEMP_LAST_CREATE: dict[str, float] = {}
+TEMP_RATE_LIMIT_WINDOW = 3600
 _temp_profile_server: "TempProfileServer | None" = None
 
 
@@ -1443,13 +1512,33 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
     def _set_session_cookie(self, session_id: str) -> None:
         self.send_header("Set-Cookie", f"temp_session={session_id}; Path=/; Max-Age=1800")
 
+    @staticmethod
+    def _get_query_token(path: str) -> str:
+        if "?" not in path:
+            return ""
+        qs = path.split("?", 1)[1]
+        for part in qs.split("&"):
+            if part.startswith("t="):
+                return part[2:]
+        return ""
+
+    def _check_temp_token(self) -> bool:
+        token = self._get_query_token(self.path)
+        expected = storage.config.get("temp_profile_token", "")
+        return bool(expected and token and token == expected)
+
     def _create_temp_session(self) -> dict[str, Any]:
+        ip = self.client_address[0]
+        now = time.time()
+        with TEMP_LOCK:
+            last = TEMP_LAST_CREATE.get(ip, 0)
+            if now - last < TEMP_RATE_LIMIT_WINDOW:
+                return None
         server = storage.server()
         session_id = str(uuid4())
         email = f"temp_{session_id}"
         xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
         client_uuid = str(uuid4())
-        now = time.time()
         expires_at = now + 30 * 60
         inbound_id = server.temp_inbound_id if server.temp_inbound_id else server.inbound_id
         expiry_ms = XrayAPI._timestamp_to_xray_ms(expires_at)
@@ -1471,6 +1560,7 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
         }
         with TEMP_LOCK:
             TEMP_SESSIONS[session_id] = session
+            TEMP_LAST_CREATE[ip] = now
         return session
 
     def _get_or_create_session(self) -> dict[str, Any] | None:
@@ -1480,19 +1570,24 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
         if session and session["expires_at"] > time.time():
             return session
         try:
-            return self._create_temp_session()
+            result = self._create_temp_session()
+            if result is None:
+                return None
+            return result
         except Exception:
             logger.exception("TempProfileHandler create session error")
         return None
 
     def _render_page(self, session: dict[str, Any]) -> str:
         server = storage.server()
-        vless_url = generate_vless_url_raw(
+        vless_url_raw = generate_vless_url_raw(
             session["client_uuid"], session["email"], session["xray_sub_id"], server
         )
-        sub_url = generate_subscription_url_raw(session["xray_sub_id"], server)
+        sub_url_raw = generate_subscription_url_raw(session["xray_sub_id"], server)
+        vless_url = html.escape(vless_url_raw, quote=True)
+        sub_url = html.escape(sub_url_raw, quote=True)
         expires = datetime.fromtimestamp(session["expires_at"]).strftime("%H:%M:%S")
-        qr_bytes = _generate_qr_code(vless_url)
+        qr_bytes = _generate_qr_code(vless_url_raw)
         qr_b64 = base64.b64encode(qr_bytes).decode("ascii") if qr_bytes else ""
         qr_img = f'<img src="data:image/png;base64,{qr_b64}" alt="QR" style="max-width:280px;">' if qr_b64 else ""
         return f"""<!DOCTYPE html>
@@ -1536,9 +1631,12 @@ a.link {{ display: block; margin: 10px 0; word-break: break-all; color: #007bff;
         if path.startswith("/sub/"):
             self._serve_sub(path)
             return
+        if not self._check_temp_token():
+            self._text_response(403, "Доступ запрещён. Укажите корректный токен в параметре ?t=...")
+            return
         session = self._get_or_create_session()
-        if not session:
-            self._text_response(500, "Не удалось создать временный профиль. Проверьте настройки 3X-UI.")
+        if session is None:
+            self._text_response(429, "Не удалось создать временный профиль. Проверьте настройки 3X-UI или превышен лимит запросов.")
             return
         html = self._render_page(session)
         self.send_response(200)
@@ -1592,7 +1690,14 @@ class TempProfileServer:
         self._thread.start()
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self._cleanup_thread.start()
+        threading.Thread(target=self._cleanup_xray_temp, daemon=True).start()
         logger.info("TempProfileServer started on port %s", self.port)
+
+    def _cleanup_xray_temp(self) -> None:
+        try:
+            XrayAPI.cleanup_temp_clients()
+        except Exception:
+            logger.exception("TempProfileServer initial Xray temp cleanup error")
 
     def _cleanup_loop(self) -> None:
         while not self._stop.is_set():
@@ -1741,10 +1846,10 @@ class XrayAPI:
     def _timestamp_to_xray_ms(ts: float) -> int:
         now = time.time()
         if ts <= now:
-            return 0
+            return 1  # уже истекло, не бессрочно (0 в 3X-UI означает безлимит)
         ms = int(ts * 1000)
         if ms < 1577836800000 or ms > 2000000000000:
-            return 0
+            return 1
         return ms
 
     @staticmethod
@@ -1899,6 +2004,30 @@ class XrayAPI:
         return False
 
     @staticmethod
+    def cleanup_temp_clients(host_id: str | None = None) -> int:
+        server = XrayAPI._get_host(host_id)
+        if not server or not server.panel_url:
+            return 0
+        session = requests.Session()
+        if not XrayAPI._login(session, server):
+            return 0
+        inbound_id = server.inbound_id
+        inbound = XrayAPI._get_inbound(session, server, inbound_id)
+        if not inbound:
+            return 0
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+            clients = settings.get("clients", [])
+            new_clients = [c for c in clients if not str(c.get("email", "")).startswith("temp_")]
+            removed = len(clients) - len(new_clients)
+            if removed and XrayAPI._update_inbound_clients(session, server, inbound_id, inbound, new_clients):
+                logger.info("3X-UI temp clients cleanup removed %s clients", removed)
+                return removed
+        except Exception:
+            logger.exception("3X-UI cleanup_temp_clients error")
+        return 0
+
+    @staticmethod
     def add_or_update_client(sub: Subscription, enable: bool = True) -> bool:
         server = XrayAPI._get_host(sub.host_id)
         if not server or not server.panel_url:
@@ -2041,7 +2170,7 @@ def generate_vless_url_raw(client_uuid: str, email: str, xray_sub_id: str, serve
     """Собирает vless:// ссылку по сырым параметрам."""
     host = server.address
     sni = server.server_name or host
-    remark = f"{server.server_name or 'VPN'}-{email}"
+    remark = quote(f"{server.server_name or 'VPN'}-{email}", safe="")
     params = {
         "type": server.network,
         "security": server.security,
@@ -2051,7 +2180,9 @@ def generate_vless_url_raw(client_uuid: str, email: str, xray_sub_id: str, serve
         "sid": server.short_id,
         "spx": server.spider_x,
     }
-    query = "&".join(f"{k}={v}" for k, v in params.items())
+    if server.flow:
+        params["flow"] = server.flow
+    query = urlencode(params, safe="", quote_via=quote)
     return f"vless://{client_uuid}@{host}:{server.port}?{query}#{remark}"
 
 
@@ -2063,7 +2194,11 @@ def generate_subscription_url(sub: Subscription, server: ServerConfig) -> str:
 def generate_subscription_url_raw(xray_sub_id: str, server: ServerConfig) -> str:
     """Формирует URL подписки /sub/{subId} по сырому subId."""
     base = server.subscription_url_base or server.address
-    scheme = "https" if server.sub_port == 443 else "http"
+    panel_url = server.panel_url or ""
+    if panel_url.startswith("https://") or server.sub_port == 443:
+        scheme = "https"
+    else:
+        scheme = "http"
     return f"{scheme}://{base}:{server.sub_port}/sub/{xray_sub_id}"
 
 
@@ -2096,6 +2231,8 @@ class UserBot:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._states: dict[int, dict[str, Any]] = {}
+        self._state_lock = threading.RLock()
+        self._channel_cache: dict[int, tuple[bool, float]] = {}
         self._crypto_poller: CryptoBotPoller | None = None
         self._scheduler: SubscriptionScheduler | None = None
         self._rates_fetcher: RatesFetcher | None = None
@@ -2105,17 +2242,20 @@ class UserBot:
 
     # ---- state helpers ----
     def set_state(self, user_id: int, state: str, data: dict[str, Any] | None = None) -> None:
-        self._states[user_id] = {"state": state, "data": data or {}}
+        with self._state_lock:
+            self._states[user_id] = {"state": state, "data": data or {}}
 
     def get_state(self, user_id: int) -> dict[str, Any] | None:
-        return self._states.get(user_id)
+        with self._state_lock:
+            return self._states.get(user_id)
 
     def check_state(self, user_id: int, state: str) -> bool:
         s = self.get_state(user_id)
         return s is not None and s.get("state") == state
 
     def clear_state(self, user_id: int) -> None:
-        self._states.pop(user_id, None)
+        with self._state_lock:
+            self._states.pop(user_id, None)
 
     # ---- handlers ----
     def _register_handlers(self) -> None:
@@ -2193,8 +2333,7 @@ class UserBot:
             ipaddress.ip_address(text)
             return True
         except ValueError:
-            pass
-        return re.match(r"^\d{1,3}(\.\d{1,3}){3}$", text) is not None
+            return False
 
     @staticmethod
     def _is_valid_amount(text: str) -> float | None:
@@ -2249,9 +2388,9 @@ class UserBot:
         param = parts[1].strip()
         if param.startswith("ref_"):
             try:
-                return param, int(param.split("_", 1)[1])
+                return "referral", int(param.split("_", 1)[1])
             except (ValueError, TypeError):
-                return param, None
+                return "referral", None
         return param, None
 
     def _send_welcome(self, user_id: int, chat_id: int) -> None:
@@ -2295,15 +2434,25 @@ class UserBot:
         channel_id = storage.config.get("channel_id", "")
         if not channel_id:
             return True
+        now = time.time()
+        with self._state_lock:
+            cached = self._channel_cache.get(user_id)
+            if cached and (now - cached[1]) < 60:
+                return cached[0]
         try:
             member = self.bot.get_chat_member(channel_id, user_id)
-            if member.status in ("member", "administrator", "creator"):
+            ok = member.status in ("member", "administrator", "creator")
+            if ok:
                 user = storage.get_user(user_id)
                 user["channel_ok"] = True
                 storage.update_user(user)
-                return True
+            with self._state_lock:
+                self._channel_cache[user_id] = (ok, now)
+            return ok
         except Exception:
             pass
+        with self._state_lock:
+            self._channel_cache[user_id] = (False, now)
         kb = K()
         kb.add(B("Проверить подписку", callback_data=f"{CB_PREFIX}check_channel"))
         invite = None
@@ -2319,7 +2468,7 @@ class UserBot:
                 invite = channel_id
         if invite:
             kb.add(B("Подписаться", url=invite))
-        channel_text = f"<b>{channel_id}</b>" if channel_id else "наш канал"
+        channel_text = f"<b>{_escape(channel_id)}</b>" if channel_id else "наш канал"
         self.bot.send_message(chat_id, f"Для использования бота необходимо подписаться на {channel_text}.", reply_markup=kb)
         return False
 
@@ -2505,8 +2654,12 @@ class UserBot:
             return
 
         if action == "unbind_device" and len(args) >= 2:
-            sub_id, ip = args[0], args[1]
-            ok, text = storage.unbind_device(sub_id, ip, user_id)
+            sub_id, idx = args[0], args[1]
+            try:
+                index = int(idx)
+            except ValueError:
+                return
+            ok, text = storage.unbind_device(sub_id, index, user_id)
             self.bot.answer_callback_query(c.id, text)
             if ok:
                 self._sub_devices(user_id, chat_id, c.message.message_id, sub_id)
@@ -2629,7 +2782,8 @@ class UserBot:
         plan = storage.plan(plan_id)
         kb = K()
         for months in DURATIONS:
-            kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}"))
+            if plan.prices.get(months) is not None:
+                kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}buy"))
         self.bot.edit_message_text(f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:",
                                    chat_id, message_id, reply_markup=kb)
@@ -2637,6 +2791,10 @@ class UserBot:
     def _confirm_purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: str, host_id: str | None = None) -> None:
         plan = storage.plan(plan_id)
         base_price = storage.price(plan_id, int(months))
+        if base_price is None:
+            self.bot.edit_message_text("Цена для выбранного срока не установлена.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
         state = self.get_state(user_id)
         discount = 0.0
         if state and state.get("state") in ("confirm_purchase", "enter_promo") and state.get("data", {}).get("plan_id") == plan_id and str(state.get("data", {}).get("months")) == str(months):
@@ -2694,9 +2852,14 @@ class UserBot:
             return
         if promo_code:
             storage.use_promocode(promo_code)
-        storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}" + (f" promo:{promo_code}" if promo_code else ""))
+        deducted = storage.deduct_balance(user_id, price, "purchase", f"plan:{plan_id}:{months}" + (f" promo:{promo_code}" if promo_code else ""))
+        if not deducted:
+            self.bot.edit_message_text("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
         sub = storage.create_subscription(user_id, plan_id, months)
-        storage.mark_first_purchase_discount_used(user_id)
+        if not promo_code and ref_discount and ref_discount < base_price:
+            storage.mark_first_purchase_discount_used(user_id)
         storage.process_referral_rewards(user_id, price)
         storage.add_purchase_stats(user_id, price, months)
         XrayAPI.add_or_update_client(sub)
@@ -2754,8 +2917,8 @@ class UserBot:
             f"<b>Подключение к VPN</b>\n\n"
             f"1. Установите приложение (v2rayNG, V2Box, Streisand и т.п.)\n"
             f"2. Отсканируйте QR-код или нажмите ссылку/подписку.\n\n"
-            f"<b>VLESS ссылка:</b>\n<code>{vless_url}</code>\n\n"
-            f"<b>Подписка:</b>\n<code>{sub_url}</code>"
+            f"<b>VLESS ссылка:</b>\n<code>{_escape(vless_url)}</code>\n\n"
+            f"<b>Подписка:</b>\n<code>{_escape(sub_url)}</code>"
         )
         qr = _generate_qr_code(vless_url)
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
@@ -2789,7 +2952,8 @@ class UserBot:
         plan = storage.plan(sub.plan_id)
         kb = K()
         for months in DURATIONS:
-            kb.add(B(f"+{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}renew_confirm:{sub_id}:{months}"))
+            if plan.prices.get(months) is not None:
+                kb.add(B(f"+{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}renew_confirm:{sub_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
         self.bot.edit_message_text("Выберите срок продления:", chat_id, message_id, reply_markup=kb)
 
@@ -2799,13 +2963,22 @@ class UserBot:
         if not sub or sub.user_id != user_id or not plan:
             return
         price = storage.price(sub.plan_id, months)
+        if price is None:
+            self.bot.edit_message_text("Цена для выбранного срока не установлена.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
         user = storage.get_user(user_id)
         if user["balance"] < price:
             self.bot.edit_message_text("Недостаточно средств.", chat_id, message_id,
                                        reply_markup=K().add(B("Пополнить", callback_data=f"{CB_PREFIX}deposit")))
             return
-        storage.deduct_balance(user_id, price, "renew", f"sub:{sub_id}:{months}")
-        sub.expires_at = sub.expires_at + months * 30 * 86400
+        if not storage.deduct_balance(user_id, price, "renew", f"sub:{sub_id}:{months}"):
+            self.bot.edit_message_text("Ошибка списания средств. Попробуйте ещё раз.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
+        now = time.time()
+        base = max(now, sub.expires_at)
+        sub.expires_at = base + months * 30 * 86400
         storage.update_subscription(sub)
         XrayAPI.update_expiry(sub)
         storage.process_referral_rewards(user_id, price)
@@ -2820,15 +2993,17 @@ class UserBot:
         plan = storage.plan(sub.plan_id)
         lines = [f"<b>Устройства</b> ({len(sub.devices)} / {plan.device_text if plan else '?'})\n\nОтвязать устройство можно раз в {storage.security().get('unbind_cooldown', DEFAULT_UNBIND_COOLDOWN) // 86400} дней."]
         for i, d in enumerate(sub.devices, 1):
-            ua = d.get('user_agent', '')
+            ip = _escape(d.get('ip', ''))
+            ua = _escape(d.get('user_agent', ''))
             seen = d.get('last_seen') or d.get('first_seen')
             ua_text = f" — {ua[:20]}" if ua else ""
-            lines.append(f"{i}. {d['ip']}{ua_text} (последнее: {datetime.fromtimestamp(seen).strftime('%d.%m.%Y %H:%M')})")
+            lines.append(f"{i}. {ip}{ua_text} (последнее: {datetime.fromtimestamp(seen).strftime('%d.%m.%Y %H:%M')})")
         if not sub.devices:
             lines.append("Устройств пока нет.")
         kb = K()
-        for d in sub.devices:
-            kb.add(B(f"Отвязать {d['ip']}", callback_data=f"{CB_PREFIX}unbind_device:{sub_id}:{d['ip']}"))
+        for idx, d in enumerate(sub.devices):
+            ip_label = _escape(d.get('ip', '')[:15])
+            kb.add(B(f"Отвязать {ip_label}", callback_data=f"{CB_PREFIX}unbind_device:{sub_id}:{idx}"))
         kb.add(B("Добавить", callback_data=f"{CB_PREFIX}add_device:{sub_id}"))
         kb.add(B("Удалить все", callback_data=f"{CB_PREFIX}del_all_devices:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
@@ -3137,9 +3312,14 @@ class UserBot:
             except (ValueError, TypeError):
                 return
             stars_amount = getattr(m.successful_payment, "total_amount", 0)
-            storage.add_balance(uid, rub_amount, "Telegram Stars", "stars", payload)
-            self.bot.send_message(m.chat.id, f"Баланс пополнен на {rub_amount}₽ ({stars_amount} Stars) через Telegram Stars.",
-                                  reply_markup=self._keyboard_main())
+            payment_id = getattr(m.successful_payment, "telegram_payment_charge_id", payload) or payload
+            credited = storage.add_balance(uid, rub_amount, "Telegram Stars", "stars", payment_id)
+            if credited:
+                self.bot.send_message(m.chat.id, f"Баланс пополнен на {rub_amount}₽ ({stars_amount} Stars) через Telegram Stars.",
+                                      reply_markup=self._keyboard_main())
+            else:
+                self.bot.send_message(m.chat.id, "Этот платёж уже был обработан ранее.",
+                                      reply_markup=self._keyboard_main())
 
     def _profile_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
@@ -3152,8 +3332,8 @@ class UserBot:
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
-            lines.append(f"Активная подписка: {plan.name if plan else sub.plan_id} (до {_format_time(sub.expires_at)})")
-            lines.append(f"Устройств: {len(sub.devices)} / {plan.device_text if plan else '?'}")
+            lines.append(f"Активная подписка: {_escape(plan.name if plan else sub.plan_id)} (до {_format_time(sub.expires_at)})")
+            lines.append(f"Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
         else:
             lines.append("Активных подписок нет.")
         if user.get("trial_used"):
@@ -3293,7 +3473,8 @@ class UserBot:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                self.bot.polling(non_stop=True, skip_pending=True, timeout=10, long_polling_timeout=5)
+                # skip_pending=False чтобы не терять successful_payment после рестарта
+                self.bot.polling(non_stop=True, skip_pending=False, timeout=10, long_polling_timeout=5)
             except Exception:
                 logger.exception("Ошибка polling user-бота")
                 time.sleep(5)
@@ -3841,6 +4022,10 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             bot.send_message(m.chat.id, "Ошибка рассылки.")
             tg.clear_state(m.chat.id, m.from_user.id)
             return
+        if not _user_bot_instance:
+            bot.send_message(m.chat.id, "User-бот не запущен. Сначала запустите его в /vpnadmin.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
         sent = 0
         failed = 0
         now = time.time()
@@ -3859,7 +4044,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
                 if u.get("source") != source_value:
                     continue
             try:
-                _user_bot_instance.bot.send_message(uid, text)
+                _user_bot_instance.bot.send_message(uid, _escape(text), parse_mode="HTML")
                 sent += 1
             except Exception:
                 failed += 1
@@ -4075,8 +4260,8 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
     earnings = storage.referrals.get("earnings", {}).get(str(target_uid), {"level1": 0.0, "level2": 0.0})
     lines = [
         f"<b>Пользователь {target_uid}</b>",
-        f"@{user.get('username') or '—'}",
-        f"Источник: {user.get('source', 'direct')}",
+        f"@{_escape(user.get('username') or '—')}",
+        f"Источник: {_escape(user.get('source', 'direct'))}",
         f"Баланс: {user.get('balance', 0)}₽",
         f"Реферальный баланс: {user.get('referral_balance', 0)}₽",
         f"Рефералы: {len(level1)} / {len(level2)} — заработок {earnings.get('level1', 0) + earnings.get('level2', 0)}₽",
@@ -4088,7 +4273,7 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
         sub = storage._sub_from_dict(s)
         plan = storage.plan(s.get("plan_id"))
         status = "Активна" if s.get("active") and not sub.is_expired else "Истекла"
-        lines.append(f"  #{s.get('sub_id')} {plan.name if plan else s.get('plan_id')} — {status} до {_format_time(s.get('expires_at', 0))}")
+        lines.append(f"  #{s.get('sub_id')} {_escape(plan.name if plan else s.get('plan_id'))} — {status} до {_format_time(s.get('expires_at', 0))}")
     kb = K()
     for s in subs:
         kb.add(B(f"Подписка #{s.get('sub_id')}", callback_data=f"{CB_PREFIX}admin_sub:{s.get('sub_id')}"))
@@ -4434,7 +4619,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                     plan = storage.plan(s["plan_id"])
                     sub_obj = storage._sub_from_dict(s)
                     status = "Активна" if s.get("active") and not sub_obj.is_expired else "Истекла"
-                    lines.append(f"#{s['sub_id']} — user {s['user_id']} — {plan.name if plan else s['plan_id']} — {status}")
+                    lines.append(f"#{s['sub_id']} — user {s['user_id']} — {_escape(plan.name if plan else s['plan_id'])} — {status}")
                 text = "\n".join(lines)
             kb = K()
             for s in subs[:20]:
@@ -4449,7 +4634,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             direct = stats.pop("direct", 0)
             lines = [f"Всего пользователей: {total}", f"Без приписки (direct): {direct}"]
             for src, count in sorted(stats.items(), key=lambda x: -x[1]):
-                lines.append(f"{src}: {count}")
+                lines.append(f"{_escape(src)}: {count}")
             if not lines[1:]:
                 lines.append("Источников пока нет.")
             text = "\n".join(lines)
@@ -4462,8 +4647,8 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             lines = ["<b>Заявки на вывод</b>"]
             for r in reqs:
                 u = storage.get_user(r["user_id"])
-                uname = u.get("username") or "?"
-                lines.append(f"#{r['id']} — user {r['user_id']} (@{uname}) — {r['amount']}₽ — {r.get('card','')}")
+                uname = _escape(u.get("username") or "?")
+                lines.append(f"#{r['id']} — user {r['user_id']} (@{uname}) — {r['amount']}₽ — {_escape(r.get('card',''))}")
             if len(lines) == 1:
                 lines.append("Нет заявок.")
             kb = K()
@@ -4538,7 +4723,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                 lines = ["<b>Жалобы</b>"]
                 for comp in complaints[-20:]:
                     status = "✅" if comp.get("status") == "closed" else "🆕"
-                    lines.append(f"{status} #{comp.get('id')} user {comp.get('user_id')} ({_format_time(comp.get('created_at'))}): {comp.get('text', '')[:80]}")
+                    lines.append(f"{status} #{comp.get('id')} user {comp.get('user_id')} ({_format_time(comp.get('created_at'))}): {_escape(comp.get('text', '')[:80])}")
                 text = "\n".join(lines)
             kb = K()
             for comp in complaints[-20:]:
@@ -4642,7 +4827,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             else:
                 lines = ["<b>Последние подключения</b>"]
                 for l in logs:
-                    lines.append(f"#{l.get('sub_id')} {l.get('ip')} — {l.get('reason')} — {'разрешено' if l.get('allowed') else 'запрещено'} ({_format_time(l.get('timestamp'))})")
+                    lines.append(f"#{l.get('sub_id')} {_escape(l.get('ip'))} — {_escape(l.get('reason'))} — {'разрешено' if l.get('allowed') else 'запрещено'} ({_format_time(l.get('timestamp'))})")
                 text = "\n".join(lines)
             bot.edit_message_text(text, chat_id, c.message.message_id,
                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:security")))
@@ -4654,7 +4839,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             else:
                 lines = ["<b>Подозрительные события</b>"]
                 for e in evts:
-                    lines.append(f"user {e.get('user_id')} sub #{e.get('sub_id')} IP {e.get('ip')} — {e.get('reason')} ({_format_time(e.get('timestamp'))})")
+                    lines.append(f"user {e.get('user_id')} sub #{e.get('sub_id')} IP {_escape(e.get('ip'))} — {_escape(e.get('reason'))} ({_format_time(e.get('timestamp'))})")
                 text = "\n".join(lines)
             bot.edit_message_text(text, chat_id, c.message.message_id,
                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:security")))
@@ -4690,7 +4875,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         text = (f"<b>Заявка на вывод #{req_id}</b>\n\n"
                 f"Пользователь: {req['user_id']}\n"
                 f"Сумма: {req['amount']}₽\n"
-                f"Карта/реквизиты: {req.get('card','')}")
+                f"Карта/реквизиты: {_escape(req.get('card',''))}")
         kb = K()
         kb.add(B("Подтвердить", callback_data=f"{CB_PREFIX}admin_withdraw_approve:{req_id}"))
         kb.add(B("Отклонить", callback_data=f"{CB_PREFIX}admin_withdraw_reject:{req_id}"))
@@ -4716,7 +4901,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                               reply_markup=_admin_main_keyboard())
         if _user_bot_instance:
             try:
-                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {req['amount']}₽ подтверждена. Средства отправлены на {req.get('card','')}.")
+                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {req['amount']}₽ подтверждена. Средства отправлены на {_escape(req.get('card',''))}.")
             except Exception:
                 pass
         return
@@ -4826,8 +5011,12 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             return
         data = state.get("data", {})
         uid = data.get("uid")
+        if not uid:
+            bot.send_message(chat_id, "Сначала введите user_id через /vpnadmin → Выдать подписку.")
+            return
         tg.clear_state(chat_id, user_id)
         sub = storage.create_subscription(uid, plan_id, months)
+        XrayAPI.add_or_update_client(sub)
         bot.send_message(chat_id, f"Подписка #{sub.sub_id} выдана пользователю {uid}.")
         if _user_bot_instance:
             try:
@@ -4958,7 +5147,7 @@ def handle_new_order(cardinal: Cardinal, e) -> None:
             pass
         msg = ("Спасибо за покупку VPN!\n\n"
                "Напишите нашему Telegram-боту и используйте команду /vpn.\n"
-               f"Ваш ник FunPay: <code>{order.buyer_username}</code>")
+               f"Ваш ник FunPay: <code>{_escape(order.buyer_username)}</code>")
         cardinal.send_message(chat_id, msg, order.buyer_username)
     except Exception:
         logger.exception("Ошибка обработки VPN-заказа")
