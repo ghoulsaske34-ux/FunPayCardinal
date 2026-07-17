@@ -27,7 +27,7 @@ import requests
 
 try:
     from fastapi import FastAPI, Request, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     import uvicorn
     HAS_FASTAPI = True
 except Exception:
@@ -35,6 +35,7 @@ except Exception:
     Request = None  # type: ignore
     HTTPException = None  # type: ignore
     JSONResponse = None  # type: ignore
+    Response = None  # type: ignore
     uvicorn = None  # type: ignore
     HAS_FASTAPI = False
 
@@ -168,6 +169,7 @@ class ServerConfig:
     temp_profile_enabled: bool = False
     temp_profile_port: int = 8081
     temp_inbound_id: int = 0
+    enabled: bool = True  # health-check отключает упавшие ноды
 
 
 @dataclass
@@ -324,6 +326,7 @@ class VPNStorage:
             "yookassa_return_url": "",
             "yookassa_webhook_url": "",
             "yookassa_webhook_enabled": False,
+            "subscription_public_url": "",
             "welcome": "Добро пожаловать в VPN-бот!",
             "support": "@support",
             "bot_username": "",
@@ -864,9 +867,12 @@ class VPNStorage:
 
     def server(self, host_id: str | None = None) -> ServerConfig:
         host = self.get_host(host_id or self.config.get("default_host_id", "main"))
-        if not host:
-            return ServerConfig()
-        return host
+        if host and host.enabled:
+            return host
+        for h in self.list_hosts():
+            if h.enabled:
+                return h
+        return host or ServerConfig()
 
     def default_host_id(self) -> str:
         return self.config.get("default_host_id", "main")
@@ -908,6 +914,7 @@ class VPNStorage:
             "temp_profile_enabled": server.temp_profile_enabled,
             "temp_profile_port": server.temp_profile_port,
             "temp_inbound_id": server.temp_inbound_id,
+            "enabled": server.enabled,
         }
         if not self.config.get("default_host_id"):
             self.config["default_host_id"] = server.host_id
@@ -1224,6 +1231,13 @@ class VPNStorage:
         if not data:
             return None
         return self._sub_from_dict(data)
+
+    def get_subscription_by_xray_sub_id(self, xray_sub_id: str) -> Subscription | None:
+        for data in self.subscriptions["subs"].values():
+            sub = self._sub_from_dict(data)
+            if sub.xray_sub_id == xray_sub_id:
+                return sub
+        return None
 
     def create_subscription(self, user_id: int, plan_id: str, months: int, is_trial: bool = False, host_id: str | None = None) -> Subscription:
         with self._lock:
@@ -2079,6 +2093,69 @@ class RatesFetcher:
             self._thread.join(timeout=5)
 
 
+class HealthChecker:
+    """Фоновый поток health-check'а нод 3X-UI: отключает упавшие, уведомляет админа."""
+
+    CHECK_INTERVAL = 60
+    FAILURE_THRESHOLD = 3
+
+    def __init__(self, bot: "UserBot") -> None:
+        self.bot = bot
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failures: dict[str, int] = {}
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._check_all()
+            except Exception:
+                logger.exception("HealthChecker error")
+            self._stop.wait(self.CHECK_INTERVAL)
+
+    def _check_all(self) -> None:
+        for host in storage.list_hosts():
+            if not host.panel_url:
+                continue
+            ok = XrayAPI.health_check(host)
+            host_id = host.host_id
+            if ok:
+                if self._failures.get(host_id, 0) >= self.FAILURE_THRESHOLD:
+                    self._enable_host(host)
+                self._failures[host_id] = 0
+            else:
+                self._failures[host_id] = self._failures.get(host_id, 0) + 1
+                logger.warning("HealthChecker host %s failure %s/%s", host_id, self._failures[host_id], self.FAILURE_THRESHOLD)
+                if self._failures[host_id] == self.FAILURE_THRESHOLD:
+                    self._disable_host(host)
+
+    def _disable_host(self, host: ServerConfig) -> None:
+        if not host.enabled:
+            return
+        host.enabled = False
+        storage.set_host(host)
+        storage._notify_admins(f"🚨 Нода {host.host_id} ({host.name}) недоступна — исключена из выдачи.", "host_down")
+        logger.warning("Host %s disabled by health-check", host.host_id)
+
+    def _enable_host(self, host: ServerConfig) -> None:
+        if host.enabled:
+            return
+        host.enabled = True
+        storage.set_host(host)
+        storage._notify_admins(f"✅ Нода {host.host_id} ({host.name}) снова доступна — включена в выдачу.", "host_up")
+        logger.info("Host %s enabled by health-check", host.host_id)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
 
 _DEVICE_RATE_LIMIT: dict[str, list[float]] = {}
 
@@ -2284,6 +2361,29 @@ class DeviceAuthServer:
             if event.startswith("payment.") and payment:
                 _handle_yookassa_payment(payment)
             return {"ok": True}
+
+        @app.get("/sub/{sub_id}")
+        async def subscription(sub_id: str, request: Request, format: str = "raw") -> Any:
+            """Универсальная подписка: raw (base64 vless), singbox, clash."""
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=60, window=60):
+                raise HTTPException(status_code=429)
+            sub = storage.get_subscription_by_xray_sub_id(sub_id)
+            if not sub or not sub.active or sub.is_expired:
+                raise HTTPException(status_code=404, detail="subscription not found or expired")
+            server = storage.get_host(sub.host_id) or storage.server()
+            if not server or not server.address or not server.public_key:
+                raise HTTPException(status_code=503, detail="server not configured")
+            vless_url = generate_vless_url(sub, server)
+            fmt = (format or "raw").lower()
+            if fmt == "raw":
+                body = base64.b64encode(vless_url.encode("utf-8")).decode("ascii")
+                return Response(content=body, media_type="text/plain; charset=utf-8")
+            if fmt == "singbox":
+                return JSONResponse(build_singbox_config(vless_url, server, sub))
+            if fmt == "clash":
+                return Response(content=build_clash_config(vless_url, server, sub), media_type="text/yaml; charset=utf-8")
+            raise HTTPException(status_code=400, detail="unsupported format")
 
         return app
 
@@ -2662,6 +2762,20 @@ class XrayAPI:
         return False
 
     @staticmethod
+    def health_check(server: ServerConfig) -> bool:
+        """Проверяет доступность панели 3X-UI (login + inbound)."""
+        if not server.panel_url:
+            return False
+        try:
+            session = requests.Session()
+            if not XrayAPI._login(session, server):
+                return False
+            inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
+            return inbound is not None
+        except Exception:
+            return False
+
+    @staticmethod
     def _get_inbound(session: requests.Session, server: ServerConfig, inbound_id: int) -> dict[str, Any] | None:
         url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/get/{inbound_id}"
         try:
@@ -2786,7 +2900,10 @@ class XrayAPI:
 
     @staticmethod
     def _get_host(host_id: str | None = None) -> ServerConfig | None:
-        return storage.get_host(host_id) or storage.server()
+        host = storage.get_host(host_id)
+        if host and host.enabled:
+            return host
+        return storage.server()
 
     @staticmethod
     def get_clients(inbound_id: int | None = None, host_id: str | None = None) -> list[dict[str, Any]]:
@@ -3063,6 +3180,10 @@ def generate_subscription_url(sub: Subscription, server: ServerConfig) -> str:
 
 def generate_subscription_url_raw(xray_sub_id: str, server: ServerConfig) -> str:
     """Формирует URL подписки /sub/{subId} по сырому subId."""
+    public_url = storage.config.get("subscription_public_url", "")
+    if public_url:
+        base = public_url.rstrip("/")
+        return f"{base}/sub/{xray_sub_id}"
     base = server.subscription_url_base or server.address
     panel_url = server.panel_url or ""
     if panel_url.startswith("https://") or server.sub_port == 443:
@@ -3070,6 +3191,79 @@ def generate_subscription_url_raw(xray_sub_id: str, server: ServerConfig) -> str
     else:
         scheme = "http"
     return f"{scheme}://{base}:{server.sub_port}/sub/{xray_sub_id}"
+
+
+def _subscription_vless_url(sub: Subscription, server: ServerConfig) -> str:
+    return generate_vless_url(sub, server)
+
+
+def build_singbox_config(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
+    """Строит sing-box outbound для VLESS Reality."""
+    return {
+        "log": {"level": "info"},
+        "dns": {"servers": [{"address": "tls://1.1.1.1"}]},
+        "inbounds": [
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080},
+        ],
+        "outbounds": [
+            {
+                "type": "vless",
+                "tag": "proxy",
+                "server": server.address,
+                "server_port": server.port,
+                "uuid": sub.client_uuid,
+                "flow": server.flow or "xtls-rprx-vision",
+                "network": "tcp",
+                "tls": {
+                    "enabled": True,
+                    "server_name": server.server_name or server.address,
+                    "utls": {"enabled": True, "fingerprint": server.fingerprint or "chrome"},
+                    "reality": {
+                        "enabled": True,
+                        "public_key": server.public_key,
+                        "short_id": server.short_id,
+                    },
+                },
+            },
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {
+            "final": "proxy",
+            "auto_detect_interface": True,
+        },
+    }
+
+
+def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) -> str:
+    """Строит минимальный Clash Meta YAML для VLESS Reality."""
+    name = f"{server.server_name or 'VPN'}-{sub.email or sub.sub_id}"
+    lines = [
+        "proxies:",
+        f"  - name: \"{name}\"",
+        f"    type: vless",
+        f"    server: {server.address}",
+        f"    port: {server.port}",
+        f"    uuid: {sub.client_uuid}",
+        f"    flow: {server.flow or 'xtls-rprx-vision'}",
+        "    network: tcp",
+        "    tls: true",
+        f"    servername: {server.server_name or server.address}",
+        f"    client-fingerprint: {server.fingerprint or 'chrome'}",
+        "    reality-opts:",
+        f"      public-key: \"{server.public_key}\"",
+        f"      short-id: \"{server.short_id}\"",
+        "",
+        "proxy-groups:",
+        f"  - name: \"Proxy\"",
+        "    type: select",
+        "    proxies:",
+        f"      - \"{name}\"",
+        "",
+        "rules:",
+        "  - MATCH,Proxy",
+    ]
+    return "\n".join(lines)
 
 
 def _generate_qr_code(url: str) -> bytes | None:
@@ -3107,6 +3301,7 @@ class UserBot:
         self._yookassa_poller: YooKassaPoller | None = None
         self._scheduler: SubscriptionScheduler | None = None
         self._rates_fetcher: RatesFetcher | None = None
+        self._health_checker: HealthChecker | None = None
         self._device_auth_server: DeviceAuthServer | None = None
         self._temp_profile_server: TempProfileServer | None = None
         self._register_handlers()
@@ -4003,12 +4198,16 @@ class UserBot:
             sub = storage.get_subscription(sub_id)
         vless_url = generate_vless_url(sub, server)
         sub_url = generate_subscription_url(sub, server)
+        singbox_url = f"{sub_url}?format=singbox"
+        clash_url = f"{sub_url}?format=clash"
         text = (
             f"<b>Подключение к VPN</b>\n\n"
-            f"1. Установите приложение (v2rayNG, V2Box, Streisand и т.п.)\n"
-            f"2. Отсканируйте QR-код или нажмите ссылку/подписку.\n\n"
+            f"1. Установите приложение (v2rayNG, V2Box, Streisand, sing-box, Clash Meta)\n"
+            f"2. Отсканируйте QR-код или добавьте ссылку/подписку.\n\n"
             f"<b>VLESS ссылка:</b>\n<code>{_escape(vless_url)}</code>\n\n"
-            f"<b>Подписка:</b>\n<code>{_escape(sub_url)}</code>"
+            f"<b>Универсальная подписка:</b>\n<code>{_escape(sub_url)}</code>\n\n"
+            f"<b>sing-box:</b>\n<code>{_escape(singbox_url)}</code>\n\n"
+            f"<b>Clash Meta:</b>\n<code>{_escape(clash_url)}</code>"
         )
         qr = _generate_qr_code(vless_url)
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
@@ -4650,6 +4849,8 @@ class UserBot:
         self._scheduler.start()
         self._rates_fetcher = RatesFetcher()
         self._rates_fetcher.start()
+        self._health_checker = HealthChecker(self)
+        self._health_checker.start()
         self._device_auth_server = DeviceAuthServer(storage.config.get("device_auth_port", 8080))
         self._device_auth_server.start()
         server_cfg = storage.server()
@@ -4681,6 +4882,8 @@ class UserBot:
             self._scheduler.stop()
         if self._rates_fetcher:
             self._rates_fetcher.stop()
+        if self._health_checker:
+            self._health_checker.stop()
         if self._device_auth_server:
             self._device_auth_server.stop()
         if self._temp_profile_server:
@@ -4808,6 +5011,21 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         storage.config["yookassa_webhook_url"] = url
         storage.save_config()
         bot.send_message(m.chat.id, "Webhook URL YooKassa сохранён. Не забудьте указать его в личном кабинете YooKassa.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_sub_url(m: Message):
+        url = m.text.strip()
+        if url in ("-", "", "none"):
+            storage.config["subscription_public_url"] = ""
+            storage.save_config()
+            bot.send_message(m.chat.id, "Публичный URL сброшен, используется 3X-UI.")
+        elif url.startswith(("http://", "https://")):
+            storage.config["subscription_public_url"] = url.rstrip("/")
+            storage.save_config()
+            bot.send_message(m.chat.id, "Публичный URL подписок сохранён.")
+        else:
+            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://, или <code>-</code> для сброса.")
+            return
         tg.clear_state(m.chat.id, m.from_user.id)
 
     def state_set_server(m: Message):
@@ -5490,6 +5708,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_yookassa_secret, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_secret"))
     tg.msg_handler(state_set_yookassa_return, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_return"))
     tg.msg_handler(state_set_yookassa_webhook, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_webhook"))
+    tg.msg_handler(state_set_sub_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_sub_url"))
     tg.msg_handler(state_set_server, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_server"))
     tg.msg_handler(state_admin_host_add, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_add"))
     tg.msg_handler(state_admin_host_data, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_data"))
@@ -5575,6 +5794,7 @@ def _admin_main_keyboard() -> K:
         B("📤 Экспорт", callback_data=f"{CB_PREFIX}admin:export", style="success"),
         B("📈 Статистика", callback_data=f"{CB_PREFIX}admin:stats", style="success"),
         B("⚙️ Настройки", callback_data=f"{CB_PREFIX}admin:settings", style="primary"),
+        B("🌐 URL подписок", callback_data=f"{CB_PREFIX}admin:sub_url", style="primary"),
         B("🔔 Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications", style="success"),
         B("📝 Жалобы", callback_data=f"{CB_PREFIX}admin:complaints", style="danger"),
         B("🔄 Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray", style="primary"),
@@ -5827,7 +6047,8 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             lines = ["<b>Серверы</b>"]
             for host in hosts:
                 default = " (по умолч.)" if host.host_id == storage.default_host_id() else ""
-                lines.append(f"{host.name or host.host_id}{default} — {host.address}:{host.port}")
+                status = "🟢" if host.enabled else "🔴"
+                lines.append(f"{status} {host.name or host.host_id}{default} — {host.address}:{host.port}")
             text = "\n".join(lines) if hosts else "Серверы не настроены."
             kb = K()
             for host in hosts:
@@ -6558,6 +6779,18 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                 text += f"\n{u['user_id']} — {_to_dec(u.get('total_spent', 0)):.2f}₽"
         bot.edit_message_text(text, chat_id, c.message.message_id,
                               reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
+        return
+
+    if section == "sub_url":
+        current = storage.config.get("subscription_public_url", "") or "не задан (используется 3X-UI)"
+        text = (f"<b>🌐 Публичный URL подписок</b>\n\n"
+                f"Текущий: <code>{current}</code>\n\n"
+                f"Отправьте URL, на который будут приходить запросы /sub/&lt;sub_id&gt; "
+                f"(например, https://ваш_домен:8080 или https://vpn.ваш_домен).\n"
+                f"Отправьте <code>-</code>, чтобы сбросить и использовать 3X-UI.")
+        kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+        bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_sub_url")
         return
 
     if section == "settings":
