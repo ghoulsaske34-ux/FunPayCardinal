@@ -11,6 +11,7 @@ import csv
 import ipaddress
 import base64
 import json
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import logging
 import os
 import re
@@ -61,17 +62,17 @@ DEFAULT_PLANS = {
     "basic": {
         "name": "Базовый",
         "max_devices": 1,
-        "prices": {"1": 100, "3": 270, "6": 500, "12": 900},
+        "prices": {"1": Decimal("100.00"), "3": Decimal("270.00"), "6": Decimal("500.00"), "12": Decimal("900.00")},
     },
     "family": {
         "name": "Семейный",
         "max_devices": 5,
-        "prices": {"1": 250, "3": 700, "6": 1300, "12": 2400},
+        "prices": {"1": Decimal("250.00"), "3": Decimal("700.00"), "6": Decimal("1300.00"), "12": Decimal("2400.00")},
     },
     "corporate": {
         "name": "Корпоративный",
         "max_devices": -1,
-        "prices": {"1": 500, "3": 1400, "6": 2600, "12": 4800},
+        "prices": {"1": Decimal("500.00"), "3": Decimal("1400.00"), "6": Decimal("2600.00"), "12": Decimal("4800.00")},
     },
 }
 
@@ -114,7 +115,7 @@ class Plan:
     id: str
     name: str
     max_devices: int
-    prices: dict[str, float]
+    prices: dict[str, Decimal]
     host_id: str = "main"
 
     @property
@@ -170,6 +171,35 @@ class VPNStorage:
         self.transactions: dict[str, Any] = self._load_json(TRANS_FILE, self._default_transactions)
         self.referrals: dict[str, Any] = self._load_json(REFERRALS_FILE, self._default_referrals)
         self.connections: dict[str, Any] = self._load_json(CONNECTIONS_FILE, self._default_connections)
+        self._decimalize_loaded()
+
+    def _decimalize_loaded(self) -> None:
+        for u in self.users.values():
+            for key in ("balance", "referral_balance", "total_spent"):
+                if key in u:
+                    u[key] = _to_dec(u[key])
+        for tx in self.transactions.get("txs", {}).values():
+            tx["amount"] = _to_dec(tx.get("amount"))
+        for inv in self.referrals.get("crypto_invoices", {}).values():
+            for key in ("amount", "rub_amount", "paid_amount"):
+                if key in inv and inv[key] is not None:
+                    inv[key] = _to_dec(inv[key])
+        for e in self.referrals.get("earnings", {}).values():
+            e["level1"] = _to_dec(e.get("level1", 0))
+            e["level2"] = _to_dec(e.get("level2", 0))
+        rates = self.config.get("rates", {})
+        for key in ("USD", "TON"):
+            if key in rates:
+                rates[key] = _to_dec(rates[key])
+        for r in self.config.get("withdrawal_requests", {}).values():
+            r["amount"] = _to_dec(r.get("amount"))
+        for p in self.config.get("plans", {}).values():
+            prices = p.get("prices", {})
+            for k, v in list(prices.items()):
+                prices[k] = _to_dec(v)
+        for promo in self.config.get("promocodes", {}).values():
+            if "value" in promo and promo["value"] is not None:
+                promo["value"] = _to_dec(promo["value"])
 
     def _ensure_config_defaults(self, current: dict[str, Any], defaults: dict[str, Any]) -> None:
         for key, value in defaults.items():
@@ -207,7 +237,7 @@ class VPNStorage:
             "plans": copy.deepcopy(DEFAULT_PLANS),
             "promocodes": {},
             "activation_codes": {},
-            "rates": {"USD": 0.0, "TON": 0.0, "updated_at": 0.0},
+            "rates": {"USD": Decimal("0.00"), "TON": Decimal("0.00"), "updated_at": 0.0},
             "withdrawal_requests": {},
             "security": {
                 "sharing_window": DEFAULT_SHARING_WINDOW,
@@ -273,7 +303,7 @@ class VPNStorage:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -302,7 +332,7 @@ class VPNStorage:
         with self._lock:
             self._save_json(REFERRALS_FILE, self.referrals)
 
-    def add_crypto_invoice(self, invoice_id: str | int, user_id: int, amount: float, asset: str, rub_amount: float | None = None) -> None:
+    def add_crypto_invoice(self, invoice_id: str | int, user_id: int, amount: Decimal, asset: str, rub_amount: Decimal | None = None) -> None:
         self.referrals["crypto_invoices"][str(invoice_id)] = {
             "user_id": user_id,
             "amount": amount,
@@ -316,7 +346,7 @@ class VPNStorage:
     def get_crypto_invoice(self, invoice_id: str | int) -> dict[str, Any] | None:
         return self.referrals["crypto_invoices"].get(str(invoice_id))
 
-    def mark_crypto_invoice(self, invoice_id: str | int, status: str, paid_amount: float | None = None, paid_asset: str | None = None) -> dict[str, Any] | None:
+    def mark_crypto_invoice(self, invoice_id: str | int, status: str, paid_amount: Decimal | None = None, paid_asset: str | None = None) -> dict[str, Any] | None:
         inv = self.referrals["crypto_invoices"].get(str(invoice_id))
         if inv:
             inv["status"] = status
@@ -420,7 +450,7 @@ class VPNStorage:
                 id=pid,
                 name=pdata.get("name", pid),
                 max_devices=int(pdata.get("max_devices", 1)),
-                prices={str(k): float(v) for k, v in pdata.get("prices", {}).items()},
+                prices={str(k): _to_dec(v) for k, v in pdata.get("prices", {}).items()},
                 host_id=plan_host,
             )
         return result
@@ -428,7 +458,7 @@ class VPNStorage:
     def plan(self, plan_id: str) -> Plan | None:
         return self.plans().get(plan_id)
 
-    def update_plan(self, plan_id: str, name: str | None = None, max_devices: int | None = None, prices: dict[str, float] | None = None, host_id: str | None = None) -> None:
+    def update_plan(self, plan_id: str, name: str | None = None, max_devices: int | None = None, prices: dict[str, Decimal] | None = None, host_id: str | None = None) -> None:
         plans = self.config.setdefault("plans", copy.deepcopy(DEFAULT_PLANS))
         plan_data = plans.setdefault(plan_id, {"name": plan_id, "max_devices": 1, "prices": {}, "host_id": "main"})
         if name is not None:
@@ -436,7 +466,7 @@ class VPNStorage:
         if max_devices is not None:
             plan_data["max_devices"] = max_devices
         if prices is not None:
-            plan_data["prices"] = {str(k): float(v) for k, v in prices.items()}
+            plan_data["prices"] = {str(k): _to_dec(v) for k, v in prices.items()}
         if host_id is not None:
             plan_data["host_id"] = host_id
         self.save_config()
@@ -447,7 +477,7 @@ class VPNStorage:
             del plans[plan_id]
             self.save_config()
 
-    def add_plan(self, plan_id: str, name: str, max_devices: int, prices: dict[str, float]) -> None:
+    def add_plan(self, plan_id: str, name: str, max_devices: int, prices: dict[str, Decimal]) -> None:
         self.update_plan(plan_id, name, max_devices, prices)
 
     def get_promocode(self, code: str) -> dict[str, Any] | None:
@@ -469,11 +499,11 @@ class VPNStorage:
         self.save_config()
         return promo
 
-    def create_promocode(self, code: str, discount_type: str, value: float, max_uses: int, expires_at: float | None = None, plan_id: str | None = None) -> None:
+    def create_promocode(self, code: str, discount_type: str, value: Decimal, max_uses: int, expires_at: float | None = None, plan_id: str | None = None) -> None:
         self.config.setdefault("promocodes", {})[code.upper()] = {
             "code": code.upper(),
             "discount_type": discount_type,
-            "value": value,
+            "value": _to_dec(value),
             "max_uses": max_uses,
             "uses": 0,
             "expires_at": expires_at,
@@ -527,16 +557,17 @@ class VPNStorage:
         self.update_subscription(sub)
         XrayAPI.add_or_update_client(sub, enable=True)
 
-    def refund_subscription(self, sub: Subscription, refund_amount: float) -> None:
+    def refund_subscription(self, sub: Subscription, refund_amount: Decimal) -> None:
         user = self.get_user(sub.user_id)
-        user["balance"] = round(user["balance"] + refund_amount, 2)
+        refund_amount = _money_round(refund_amount)
+        user["balance"] = _money_round(user["balance"] + refund_amount)
         self.update_user(user)
         self._add_transaction(sub.user_id, refund_amount, "refund", "admin", f"sub:{sub.sub_id}")
         sub.active = False
         self.update_subscription(sub)
         XrayAPI.remove_client(sub)
 
-    def price(self, plan_id: str, months: int) -> float | None:
+    def price(self, plan_id: str, months: int) -> Decimal | None:
         plan = self.plan(plan_id)
         if not plan:
             return None
@@ -550,15 +581,15 @@ class VPNStorage:
                 "username": username or "",
                 "source": source,
                 "settings": {"lang": "ru", "notifications": True, "auto_renew": True},
-                "balance": 0.0,
-                "referral_balance": 0.0,
+                "balance": Decimal("0.00"),
+                "referral_balance": Decimal("0.00"),
                 "referral_code": f"ref_{user_id}",
                 "referred_by": None,
                 "trial_used": False,
                 "joined_at": time.time(),
                 "channel_ok": False,
                 "is_banned": False,
-                "total_spent": 0.0,
+                "total_spent": Decimal("0.00"),
                 "total_months": 0,
                 "first_purchase_discount_used": False,
             }
@@ -610,37 +641,40 @@ class VPNStorage:
                 return True
         return False
 
-    def add_balance(self, user_id: int, amount: float, source: str, method: str, payload: str = "", notify: bool = True) -> bool:
+    def add_balance(self, user_id: int, amount: Decimal, source: str, method: str, payload: str = "", notify: bool = True) -> bool:
         with self._lock:
             if self._is_tx_duplicate(user_id, method, payload):
                 return False
             user = self.get_user(user_id)
-            user["balance"] = round(user["balance"] + amount, 2)
+            amount = _money_round(amount)
+            user["balance"] = _money_round(user["balance"] + amount)
             self.update_user(user)
             self._add_transaction(user_id, amount, "deposit", method, payload)
         if notify and amount > 0:
-            self._notify_admins(f"Новый платёж: user {user_id} пополнил баланс на {amount}₽ ({method}).", "new_payment")
+            self._notify_admins(f"Новый платёж: user {user_id} пополнил баланс на {_money_str(amount)}₽ ({method}).", "new_payment")
         return True
 
-    def deduct_balance(self, user_id: int, amount: float, method: str, payload: str = "") -> bool:
+    def deduct_balance(self, user_id: int, amount: Decimal, method: str, payload: str = "") -> bool:
         with self._lock:
             user = self.get_user(user_id)
-            if user["balance"] < amount - 1e-9:
+            amount = _money_round(amount)
+            if user["balance"] < amount:
                 return False
-            user["balance"] = round(user["balance"] - amount, 2)
+            user["balance"] = _money_round(user["balance"] - amount)
             self.update_user(user)
             self._add_transaction(user_id, -amount, "purchase", method, payload)
         return True
 
-    def apply_referral_discount(self, user_id: int, base_price: float) -> float:
+    def apply_referral_discount(self, user_id: int, base_price: Decimal) -> Decimal:
         with self._lock:
             user = self.get_user(user_id)
+            base_price = _to_dec(base_price)
             if not user.get("referred_by") or user.get("first_purchase_discount_used"):
                 return base_price
-            discount = float(self.config.get("referral_first_discount", 0))
+            discount = _to_dec(self.config.get("referral_first_discount", 0))
             if discount <= 0 or discount >= 100:
                 return base_price
-            return round(base_price * (100 - discount) / 100, 2)
+            return _money_round(base_price * (100 - discount) / 100)
 
     def mark_first_purchase_discount_used(self, user_id: int) -> None:
         with self._lock:
@@ -649,21 +683,22 @@ class VPNStorage:
                 user["first_purchase_discount_used"] = True
                 self.update_user(user)
 
-    def add_purchase_stats(self, user_id: int, amount: float, months: int) -> None:
+    def add_purchase_stats(self, user_id: int, amount: Decimal, months: int) -> None:
         with self._lock:
             user = self.get_user(user_id)
-            user["total_spent"] = round(user.get("total_spent", 0.0) + amount, 2)
+            amount = _to_dec(amount)
+            user["total_spent"] = _money_round(user.get("total_spent", 0) + amount)
             user["total_months"] = int(user.get("total_months", 0)) + months
             self.update_user(user)
 
-    def _add_transaction(self, user_id: int, amount: float, tx_type: str, method: str, payload: str) -> None:
+    def _add_transaction(self, user_id: int, amount: Decimal, tx_type: str, method: str, payload: str) -> None:
         with self._lock:
             tid = str(self.transactions["next_id"])
             self.transactions["next_id"] += 1
             self.transactions["txs"][tid] = {
                 "id": tid,
                 "user_id": user_id,
-                "amount": amount,
+                "amount": _money_round(amount),
                 "type": tx_type,
                 "method": method,
                 "payload": payload,
@@ -745,14 +780,14 @@ class VPNStorage:
         self.subscriptions["subs"][sub.sub_id] = asdict(sub)
         self.save_subscriptions()
 
-    def create_withdrawal_request(self, user_id: int, amount: float, card: str) -> str:
+    def create_withdrawal_request(self, user_id: int, amount: Decimal, card: str) -> str:
         with self._lock:
             req_id = str(self.config.setdefault("withdrawal_next_id", 1))
             self.config["withdrawal_next_id"] = int(req_id) + 1
         self.config.setdefault("withdrawal_requests", {})[req_id] = {
             "id": req_id,
             "user_id": user_id,
-            "amount": amount,
+            "amount": _money_round(amount),
             "card": card,
             "status": "pending",
             "created_at": time.time(),
@@ -942,15 +977,16 @@ class VPNStorage:
                 count += 1
         return count
 
-    def bulk_add_balance(self, amount: float) -> int:
+    def bulk_add_balance(self, amount: Decimal) -> int:
         with self._lock:
             ts = str(int(time.time()))
+            amount = _money_round(amount)
             count = 0
             for u in self.users.values():
                 uid = int(u.get("user_id", 0))
                 if not uid:
                     continue
-                u["balance"] = round(u.get("balance", 0.0) + amount, 2)
+                u["balance"] = _money_round(_to_dec(u.get("balance", 0)) + amount)
                 tid = str(self.transactions["next_id"])
                 self.transactions["next_id"] += 1
                 self.transactions["txs"][tid] = {
@@ -1020,18 +1056,20 @@ class VPNStorage:
         self.update_user(user)
         return True, "Устройство отвязано."
 
-    def add_referral_earnings(self, user_id: int, amount: float, from_user_id: int, level: int) -> None:
+    def add_referral_earnings(self, user_id: int, amount: Decimal, from_user_id: int, level: int) -> None:
         with self._lock:
             user = self.get_user(user_id)
-            user["referral_balance"] = round(user.get("referral_balance", 0.0) + amount, 2)
+            amount = _money_round(amount)
+            user["referral_balance"] = _money_round(user.get("referral_balance", 0) + amount)
             self.update_user(user)
             self._add_transaction(user_id, amount, "referral", f"level_{level}", f"from_{from_user_id}")
             key = str(user_id)
-            self.referrals["earnings"].setdefault(key, {"level1": 0.0, "level2": 0.0})
-            self.referrals["earnings"][key][f"level{level}"] = round(self.referrals["earnings"][key][f"level{level}"] + amount, 2)
+            self.referrals["earnings"].setdefault(key, {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
+            self.referrals["earnings"][key][f"level{level}"] = _money_round(self.referrals["earnings"][key][f"level{level}"] + amount)
             self.save_referrals()
 
-    def process_referral_rewards(self, buyer_id: int, amount: float) -> None:
+    def process_referral_rewards(self, buyer_id: int, amount: Decimal) -> None:
+        amount = _money_round(amount)
         if amount <= 0:
             return
         user = self.get_user(buyer_id)
@@ -1039,20 +1077,18 @@ class VPNStorage:
         if parent_id:
             try:
                 pid = int(parent_id)
-                reward = round(amount * 0.10, 2)
+                reward = _money_round(amount * Decimal("0.10"))
                 if reward > 0 and self.get_user(pid):
                     self.add_referral_earnings(pid, reward, buyer_id, 1)
                     grandparent = self.get_user(pid).get("referred_by")
                     if grandparent:
                         gpid = int(grandparent)
-                        reward2 = round(amount * 0.05, 2)
+                        reward2 = _money_round(amount * Decimal("0.05"))
                         if reward2 > 0 and self.get_user(gpid):
                             self.add_referral_earnings(gpid, reward2, buyer_id, 2)
             except (ValueError, TypeError):
                 pass
 
-
-storage = VPNStorage()
 
 
 def _escape(text: str) -> str:
@@ -1066,13 +1102,44 @@ def _csv_safe(value: Any) -> str:
     return s
 
 
+CENTS = Decimal("0.01")
+
+def _to_dec(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        s = value.strip().replace(",", ".")
+        if not s:
+            return Decimal("0")
+        return Decimal(s)
+    return Decimal(str(value))
+
+
+def _money_round(value: Any) -> Decimal:
+    return _to_dec(value).quantize(CENTS, rounding=ROUND_HALF_UP)
+
+
+def _money_str(value: Any) -> str:
+    return f"{_to_dec(value):.2f}"
+
+
+def _json_default(obj: Any) -> Any:
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
 
 def _price_text(plan: Plan, months: str) -> str:
     price = plan.prices.get(months)
-    return f"{price}₽" if price is not None else "?₽"
+    return f"{_money_str(price)}₽" if price is not None else "?₽"
 
 
 def format_subscription(sub: Subscription) -> str:
@@ -1108,13 +1175,14 @@ class CryptoBotAPI:
     def _headers(self) -> dict[str, str]:
         return {"Crypto-Pay-API-Token": self.token, "Content-Type": "application/json"}
 
-    def create_invoice(self, user_id: int, amount: float, asset: str = "USDT") -> dict[str, Any]:
+    def create_invoice(self, user_id: int, amount: Decimal, asset: str = "USDT") -> dict[str, Any]:
         if not self.token:
             return {"ok": False, "error": "Crypto Bot token not set"}
-        payload = json.dumps({"user_id": user_id, "amount": amount, "asset": asset})
+        amount_str = str(amount)
+        payload = json.dumps({"user_id": user_id, "amount": amount_str, "asset": asset})
         body = {
             "asset": asset,
-            "amount": str(amount),
+            "amount": amount_str,
             "description": "Пополнение баланса VPN-бота",
             "hidden_message": "Спасибо за оплату!",
             "payload": payload,
@@ -1193,18 +1261,18 @@ class CryptoBotPoller:
                 except Exception:
                     info = {}
                 uid = info.get("user_id") or local.get("user_id")
-                paid_amount = float(inv.get("paid_amount") or inv.get("amount") or local.get("amount") or 0)
+                paid_amount = _to_dec(inv.get("paid_amount") or inv.get("amount") or local.get("amount") or 0)
                 paid_asset = inv.get("paid_asset") or local.get("asset")
                 if uid and paid_amount:
                     rub_amount = local.get("rub_amount")
                     if not rub_amount:
-                        rate = RatesFetcher().get_rate(paid_asset) or 0
-                        rub_amount = round(paid_amount * rate, 2) if rate else 0.0
+                        rate = RatesFetcher().get_rate(paid_asset) or Decimal("0")
+                        rub_amount = _money_round(paid_amount * rate) if rate else Decimal("0.00")
                     credited = storage.add_balance(int(uid), rub_amount, "Crypto Bot", f"cryptobot:{paid_asset}", iid)
                     if credited:
                         storage.mark_crypto_invoice(iid, "paid", paid_amount, paid_asset)
                         try:
-                            self.bot.bot.send_message(int(uid), f"Баланс пополнен на {rub_amount}₽ (~{paid_amount} {paid_asset}) через Crypto Bot.")
+                            self.bot.bot.send_message(int(uid), f"Баланс пополнен на {_money_str(rub_amount)}₽ (~{paid_amount} {paid_asset}) через Crypto Bot.")
                         except Exception:
                             pass
             elif status in ("expired", "cancelled"):
@@ -1312,7 +1380,7 @@ class SubscriptionScheduler:
                     XrayAPI.remove_client(sub)
                     self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Недостаточно средств для автопродления.")
                     continue
-                user["balance"] = round(user["balance"] - price, 2)
+                user["balance"] = _money_round(user["balance"] - price)
                 storage.update_user(user)
                 storage._add_transaction(sub.user_id, -price, "purchase", "autorenew", f"sub:{sub.sub_id}")
                 sub.expires_at = sub.expires_at + months * 30 * 86400
@@ -1322,7 +1390,7 @@ class SubscriptionScheduler:
                 storage.process_referral_rewards(sub.user_id, price)
                 storage.add_purchase_stats(sub.user_id, price, months)
                 XrayAPI.add_or_update_client(sub)
-                self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {price}₽.")
+                self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {_money_str(price)}₽.")
 
     def stop(self) -> None:
         self._stop.set()
@@ -1365,36 +1433,36 @@ class RatesFetcher:
         except Exception:
             logger.exception("RatesFetcher failed")
 
-    def _fetch_usd(self) -> float:
+    def _fetch_usd(self) -> Decimal:
         try:
             r = requests.get(self.CBR_URL, timeout=20)
             r.raise_for_status()
             data = r.json()
-            return float(data["Valute"]["USD"]["Value"])
+            return Decimal(str(data["Valute"]["USD"]["Value"]))
         except Exception:
             last = storage.config.get("rates", {}).get("USD")
             if last:
-                return last
+                return _to_dec(last)
             raise
 
-    def _fetch_ton(self) -> float:
+    def _fetch_ton(self) -> Decimal:
         try:
             r = requests.get(self.COINGECKO_URL, timeout=20)
             r.raise_for_status()
             data = r.json()
-            return float(data["the-open-network"]["rub"])
+            return Decimal(str(data["the-open-network"]["rub"]))
         except Exception:
             last = storage.config.get("rates", {}).get("TON")
             if last:
-                return last
+                return _to_dec(last)
             raise
 
-    def get_rate(self, asset: str) -> float | None:
+    def get_rate(self, asset: str) -> Decimal | None:
         rates = storage.config.get("rates", {})
         if asset == "USDT":
-            return rates.get("USD") or 0.0
+            return _to_dec(rates.get("USD")) or None
         if asset == "TON":
-            return rates.get("TON") or 0.0
+            return _to_dec(rates.get("TON")) or None
         return None
 
     def stop(self) -> None:
@@ -1751,7 +1819,7 @@ class StarsPayment:
     """Реальная отправка инвойса Telegram Stars."""
 
     @staticmethod
-    def send_invoice(bot, chat_id: int, user_id: int, amount: int, title: str = "Пополнение", description: str = "Баланс VPN-бота", rub_amount: float | None = None) -> bool:
+    def send_invoice(bot, chat_id: int, user_id: int, amount: int, title: str = "Пополнение", description: str = "Баланс VPN-бота", rub_amount: Decimal | None = None) -> bool:
         """Отправляет инвойс на указанное количество Telegram Stars."""
         payload = f"stars_{user_id}_{int(rub_amount or amount)}"
         try:
@@ -2352,12 +2420,12 @@ class UserBot:
             return False
 
     @staticmethod
-    def _is_valid_amount(text: str) -> float | None:
+    def _is_valid_amount(text: str) -> Decimal | None:
         text = text.strip().replace(",", ".")
         try:
-            value = float(text)
+            value = _to_dec(text)
             return value if value > 0 else None
-        except ValueError:
+        except (ValueError, InvalidOperation):
             return None
 
     @staticmethod
@@ -2745,13 +2813,13 @@ class UserBot:
 
         if action == "withdraw":
             user = storage.get_user(user_id)
-            ref_balance = user.get("referral_balance", 0.0)
+            ref_balance = _to_dec(user.get("referral_balance", 0))
             if ref_balance < 3000:
-                self.bot.edit_message_text(f"Минимальная сумма вывода 3000₽. Ваш реферальный баланс: {ref_balance}₽.",
+                self.bot.edit_message_text(f"Минимальная сумма вывода 3000₽. Ваш реферальный баланс: {_money_str(ref_balance)}₽.",
                                            chat_id, c.message.message_id, reply_markup=self._keyboard_main())
                 return
             self.set_state(user_id, "withdraw_amount", {"message_id": c.message.message_id})
-            self.bot.edit_message_text(f"Введите сумму вывода (доступно {ref_balance}₽, минимум 3000₽):",
+            self.bot.edit_message_text(f"Введите сумму вывода (доступно {_money_str(ref_balance)}₽, минимум 3000₽):",
                                        chat_id, c.message.message_id,
                                        reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}referral")))
             return
@@ -2812,24 +2880,24 @@ class UserBot:
                                        reply_markup=self._keyboard_main())
             return
         state = self.get_state(user_id)
-        discount = 0.0
+        discount = Decimal("0.00")
         if state and state.get("state") in ("confirm_purchase", "enter_promo") and state.get("data", {}).get("plan_id") == plan_id and str(state.get("data", {}).get("months")) == str(months):
-            discount = state["data"].get("discount", 0.0)
+            discount = _to_dec(state["data"].get("discount", 0))
             message_id = message_id or state["data"].get("message_id")
         # apply referral first-purchase discount once
-        ref_discount = storage.apply_referral_discount(user_id, base_price or 0.0) if not discount else 0.0
-        if ref_discount and ref_discount < (base_price or 0.0):
-            discount = round((base_price or 0.0) - ref_discount, 2)
-        price = round((base_price or 0.0) - discount, 2)
+        ref_discount = storage.apply_referral_discount(user_id, base_price or Decimal("0.00")) if not discount else Decimal("0.00")
+        if ref_discount and ref_discount < (base_price or Decimal("0.00")):
+            discount = _money_round((base_price or Decimal("0.00")) - ref_discount)
+        price = _money_round((base_price or Decimal("0.00")) - discount)
         user = storage.get_user(user_id)
         host = storage.get_host(plan.host_id) if plan and plan.host_id else storage.server()
         host_text = f"Сервер: {host.name}\n" if host and host.name and len(storage.list_hosts()) > 1 else ""
-        price_text = f"<s>{base_price}₽</s> {price}₽ (скидка {discount}₽)" if discount else f"{price}₽"
+        price_text = f"<s>{_money_str(base_price)}₽</s> {_money_str(price)}₽ (скидка {_money_str(discount)}₽)" if discount else f"{_money_str(price)}₽"
         text = (f"<b>{_escape(plan.name)}</b>\n"
                 f"{host_text}"
                 f"Срок: {months} мес.\n"
                 f"Цена: {price_text}\n"
-                f"Ваш баланс: {user['balance']}₽\n\n"
+                f"Ваш баланс: {_money_str(user['balance'])}₽\n\n"
                 f"Подтвердите покупку:")
         kb = K()
         kb.add(B("Купить", callback_data=f"{CB_PREFIX}purchase:{plan_id}:{months}"))
@@ -2850,16 +2918,16 @@ class UserBot:
             self.bot.edit_message_text("Ошибка: тариф не найден.", chat_id, message_id, reply_markup=self._keyboard_main())
             return
         state = self.get_state(user_id)
-        discount = 0.0
+        discount = Decimal("0.00")
         promo_code = None
         if state and state.get("state") == "confirm_purchase" and state.get("data", {}).get("plan_id") == plan_id and str(state.get("data", {}).get("months")) == str(months):
-            discount = state["data"].get("discount", 0.0)
+            discount = _to_dec(state["data"].get("discount", 0))
             promo_code = state["data"].get("promo_code")
         # referral first-purchase discount
-        ref_discount = storage.apply_referral_discount(user_id, base_price) if not discount else 0.0
+        ref_discount = storage.apply_referral_discount(user_id, base_price) if not discount else Decimal("0.00")
         if ref_discount and ref_discount < base_price:
-            discount = round(base_price - ref_discount, 2)
-        price = round(base_price - discount, 2)
+            discount = _money_round(base_price - ref_discount)
+        price = _money_round(base_price - discount)
         user = storage.get_user(user_id)
         if user["balance"] < price:
             self.bot.edit_message_text("Недостаточно средств. Пополните баланс.", chat_id, message_id,
@@ -3087,9 +3155,11 @@ class UserBot:
         rates = storage.config.get("rates", {})
         usd = rates.get("USD") or "н/д"
         ton = rates.get("TON") or "н/д"
+        usd_text = _money_str(usd) if isinstance(usd, Decimal) else str(usd)
+        ton_text = _money_str(ton) if isinstance(ton, Decimal) else str(ton)
         text = (f"<b>Пополнение баланса</b>\n\n"
-                f"Текущий баланс: {user['balance']}₽\n"
-                f"Курс: USD {usd}₽, TON {ton}₽\n"
+                f"Текущий баланс: {_money_str(user['balance'])}₽\n"
+                f"Курс: USD {usd_text}₽, TON {ton_text}₽\n"
                 f"Telegram Stars: 1.3 Stars = 1₽\n\n"
                 f"Выберите способ:")
         kb = K()
@@ -3109,7 +3179,7 @@ class UserBot:
         kb.add(B("Назад", callback_data=back_callback))
         return kb
 
-    def _create_crypto_invoice(self, user_id: int, chat_id: int, message_id: int, asset: str, rub_amount: float) -> None:
+    def _create_crypto_invoice(self, user_id: int, chat_id: int, message_id: int, asset: str, rub_amount: Decimal) -> None:
         token = storage.config.get("crypto_bot_token", "")
         if not token:
             self.bot.edit_message_text("Crypto Bot не настроен. Обратитесь к администратору.", chat_id, message_id,
@@ -3120,7 +3190,8 @@ class UserBot:
             self.bot.edit_message_text(f"Курс для {asset} ещё не загружен.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
-        amount = round(rub_amount / rate, 6)
+        rub_amount = _money_round(rub_amount)
+        amount = _to_dec(rub_amount / rate).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
         if amount <= 0:
             self.bot.edit_message_text("Сумма слишком мала.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
@@ -3135,7 +3206,7 @@ class UserBot:
             kb.add(B("Оплатить", url=pay_url))
             kb.add(B("Проверить оплату", callback_data=f"{CB_PREFIX}check_crypto"))
             kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
-            self.bot.edit_message_text(f"Счёт на {amount} {asset} (~{rub_amount}₽) создан. Оплатите по кнопке ниже.",
+            self.bot.edit_message_text(f"Счёт на {amount} {asset} (~{_money_str(rub_amount)}₽) создан. Оплатите по кнопке ниже.",
                                        chat_id, message_id, reply_markup=kb)
         else:
             error = result.get("error", "Не удалось создать счёт.")
@@ -3158,15 +3229,16 @@ class UserBot:
         self.clear_state(user_id)
         self._create_crypto_invoice(user_id, m.chat.id, message_id, asset, rub_amount)
 
-    def _create_stars_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: float) -> None:
-        stars_amount = int(round(rub_amount * 1.3))
+    def _create_stars_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal) -> None:
+        rub_amount = _money_round(rub_amount)
+        stars_amount = int((rub_amount * Decimal("1.3")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         if stars_amount <= 0:
             self.bot.edit_message_text("Сумма слишком мала.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
             return
-        title = f"Пополнение на {rub_amount}₽"
+        title = f"Пополнение на {_money_str(rub_amount)}₽"
         if StarsPayment.send_invoice(self.bot, chat_id, user_id, stars_amount, title=title, rub_amount=rub_amount):
-            self.bot.edit_message_text(f"Инвойс на {stars_amount} Stars (~{rub_amount}₽) отправлен. Оплатите его в этом чате.",
+            self.bot.edit_message_text(f"Инвойс на {stars_amount} Stars (~{_money_str(rub_amount)}₽) отправлен. Оплатите его в этом чате.",
                                        chat_id, message_id,
                                        reply_markup=K().add(B("Главное меню", callback_data=f"{CB_PREFIX}main")))
         else:
@@ -3209,9 +3281,9 @@ class UserBot:
             return
         base_price = storage.price(plan_id, int(months))
         if promo["discount_type"] == "percent":
-            discount = round(base_price * promo["value"] / 100, 2)
+            discount = _money_round(base_price * _to_dec(promo["value"]) / 100)
         else:
-            discount = round(promo["value"], 2)
+            discount = _money_round(promo["value"])
         discount = min(discount, base_price)
         self.set_state(user_id, "confirm_purchase", {"plan_id": plan_id, "months": months, "discount": discount, "promo_code": code, "message_id": message_id})
         self._confirm_purchase(user_id, m.chat.id, message_id, plan_id, months)
@@ -3251,12 +3323,12 @@ class UserBot:
             self.bot.send_message(m.chat.id, "Введите положительную числовую сумму.")
             return
         user = storage.get_user(user_id)
-        ref_balance = user.get("referral_balance", 0.0)
+        ref_balance = _to_dec(user.get("referral_balance", 0))
         if amount < 3000:
             self.bot.send_message(m.chat.id, "Минимальная сумма вывода 3000₽.")
             return
         if amount > ref_balance:
-            self.bot.send_message(m.chat.id, f"Недостаточно реферальных средств. Доступно: {ref_balance}₽.")
+            self.bot.send_message(m.chat.id, f"Недостаточно реферальных средств. Доступно: {_money_str(ref_balance)}₽.")
             return
         self.set_state(user_id, "withdraw_card", {"amount": amount, "message_id": state["data"].get("message_id")})
         self.bot.send_message(m.chat.id, "Введите номер карты/реквизиты для вывода:",
@@ -3276,7 +3348,7 @@ class UserBot:
             return
         req_id = storage.create_withdrawal_request(user_id, amount, card)
         self.clear_state(user_id)
-        self.bot.send_message(m.chat.id, f"Заявка #{req_id} на вывод {amount}₽ создана. Ожидайте подтверждения администратора.",
+        self.bot.send_message(m.chat.id, f"Заявка #{req_id} на вывод {_money_str(amount)}₽ создана. Ожидайте подтверждения администратора.",
                               reply_markup=self._keyboard_main())
 
     def _on_freeze_days(self, m: Message) -> None:
@@ -3324,14 +3396,14 @@ class UserBot:
             try:
                 _, uid_str, rub_str = payload.split("_")
                 uid = int(uid_str)
-                rub_amount = int(rub_str)
-            except (ValueError, TypeError):
+                rub_amount = _to_dec(rub_str)
+            except (ValueError, TypeError, InvalidOperation):
                 return
             stars_amount = getattr(m.successful_payment, "total_amount", 0)
             payment_id = getattr(m.successful_payment, "telegram_payment_charge_id", payload) or payload
             credited = storage.add_balance(uid, rub_amount, "Telegram Stars", "stars", payment_id)
             if credited:
-                self.bot.send_message(m.chat.id, f"Баланс пополнен на {rub_amount}₽ ({stars_amount} Stars) через Telegram Stars.",
+                self.bot.send_message(m.chat.id, f"Баланс пополнен на {_money_str(rub_amount)}₽ ({stars_amount} Stars) через Telegram Stars.",
                                       reply_markup=self._keyboard_main())
             else:
                 self.bot.send_message(m.chat.id, "Этот платёж уже был обработан ранее.",
@@ -3343,7 +3415,7 @@ class UserBot:
         lines = [
             f"<b>Профиль</b>",
             f"ID: <code>{user_id}</code>",
-            f"Баланс: {user.get('balance', 0)}₽",
+            f"Баланс: {_money_str(user.get('balance', 0))}₽",
         ]
         if subs:
             sub = subs[0]
@@ -3354,14 +3426,14 @@ class UserBot:
             lines.append("Активных подписок нет.")
         if user.get("trial_used"):
             lines.append("Пробный период использован.")
-        total_spent = user.get("total_spent", 0.0)
+        total_spent = _to_dec(user.get("total_spent", 0))
         total_months = user.get("total_months", 0)
         if total_spent or total_months:
-            lines.append(f"Всего потрачено: {total_spent}₽ (куплено {total_months} мес.)")
-        earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": 0.0, "level2": 0.0})
-        total_earn = earnings.get("level1", 0.0) + earnings.get("level2", 0.0)
+            lines.append(f"Всего потрачено: {_money_str(total_spent)}₽ (куплено {total_months} мес.)")
+        earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
+        total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
         if total_earn:
-            lines.append(f"Заработано с рефералов: {total_earn}₽")
+            lines.append(f"Заработано с рефералов: {_money_str(total_earn)}₽")
         kb = K()
         kb.add(B("История операций", callback_data=f"{CB_PREFIX}history"))
         kb.add(B("Настройки", callback_data=f"{CB_PREFIX}settings"))
@@ -3442,16 +3514,17 @@ class UserBot:
         link = f"https://t.me/{bot_username}?start=ref_{user_id}" if bot_username else f"Код: ref_{user_id}"
         level1 = [u for u in storage.users.values() if u.get("referred_by") == user_id]
         level2 = [u for u in storage.users.values() if u.get("referred_by") in {x["user_id"] for x in level1}]
-        earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": 0.0, "level2": 0.0})
-        ref_balance = user.get("referral_balance", 0.0)
+        earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
+        ref_balance = _to_dec(user.get("referral_balance", 0))
+        total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
         text = (f"<b>Реферальная система</b>\n\n"
                 f"Ваша ссылка: {link}\n\n"
                 f"Рефералы 1 уровня: {len(level1)}\n"
                 f"Рефералы 2 уровня: {len(level2)}\n"
-                f"Заработано: {earnings.get('level1', 0) + earnings.get('level2', 0)}₽\n"
-                f"  1 уровень (10%): {earnings.get('level1', 0)}₽\n"
-                f"  2 уровень (5%): {earnings.get('level2', 0)}₽\n\n"
-                f"Реферальный баланс: {ref_balance}₽\n"
+                f"Заработано: {_money_str(total_earn)}₽\n"
+                f"  1 уровень (10%): {_money_str(earnings.get('level1', 0))}₽\n"
+                f"  2 уровень (5%): {_money_str(earnings.get('level2', 0))}₽\n\n"
+                f"Реферальный баланс: {_money_str(ref_balance)}₽\n"
                 f"Минимум для вывода: 3000₽")
         kb = K()
         kb.add(B("Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
@@ -3708,15 +3781,15 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not state:
             return
         try:
-            price = float(m.text.strip().replace(",", "."))
+            price = _to_dec(m.text.strip().replace(",", "."))
             plan_id = state["data"].get("plan_id")
             months = state["data"].get("months")
             plan = storage.plan(plan_id)
-            prices = plan.prices if plan else {}
+            prices = {k: _to_dec(v) for k, v in (plan.prices.items() if plan else {})}
             prices[str(months)] = price
             storage.update_plan(plan_id, prices=prices)
             bot.send_message(m.chat.id, f"Цена для {months} мес. тарифа {plan_id} обновлена.")
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Введите число.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
@@ -3772,12 +3845,12 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             bot.send_message(m.chat.id, f"Нужно {len(DURATIONS)} цены через пробел.")
             return
         try:
-            prices = {str(DURATIONS[i]): float(parts[i].replace(",", ".")) for i in range(len(DURATIONS))}
+            prices = {str(DURATIONS[i]): _to_dec(parts[i].replace(",", ".")) for i in range(len(DURATIONS))}
             data = state["data"]
             storage.add_plan(data["plan_id"], data["name"], data["max_devices"], prices)
             storage.update_plan(data["plan_id"], host_id=data.get("host_id", storage.default_host_id()))
             bot.send_message(m.chat.id, f"Тариф {data['name']} добавлен.")
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Введите числовые цены.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
@@ -3807,9 +3880,9 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if d_type in ("фикс",):
             d_type = "fixed"
         try:
-            value = float(parts[2].replace(",", "."))
+            value = _to_dec(parts[2].replace(",", "."))
             max_uses = int(parts[3])
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Значение и max_uses должны быть числами.")
             return
         plan_id = parts[4] if len(parts) >= 5 else None
@@ -3863,15 +3936,15 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not state:
             return
         try:
-            amount = float(m.text.strip().replace(",", "."))
+            amount = _to_dec(m.text.strip().replace(",", "."))
             uid = state["data"]["uid"]
             if amount > 0:
                 storage.add_balance(uid, amount, "manual", "admin")
             else:
                 storage.deduct_balance(uid, -amount, "manual", "admin")
             user = storage.get_user(uid)
-            bot.send_message(m.chat.id, f"Баланс пользователя {uid}: {user['balance']}₽")
-        except ValueError:
+            bot.send_message(m.chat.id, f"Баланс пользователя {uid}: {_money_str(user['balance'])}₽")
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Введите число.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
@@ -3935,7 +4008,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not state:
             return
         try:
-            amount = float(m.text.strip().replace(",", "."))
+            amount = _to_dec(m.text.strip().replace(",", "."))
             sub_id = state["data"]["sub_id"]
             sub = storage.get_subscription(sub_id)
             if not sub:
@@ -3943,19 +4016,18 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
                 return
             if amount <= 0:
                 # auto-calc remaining value
-                plan = storage.plan(sub.plan_id)
-                total = storage.price(sub.plan_id, sub.months) or 0
+                total = storage.price(sub.plan_id, sub.months) or Decimal("0.00")
                 total_days = sub.months * 30 if sub.months else 3
                 remaining_days = max(0, (sub.effective_expires_at - time.time()) / 86400)
-                amount = round(total * remaining_days / total_days, 2)
+                amount = _money_round(_to_dec(total) * _to_dec(remaining_days) / _to_dec(total_days))
             storage.refund_subscription(sub, amount)
-            bot.send_message(m.chat.id, f"Возвращено {amount}₽ пользователю {sub.user_id} за подписку #{sub.sub_id}.")
+            bot.send_message(m.chat.id, f"Возвращено {_money_str(amount)}₽ пользователю {sub.user_id} за подписку #{sub.sub_id}.")
             if _user_bot_instance:
                 try:
-                    _user_bot_instance.bot.send_message(sub.user_id, f"По подписке #{sub.sub_id} возвращено {amount}₽.")
+                    _user_bot_instance.bot.send_message(sub.user_id, f"По подписке #{sub.sub_id} возвращено {_money_str(amount)}₽.")
                 except Exception:
                     pass
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Введите число.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
@@ -4014,10 +4086,10 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
 
     def state_admin_bulk_balance(m: Message):
         try:
-            amount = float(m.text.strip().replace(",", "."))
+            amount = _to_dec(m.text.strip().replace(",", "."))
             count = storage.bulk_add_balance(amount)
-            bot.send_message(m.chat.id, f"{count} пользователям начислено {amount}₽.")
-        except ValueError:
+            bot.send_message(m.chat.id, f"{count} пользователям начислено {_money_str(amount)}₽.")
+        except (ValueError, InvalidOperation):
             bot.send_message(m.chat.id, "Введите число.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
@@ -4273,15 +4345,16 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
         return "Пользователь не найден.", K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
     level1, level2 = storage.get_user_referrals(target_uid)
     subs = storage.get_user_subscriptions(target_uid)
-    earnings = storage.referrals.get("earnings", {}).get(str(target_uid), {"level1": 0.0, "level2": 0.0})
+    earnings = storage.referrals.get("earnings", {}).get(str(target_uid), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
+    total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
     lines = [
         f"<b>Пользователь {target_uid}</b>",
         f"@{_escape(user.get('username') or '—')}",
         f"Источник: {_escape(user.get('source', 'direct'))}",
-        f"Баланс: {user.get('balance', 0)}₽",
-        f"Реферальный баланс: {user.get('referral_balance', 0)}₽",
-        f"Рефералы: {len(level1)} / {len(level2)} — заработок {earnings.get('level1', 0) + earnings.get('level2', 0)}₽",
-        f"Всего потрачено: {user.get('total_spent', 0)}₽ (месяцев: {user.get('total_months', 0)})",
+        f"Баланс: {_money_str(user.get('balance', 0))}₽",
+        f"Реферальный баланс: {_money_str(user.get('referral_balance', 0))}₽",
+        f"Рефералы: {len(level1)} / {len(level2)} — заработок {_money_str(total_earn)}₽",
+        f"Всего потрачено: {_money_str(user.get('total_spent', 0))}₽ (месяцев: {user.get('total_months', 0)})",
         f"Бан: {'да' if user.get('is_banned') else 'нет'}",
         f"Подписок: {len(subs)}",
     ]
@@ -4619,7 +4692,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             else:
                 lines = [f"Всего: {len(users)}"]
                 for u in users[:20]:
-                    lines.append(f"{u['user_id']} — @{u['username'] or '?'} — баланс {u['balance']}₽")
+                    lines.append(f"{u['user_id']} — @{u['username'] or '?'} — баланс {_money_str(u['balance'])}₽")
                 text = "\n".join(lines)
             kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
@@ -4664,12 +4737,12 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             for r in reqs:
                 u = storage.get_user(r["user_id"])
                 uname = _escape(u.get("username") or "?")
-                lines.append(f"#{r['id']} — user {r['user_id']} (@{uname}) — {r['amount']}₽ — {_escape(r.get('card',''))}")
+                lines.append(f"#{r['id']} — user {r['user_id']} (@{uname}) — {_money_str(r['amount'])}₽ — {_escape(r.get('card',''))}")
             if len(lines) == 1:
                 lines.append("Нет заявок.")
             kb = K()
             for r in reqs:
-                kb.add(B(f"#{r['id']} {r['amount']}₽", callback_data=f"{CB_PREFIX}admin_withdraw:{r['id']}"))
+                kb.add(B(f"#{r['id']} {_money_str(r['amount'])}₽", callback_data=f"{CB_PREFIX}admin_withdraw:{r['id']}"))
             kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text("\n".join(lines), chat_id, c.message.message_id, reply_markup=kb)
             return
@@ -4890,7 +4963,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             return
         text = (f"<b>Заявка на вывод #{req_id}</b>\n\n"
                 f"Пользователь: {req['user_id']}\n"
-                f"Сумма: {req['amount']}₽\n"
+                f"Сумма: {_money_str(req['amount'])}₽\n"
                 f"Карта/реквизиты: {_escape(req.get('card',''))}")
         kb = K()
         kb.add(B("Подтвердить", callback_data=f"{CB_PREFIX}admin_withdraw_approve:{req_id}"))
@@ -4906,18 +4979,19 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             bot.send_message(chat_id, "Заявка не найдена или уже обработана.")
             return
         u = storage.get_user(req["user_id"])
-        if u.get("referral_balance", 0.0) < req["amount"]:
+        req_amount = _to_dec(req["amount"])
+        if _to_dec(u.get("referral_balance", 0)) < req_amount:
             bot.send_message(chat_id, "У пользователя недостаточно реферальных средств.")
             return
-        u["referral_balance"] = round(u["referral_balance"] - req["amount"], 2)
+        u["referral_balance"] = _money_round(_to_dec(u["referral_balance"]) - req_amount)
         storage.update_user(u)
-        storage._add_transaction(req["user_id"], -req["amount"], "withdrawal", "card", f"req:{req_id}")
+        storage._add_transaction(req["user_id"], -req_amount, "withdrawal", "card", f"req:{req_id}")
         storage.update_withdrawal_request(req_id, "approved")
-        bot.edit_message_text(f"Заявка #{req_id} на {req['amount']}₽ подтверждена.", chat_id, c.message.message_id,
+        bot.edit_message_text(f"Заявка #{req_id} на {_money_str(req_amount)}₽ подтверждена.", chat_id, c.message.message_id,
                               reply_markup=_admin_main_keyboard())
         if _user_bot_instance:
             try:
-                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {req['amount']}₽ подтверждена. Средства отправлены на {_escape(req.get('card',''))}.")
+                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {_money_str(req_amount)}₽ подтверждена. Средства отправлены на {_escape(req.get('card',''))}.")
             except Exception:
                 pass
         return
@@ -4932,7 +5006,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         bot.edit_message_text(f"Заявка #{req_id} отклонена.", chat_id, c.message.message_id, reply_markup=_admin_main_keyboard())
         if _user_bot_instance:
             try:
-                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {req['amount']}₽ отклонена.")
+                _user_bot_instance.bot.send_message(req["user_id"], f"Заявка #{req_id} на вывод {_money_str(req['amount'])}₽ отклонена.")
             except Exception:
                 pass
         return
@@ -5114,7 +5188,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         total_users = len(storage.users)
         total_subs = len(storage.subscriptions.get("subs", {}))
         active_subs = len(storage.active_subscriptions_all())
-        total_spent = sum(u.get("total_spent", 0.0) for u in storage.users.values())
+        total_spent = sum(_to_dec(u.get("total_spent", 0)) for u in storage.users.values())
         total_months = sum(u.get("total_months", 0) for u in storage.users.values())
         hosts = len(storage.list_hosts())
         text = (f"<b>Статистика</b>\n\n"
@@ -5124,11 +5198,11 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                 f"Всего потрачено: {total_spent:.2f}₽\n"
                 f"Всего куплено месяцев: {total_months}\n"
                 f"Серверов: {hosts}")
-        top = sorted(storage.users.values(), key=lambda u: u.get("total_spent", 0.0), reverse=True)[:5]
+        top = sorted(storage.users.values(), key=lambda u: _to_dec(u.get("total_spent", 0)), reverse=True)[:5]
         if top:
             text += "\n\n<b>Топ по тратам:</b>"
             for u in top:
-                text += f"\n{u['user_id']} — {u.get('total_spent', 0):.2f}₽"
+                text += f"\n{u['user_id']} — {_to_dec(u.get('total_spent', 0)):.2f}₽"
         bot.edit_message_text(text, chat_id, c.message.message_id,
                               reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main")))
         return
@@ -5177,6 +5251,9 @@ def cleanup(cardinal: Cardinal, *args) -> None:
     storage.save_referrals()
     if _user_bot_instance:
         _user_bot_instance.stop()
+
+
+storage = VPNStorage()
 
 
 BIND_TO_PRE_INIT = [init_plugin]
