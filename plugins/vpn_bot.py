@@ -200,14 +200,18 @@ class VPNStorage:
     def __init__(self) -> None:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self._db_conn.execute("PRAGMA journal_mode=WAL")
+        self._db_conn.execute("PRAGMA synchronous=NORMAL")
         self._init_db()
         self._migrate_json_to_sqlite()
+        self._migrate_kv_to_tables()
         self.config: dict[str, Any] = self._load_db("config", self._default_config)
         self._ensure_config_defaults(self.config, self._default_config())
         self._migrate_config()
-        self.users: dict[str, Any] = self._load_db("users", self._default_users)
-        self.subscriptions: dict[str, Any] = self._load_db("subscriptions", self._default_subscriptions)
-        self.transactions: dict[str, Any] = self._load_db("transactions", self._default_transactions)
+        self.users: dict[str, Any] = self._load_users()
+        self.subscriptions: dict[str, Any] = {"subs": self._load_subscriptions(), "next_id": self._load_seq("subscriptions")}
+        self.transactions: dict[str, Any] = {"txs": self._load_transactions(), "next_id": self._load_seq("transactions")}
         self.referrals: dict[str, Any] = self._load_db("referrals", self._default_referrals)
         self.connections: dict[str, Any] = self._load_db("connections", self._default_connections)
         self._decimalize_loaded()
@@ -327,16 +331,291 @@ class VPNStorage:
         return {"paid_invoices": [], "earnings": {}, "crypto_invoices": {}}
 
     def _init_db(self) -> None:
-        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kv (
-                    name TEXT PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                )
-            """)
-            conn.commit()
+        schema = """
+            CREATE TABLE IF NOT EXISTS kv (
+                name TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                source TEXT,
+                settings TEXT,
+                balance TEXT,
+                referral_balance TEXT,
+                referral_code TEXT,
+                referred_by INTEGER,
+                trial_used INTEGER DEFAULT 0,
+                joined_at REAL,
+                channel_ok INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
+                total_spent TEXT,
+                total_months INTEGER DEFAULT 0,
+                first_purchase_discount_used INTEGER DEFAULT 0,
+                updated_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_source ON users(source);
+            CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
+            CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned);
+
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                sub_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                plan_id TEXT,
+                months INTEGER,
+                client_uuid TEXT,
+                created_at REAL,
+                expires_at REAL,
+                devices TEXT,
+                active INTEGER,
+                warnings TEXT,
+                email TEXT,
+                xray_sub_id TEXT,
+                xray_synced INTEGER,
+                host_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_active_expires ON subscriptions(active, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_plan_id ON subscriptions(plan_id);
+
+            CREATE TABLE IF NOT EXISTS transactions (
+                tx_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                amount TEXT,
+                type TEXT,
+                method TEXT,
+                payload TEXT,
+                created_at REAL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_unique_deposit
+                ON transactions(user_id, method, payload) WHERE type='deposit' AND payload <> '';
+            CREATE INDEX IF NOT EXISTS idx_transactions_user_id_created ON transactions(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);
+
+            CREATE TABLE IF NOT EXISTS sequences (
+                name TEXT PRIMARY KEY,
+                value INTEGER
+            );
+        """
+        with self._lock:
+            self._db_conn.executescript(schema)
+            self._db_conn.commit()
+
+    def _user_to_row(self, user: dict[str, Any]) -> tuple:
+        return (
+            int(user["user_id"]),
+            str(user.get("username", "")),
+            str(user.get("source", "direct")),
+            json.dumps(user.get("settings", {}), ensure_ascii=False, default=_json_default),
+            str(_money_round(user.get("balance", 0))),
+            str(_money_round(user.get("referral_balance", 0))),
+            str(user.get("referral_code", "")),
+            user.get("referred_by"),
+            1 if user.get("trial_used") else 0,
+            float(user.get("joined_at", 0)),
+            1 if user.get("channel_ok") else 0,
+            1 if user.get("is_banned") else 0,
+            str(_money_round(user.get("total_spent", 0))),
+            int(user.get("total_months", 0)),
+            1 if user.get("first_purchase_discount_used") else 0,
+            time.time(),
+        )
+
+    def _user_from_row(self, row: tuple) -> dict[str, Any]:
+        settings = json.loads(row[3]) if row[3] else {}
+        return {
+            "user_id": int(row[0]),
+            "username": row[1] or "",
+            "source": row[2] or "direct",
+            "settings": settings if isinstance(settings, dict) else {},
+            "balance": _to_dec(row[4]),
+            "referral_balance": _to_dec(row[5]),
+            "referral_code": row[6] or "",
+            "referred_by": row[7],
+            "trial_used": bool(row[8]),
+            "joined_at": float(row[9] or 0),
+            "channel_ok": bool(row[10]),
+            "is_banned": bool(row[11]),
+            "total_spent": _to_dec(row[12]),
+            "total_months": int(row[13] or 0),
+            "first_purchase_discount_used": bool(row[14]),
+        }
+
+    def _sub_to_row(self, s: dict[str, Any]) -> tuple:
+        return (
+            str(s["sub_id"]),
+            int(s["user_id"]),
+            str(s.get("plan_id", "")),
+            int(s.get("months", 0)),
+            str(s.get("client_uuid", "")),
+            float(s.get("created_at", 0)),
+            float(s.get("expires_at", 0)),
+            json.dumps(s.get("devices", []), ensure_ascii=False, default=_json_default),
+            1 if s.get("active") else 0,
+            json.dumps(s.get("warnings", {}), ensure_ascii=False, default=_json_default),
+            str(s.get("email", "")),
+            str(s.get("xray_sub_id", "")),
+            1 if s.get("xray_synced") else 0,
+            str(s.get("host_id", "main")),
+        )
+
+    def _sub_from_row(self, row: tuple) -> dict[str, Any]:
+        data = {
+            "sub_id": str(row[0]),
+            "user_id": int(row[1]),
+            "plan_id": row[2] or "",
+            "months": int(row[3] or 0),
+            "client_uuid": row[4] or "",
+            "created_at": float(row[5] or 0),
+            "expires_at": float(row[6] or 0),
+            "devices": json.loads(row[7]) if row[7] else [],
+            "active": bool(row[8]),
+            "warnings": json.loads(row[9]) if row[9] else {},
+            "email": row[10] or "",
+            "xray_sub_id": row[11] or "",
+            "xray_synced": bool(row[12]),
+            "host_id": row[13] or "main",
+        }
+        return asdict(self._sub_from_dict(data))
+
+    def _tx_to_row(self, tx: dict[str, Any]) -> tuple:
+        return (
+            str(tx["id"]),
+            int(tx["user_id"]),
+            str(_money_round(tx.get("amount", 0))),
+            str(tx.get("type", "")),
+            str(tx.get("method", "")),
+            str(tx.get("payload", "")),
+            float(tx.get("created_at", 0)),
+        )
+
+    def _tx_from_row(self, row: tuple) -> dict[str, Any]:
+        return {
+            "id": str(row[0]),
+            "user_id": int(row[1]),
+            "amount": _to_dec(row[2]),
+            "type": row[3] or "",
+            "method": row[4] or "",
+            "payload": row[5] or "",
+            "created_at": float(row[6] or 0),
+        }
+
+    def _load_users(self) -> dict[str, Any]:
+        with self._lock:
+            cur = self._db_conn.execute(
+                "SELECT user_id, username, source, settings, balance, referral_balance, referral_code, referred_by, trial_used, joined_at, channel_ok, is_banned, total_spent, total_months, first_purchase_discount_used FROM users"
+            )
+            out = {}
+            for row in cur:
+                u = self._user_from_row(row)
+                out[str(u["user_id"])] = u
+        return out
+
+    def _load_subscriptions(self) -> dict[str, Any]:
+        with self._lock:
+            cur = self._db_conn.execute(
+                "SELECT sub_id, user_id, plan_id, months, client_uuid, created_at, expires_at, devices, active, warnings, email, xray_sub_id, xray_synced, host_id FROM subscriptions"
+            )
+            out = {}
+            for row in cur:
+                sub = self._sub_from_row(row)
+                out[sub["sub_id"]] = sub
+        return out
+
+    def _load_transactions(self) -> dict[str, Any]:
+        with self._lock:
+            cur = self._db_conn.execute(
+                "SELECT tx_id, user_id, amount, type, method, payload, created_at FROM transactions"
+            )
+            out = {}
+            for row in cur:
+                tx = self._tx_from_row(row)
+                out[tx["id"]] = tx
+        return out
+
+    def _load_seq(self, name: str) -> int:
+        with self._lock:
+            row = self._db_conn.execute("SELECT value FROM sequences WHERE name=?", (name,)).fetchone()
+            if row:
+                return int(row[0])
+            table = "subscriptions" if name == "subscriptions" else "transactions"
+            col = "sub_id" if name == "subscriptions" else "tx_id"
+            row = self._db_conn.execute(f"SELECT MAX(CAST({col} AS INTEGER)) FROM {table}").fetchone()
+            return (int(row[0]) if row and row[0] else 0) + 1
+
+    def _save_seq(self, name: str, value: int) -> None:
+        self._db_conn.execute("INSERT OR REPLACE INTO sequences (name, value) VALUES (?, ?)", (name, int(value)))
+
+    def _save_user(self, user: dict[str, Any]) -> None:
+        self._db_conn.execute(
+            "INSERT OR REPLACE INTO users (user_id, username, source, settings, balance, referral_balance, referral_code, referred_by, trial_used, joined_at, channel_ok, is_banned, total_spent, total_months, first_purchase_discount_used, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._user_to_row(user),
+        )
+
+    def _save_subscription(self, sub: dict[str, Any]) -> None:
+        self._db_conn.execute(
+            "INSERT OR REPLACE INTO subscriptions (sub_id, user_id, plan_id, months, client_uuid, created_at, expires_at, devices, active, warnings, email, xray_sub_id, xray_synced, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self._sub_to_row(sub),
+        )
+
+    def _save_transaction(self, tx: dict[str, Any]) -> None:
+        self._db_conn.execute(
+            "INSERT OR REPLACE INTO transactions (tx_id, user_id, amount, type, method, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self._tx_to_row(tx),
+        )
+
+    def _migrate_kv_to_tables(self) -> None:
+        """Переносит старые JSON-blob'ы из kv в нормализованные таблицы."""
+        with self._lock:
+            # users
+            if not self._db_conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+                row = self._db_conn.execute("SELECT data FROM kv WHERE name='users'").fetchone()
+                if row:
+                    data = json.loads(row[0])
+                    for u in data.values():
+                        self._db_conn.execute(
+                            "INSERT OR IGNORE INTO users (user_id, username, source, settings, balance, referral_balance, referral_code, referred_by, trial_used, joined_at, channel_ok, is_banned, total_spent, total_months, first_purchase_discount_used, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            self._user_to_row(u),
+                        )
+                    self._db_conn.execute("DELETE FROM kv WHERE name='users'")
+            else:
+                self._db_conn.execute("DELETE FROM kv WHERE name='users'")
+
+            # subscriptions
+            if not self._db_conn.execute("SELECT 1 FROM subscriptions LIMIT 1").fetchone():
+                row = self._db_conn.execute("SELECT data FROM kv WHERE name='subscriptions'").fetchone()
+                if row:
+                    data = json.loads(row[0])
+                    next_id = data.get("next_id", 1)
+                    for s in data.get("subs", {}).values():
+                        self._db_conn.execute(
+                            "INSERT OR IGNORE INTO subscriptions (sub_id, user_id, plan_id, months, client_uuid, created_at, expires_at, devices, active, warnings, email, xray_sub_id, xray_synced, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            self._sub_to_row(s),
+                        )
+                    self._db_conn.execute("INSERT OR REPLACE INTO sequences (name, value) VALUES ('subscriptions', ?)", (next_id,))
+                    self._db_conn.execute("DELETE FROM kv WHERE name='subscriptions'")
+            else:
+                self._db_conn.execute("DELETE FROM kv WHERE name='subscriptions'")
+
+            # transactions
+            if not self._db_conn.execute("SELECT 1 FROM transactions LIMIT 1").fetchone():
+                row = self._db_conn.execute("SELECT data FROM kv WHERE name='transactions'").fetchone()
+                if row:
+                    data = json.loads(row[0])
+                    next_id = data.get("next_id", 1)
+                    for t in data.get("txs", {}).values():
+                        self._db_conn.execute(
+                            "INSERT OR IGNORE INTO transactions (tx_id, user_id, amount, type, method, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            self._tx_to_row(t),
+                        )
+                    self._db_conn.execute("INSERT OR REPLACE INTO sequences (name, value) VALUES ('transactions', ?)", (next_id,))
+                    self._db_conn.execute("DELETE FROM kv WHERE name='transactions'")
+            else:
+                self._db_conn.execute("DELETE FROM kv WHERE name='transactions'")
+
+            self._db_conn.commit()
 
     def _load_db(self, name: str, default_factory) -> dict[str, Any]:
         try:
@@ -390,15 +669,50 @@ class VPNStorage:
 
     def save_users(self) -> None:
         with self._lock:
-            self._save_db("users", self.users)
+            uids = set(self.users.keys())
+            if uids:
+                placeholders = ",".join("?" * len(uids))
+                self._db_conn.execute(f"DELETE FROM users WHERE user_id NOT IN ({placeholders})", tuple(int(u) for u in uids))
+            else:
+                self._db_conn.execute("DELETE FROM users")
+            for user in self.users.values():
+                self._db_conn.execute(
+                    "INSERT OR REPLACE INTO users (user_id, username, source, settings, balance, referral_balance, referral_code, referred_by, trial_used, joined_at, channel_ok, is_banned, total_spent, total_months, first_purchase_discount_used, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    self._user_to_row(user),
+                )
+            self._db_conn.commit()
 
     def save_subscriptions(self) -> None:
         with self._lock:
-            self._save_db("subscriptions", self.subscriptions)
+            sids = set(self.subscriptions.get("subs", {}).keys())
+            if sids:
+                placeholders = ",".join("?" * len(sids))
+                self._db_conn.execute(f"DELETE FROM subscriptions WHERE sub_id NOT IN ({placeholders})", tuple(sids))
+            else:
+                self._db_conn.execute("DELETE FROM subscriptions")
+            for sub in self.subscriptions.get("subs", {}).values():
+                self._db_conn.execute(
+                    "INSERT OR REPLACE INTO subscriptions (sub_id, user_id, plan_id, months, client_uuid, created_at, expires_at, devices, active, warnings, email, xray_sub_id, xray_synced, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    self._sub_to_row(sub),
+                )
+            self._save_seq("subscriptions", self.subscriptions.get("next_id", 1))
+            self._db_conn.commit()
 
     def save_transactions(self) -> None:
         with self._lock:
-            self._save_db("transactions", self.transactions)
+            txids = set(self.transactions.get("txs", {}).keys())
+            if txids:
+                placeholders = ",".join("?" * len(txids))
+                self._db_conn.execute(f"DELETE FROM transactions WHERE tx_id NOT IN ({placeholders})", tuple(txids))
+            else:
+                self._db_conn.execute("DELETE FROM transactions")
+            for tx in self.transactions.get("txs", {}).values():
+                self._db_conn.execute(
+                    "INSERT OR REPLACE INTO transactions (tx_id, user_id, amount, type, method, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    self._tx_to_row(tx),
+                )
+            self._save_seq("transactions", self.transactions.get("next_id", 1))
+            self._db_conn.commit()
 
     def save_connections(self) -> None:
         with self._lock:
@@ -630,30 +944,34 @@ class VPNStorage:
 
     def get_user(self, user_id: int, username: str = "", source: str = "direct") -> dict[str, Any]:
         key = str(user_id)
-        if key not in self.users:
-            self.users[key] = {
-                "user_id": user_id,
-                "username": username or "",
-                "source": source,
-                "settings": {"lang": "ru", "notifications": True, "auto_renew": True},
-                "balance": Decimal("0.00"),
-                "referral_balance": Decimal("0.00"),
-                "referral_code": f"ref_{user_id}",
-                "referred_by": None,
-                "trial_used": False,
-                "joined_at": time.time(),
-                "channel_ok": False,
-                "is_banned": False,
-                "total_spent": Decimal("0.00"),
-                "total_months": 0,
-                "first_purchase_discount_used": False,
-            }
-            self.save_users()
+        with self._lock:
+            if key not in self.users:
+                self.users[key] = {
+                    "user_id": user_id,
+                    "username": username or "",
+                    "source": source,
+                    "settings": {"lang": "ru", "notifications": True, "auto_renew": True},
+                    "balance": Decimal("0.00"),
+                    "referral_balance": Decimal("0.00"),
+                    "referral_code": f"ref_{user_id}",
+                    "referred_by": None,
+                    "trial_used": False,
+                    "joined_at": time.time(),
+                    "channel_ok": False,
+                    "is_banned": False,
+                    "total_spent": Decimal("0.00"),
+                    "total_months": 0,
+                    "first_purchase_discount_used": False,
+                }
+                self._save_user(self.users[key])
+                self._db_conn.commit()
         return self.users[key]
 
     def update_user(self, user: dict[str, Any]) -> None:
-        self.users[str(user["user_id"])] = user
-        self.save_users()
+        with self._lock:
+            self.users[str(user["user_id"])] = user
+            self._save_user(user)
+            self._db_conn.commit()
 
     def ban_user(self, user_id: int) -> None:
         user = self.get_user(user_id)
@@ -691,10 +1009,12 @@ class VPNStorage:
     def _is_tx_duplicate(self, user_id: int, method: str, payload: str) -> bool:
         if not payload:
             return False
-        for tx in self.transactions.get("txs", {}).values():
-            if tx.get("user_id") == user_id and tx.get("method") == method and str(tx.get("payload")) == str(payload):
-                return True
-        return False
+        with self._lock:
+            cur = self._db_conn.execute(
+                "SELECT 1 FROM transactions WHERE user_id=? AND method=? AND payload=? AND type='deposit' AND payload <> '' LIMIT 1",
+                (int(user_id), method, str(payload)),
+            )
+            return cur.fetchone() is not None
 
     def add_balance(self, user_id: int, amount: Decimal, source: str, method: str, payload: str = "", notify: bool = True) -> bool:
         with self._lock:
@@ -703,7 +1023,7 @@ class VPNStorage:
             user = self.get_user(user_id)
             amount = _money_round(amount)
             user["balance"] = _money_round(user["balance"] + amount)
-            self.update_user(user)
+            self._save_user(user)
             self._add_transaction(user_id, amount, "deposit", method, payload)
         if notify and amount > 0:
             self._notify_admins(f"Новый платёж: user {user_id} пополнил баланс на {_money_str(amount)}₽ ({method}).", "new_payment")
@@ -716,7 +1036,7 @@ class VPNStorage:
             if user["balance"] < amount:
                 return False
             user["balance"] = _money_round(user["balance"] - amount)
-            self.update_user(user)
+            self._save_user(user)
             self._add_transaction(user_id, -amount, "purchase", method, payload)
         return True
 
@@ -750,16 +1070,19 @@ class VPNStorage:
         with self._lock:
             tid = str(self.transactions["next_id"])
             self.transactions["next_id"] += 1
-            self.transactions["txs"][tid] = {
+            tx = {
                 "id": tid,
-                "user_id": user_id,
+                "user_id": int(user_id),
                 "amount": _money_round(amount),
                 "type": tx_type,
                 "method": method,
-                "payload": payload,
+                "payload": payload or "",
                 "created_at": time.time(),
             }
-            self.save_transactions()
+            self.transactions["txs"][tid] = tx
+            self._save_transaction(tx)
+            self._save_seq("transactions", self.transactions["next_id"])
+            self._db_conn.commit()
 
     def _sub_from_dict(self, data: dict[str, Any]) -> Subscription:
         fields = {f for f in Subscription.__dataclass_fields__}
@@ -801,39 +1124,45 @@ class VPNStorage:
         with self._lock:
             sid = str(self.subscriptions["next_id"])
             self.subscriptions["next_id"] += 1
-        now = time.time()
-        if is_trial:
-            days = int(self.config.get("trial_days", TRIAL_DAYS))
-            expires = now + days * 86400
-            months = 0
-        else:
-            expires = now + months * 30 * 86400
-        if not host_id:
-            plan = self.plan(plan_id)
-            host_id = plan.host_id if plan else self.default_host_id()
-        email = f"vpn_{host_id}_{user_id}_{sid}"
-        xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
-        sub = Subscription(
-            sub_id=sid,
-            user_id=user_id,
-            plan_id=plan_id,
-            months=months,
-            client_uuid=str(uuid4()),
-            created_at=now,
-            expires_at=expires,
-            devices=[],
-            active=True,
-            email=email,
-            xray_sub_id=xray_sub_id,
-            host_id=host_id,
-        )
-        self.subscriptions["subs"][sid] = asdict(sub)
-        self.save_subscriptions()
+            now = time.time()
+            if is_trial:
+                days = int(self.config.get("trial_days", TRIAL_DAYS))
+                expires = now + days * 86400
+                months = 0
+            else:
+                expires = now + months * 30 * 86400
+            if not host_id:
+                plan = self.plan(plan_id)
+                host_id = plan.host_id if plan else self.default_host_id()
+            email = f"vpn_{host_id}_{user_id}_{sid}"
+            xray_sub_id = str(uuid5(NAMESPACE_DNS, email))
+            sub = Subscription(
+                sub_id=sid,
+                user_id=user_id,
+                plan_id=plan_id,
+                months=months,
+                client_uuid=str(uuid4()),
+                created_at=now,
+                expires_at=expires,
+                devices=[],
+                active=True,
+                email=email,
+                xray_sub_id=xray_sub_id,
+                host_id=host_id,
+            )
+            data = asdict(sub)
+            self.subscriptions["subs"][sid] = data
+            self._save_subscription(data)
+            self._save_seq("subscriptions", self.subscriptions["next_id"])
+            self._db_conn.commit()
         return sub
 
     def update_subscription(self, sub: Subscription) -> None:
-        self.subscriptions["subs"][sub.sub_id] = asdict(sub)
-        self.save_subscriptions()
+        data = asdict(sub)
+        with self._lock:
+            self.subscriptions["subs"][sub.sub_id] = data
+            self._save_subscription(data)
+            self._db_conn.commit()
 
     def create_withdrawal_request(self, user_id: int, amount: Decimal, card: str) -> str:
         with self._lock:
@@ -1063,7 +1392,7 @@ class VPNStorage:
                 u["balance"] = _money_round(_to_dec(u.get("balance", 0)) + amount)
                 tid = str(self.transactions["next_id"])
                 self.transactions["next_id"] += 1
-                self.transactions["txs"][tid] = {
+                tx = {
                     "id": tid,
                     "user_id": uid,
                     "amount": amount,
@@ -1072,9 +1401,12 @@ class VPNStorage:
                     "payload": f"admin:{ts}:{uid}",
                     "created_at": time.time(),
                 }
+                self.transactions["txs"][tid] = tx
+                self._save_transaction(tx)
+                self._save_user(u)
                 count += 1
-            self.save_users()
-            self.save_transactions()
+            self._save_seq("transactions", self.transactions["next_id"])
+            self._db_conn.commit()
         return count
 
     def export_csv(self, kind: str) -> Path:
@@ -1136,7 +1468,7 @@ class VPNStorage:
             amount = _money_round(amount)
             user["referral_balance"] = _money_round(user.get("referral_balance", 0) + amount)
             self.update_user(user)
-            self._add_transaction(user_id, amount, "referral", f"level_{level}", f"from_{from_user_id}")
+            self._add_transaction(user_id, amount, "referral", f"level_{level}", f"from_{from_user_id}_{time.time_ns()}")
             key = str(user_id)
             self.referrals["earnings"].setdefault(key, {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
             self.referrals["earnings"][key][f"level{level}"] = _money_round(self.referrals["earnings"][key][f"level{level}"] + amount)
