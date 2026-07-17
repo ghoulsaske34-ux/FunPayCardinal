@@ -320,7 +320,7 @@ class VPNStorage:
             "channel_id": "",
             "support_id": "",
             "crypto_bot_token": "",
-            "crypto_bot_webhook_enabled": True,
+            "crypto_bot_webhook_enabled": False,
             "welcome": "Добро пожаловать в VPN-бот!",
             "support": "@support",
             "bot_username": "",
