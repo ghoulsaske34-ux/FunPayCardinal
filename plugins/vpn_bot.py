@@ -81,6 +81,19 @@ DB_FILE = STORAGE_DIR / "vpn_bot.db"
 
 CB_PREFIX = "vpn:"
 
+MESSAGE_MEDIA_LABELS = {
+    "welcome": "Приветствие (/start)",
+    "main": "Главное меню",
+    "channel_check": "Проверка канала",
+    "trial": "Пробный период",
+    "profile": "Профиль",
+    "buy": "Покупка подписки",
+    "my_subs": "Мои подписки",
+    "deposit": "Пополнение",
+    "referral": "Реферальная система",
+    "help": "Помощь",
+}
+
 # Пороги безопасности (можно переопределять в /vpnadmin → Безопасность)
 DEFAULT_SHARING_WINDOW = 300  # сек — окно одновременных подключений для анти-шаринга
 DEFAULT_UNBIND_COOLDOWN = 7 * 86400  # сек — раз в 7 дней пользователь может отвязать устройство
@@ -304,6 +317,7 @@ class VPNStorage:
             "welcome_media_type": "photo",
             "menu_media_file_id": "",
             "menu_media_type": "photo",
+            "message_media": {},
         }
 
     def _default_users(self) -> dict[str, Any]:
@@ -2433,10 +2447,15 @@ class UserBot:
         else:
             self.bot.send_photo(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
 
-    def _send_menu_message(self, chat_id: int, text: str, reply_markup=None, prefer_welcome_media: bool = False) -> None:
+    def _send_menu_message(self, chat_id: int, text: str, reply_markup=None, prefer_welcome_media: bool = False, media_key: str | None = None) -> None:
         file_id = ""
         media_type = "photo"
-        if prefer_welcome_media:
+        if media_key:
+            mm = storage.config.get("message_media", {})
+            data = mm.get(media_key, {})
+            file_id = data.get("file_id", "")
+            media_type = data.get("media_type", "photo")
+        if prefer_welcome_media and not file_id:
             file_id = storage.config.get("welcome_media_file_id", "")
             media_type = storage.config.get("welcome_media_type", "photo")
         if not file_id:
@@ -2598,9 +2617,9 @@ class UserBot:
                 B("🏠 Главное меню", callback_data=f"{CB_PREFIX}main", style="primary"),
             )
             caption = f"{text}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
-            self._send_menu_message(chat_id, caption, reply_markup=kb, prefer_welcome_media=True)
+            self._send_menu_message(chat_id, caption, reply_markup=kb, prefer_welcome_media=True, media_key="welcome")
         else:
-            self._send_menu_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main(), prefer_welcome_media=True)
+            self._send_menu_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main(), prefer_welcome_media=True, media_key="main")
 
     def _check_maintenance(self, user_id: int, chat_id: int) -> bool:
         if storage.is_banned(user_id):
@@ -2678,7 +2697,7 @@ class UserBot:
                 self.bot.delete_message(chat_id, message_id)
             except Exception:
                 pass
-        self._send_menu_message(chat_id, text, reply_markup=kb, prefer_welcome_media=False)
+        self._send_menu_message(chat_id, text, reply_markup=kb, prefer_welcome_media=False, media_key="channel_check")
         self.set_state(user_id, "manual_channel_verify", {})
 
     def _on_channel_ok(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
@@ -3932,8 +3951,21 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         elif m.content_type == "animation" and m.animation:
             file_id = m.animation.file_id
             media_type = "animation"
+        elif m.content_type == "document" and m.document:
+            file_id = m.document.file_id
+            mime = (m.document.mime_type or "").lower()
+            if mime.startswith("video/"):
+                media_type = "video"
+            elif mime == "image/gif":
+                media_type = "animation"
+            else:
+                media_type = "photo"
+        if m.content_type == "text" and m.text and m.text.strip() in ("-", "отмена", "cancel"):
+            bot.send_message(m.chat.id, "Загрузка медиа отменена.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
         if not file_id:
-            bot.send_message(m.chat.id, "Отправьте фото, GIF (анимацию) или видео.")
+            bot.send_message(m.chat.id, "Отправьте фото, GIF (анимацию) или видео. Для отмены отправьте '-'.")
             return
         storage.config[f"{key_prefix}_media_file_id"] = file_id
         storage.config[f"{key_prefix}_media_type"] = media_type
@@ -3941,11 +3973,53 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         bot.send_message(m.chat.id, f"{label} {media_type} сохранено.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
+    def _set_msg_media(m: Message, key: str, label: str) -> None:
+        file_id = None
+        media_type = "photo"
+        if m.content_type == "photo" and m.photo:
+            file_id = m.photo[-1].file_id
+        elif m.content_type == "video" and m.video:
+            file_id = m.video.file_id
+            media_type = "video"
+        elif m.content_type == "animation" and m.animation:
+            file_id = m.animation.file_id
+            media_type = "animation"
+        elif m.content_type == "document" and m.document:
+            file_id = m.document.file_id
+            mime = (m.document.mime_type or "").lower()
+            if mime.startswith("video/"):
+                media_type = "video"
+            elif mime == "image/gif":
+                media_type = "animation"
+            else:
+                media_type = "photo"
+        if m.content_type == "text" and m.text and m.text.strip() in ("-", "отмена", "cancel"):
+            bot.send_message(m.chat.id, "Загрузка медиа отменена.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        if not file_id:
+            bot.send_message(m.chat.id, "Отправьте фото, GIF (анимацию) или видео. Для отмены отправьте '-'.")
+            return
+        mm = storage.config.setdefault("message_media", {})
+        mm[key] = {"file_id": file_id, "media_type": media_type}
+        storage.save_config()
+        bot.send_message(m.chat.id, f"Медиа для «{label}» ({media_type}) сохранено.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
     def state_set_welcome_media(m: Message):
         _set_media_from_message(m, "welcome", "Приветственное")
 
     def state_set_menu_media(m: Message):
         _set_media_from_message(m, "menu", "Медиа меню")
+
+    def state_set_msg_media(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state or "key" not in (state.get("data") or {}):
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        key = state["data"]["key"]
+        label = MESSAGE_MEDIA_LABELS.get(key, key)
+        _set_msg_media(m, key, label)
 
     def state_set_faq_text(m: Message):
         storage.config["faq_text"] = m.text.strip() if m.text else ""
@@ -4498,8 +4572,16 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_host_data, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_data"))
     tg.msg_handler(state_admin_host_edit, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_edit"))
     tg.msg_handler(state_set_temp_profiles, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_temp_profiles"))
-    tg.msg_handler(state_set_welcome_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_welcome_media"))
-    tg.msg_handler(state_set_menu_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_menu_media"))
+    # file_handler перехватывает photo/document через TGBot.run_file_handlers
+    tg.file_handler(f"{CB_PREFIX}set_welcome_media", state_set_welcome_media)
+    tg.msg_handler(state_set_welcome_media, content_types=["video", "animation", "text"],
+                   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_welcome_media"))
+    tg.file_handler(f"{CB_PREFIX}set_menu_media", state_set_menu_media)
+    tg.msg_handler(state_set_menu_media, content_types=["video", "animation", "text"],
+                   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_menu_media"))
+    tg.file_handler(f"{CB_PREFIX}set_msg_media", state_set_msg_media)
+    tg.msg_handler(state_set_msg_media, content_types=["video", "animation", "text"],
+                   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_msg_media"))
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
     tg.msg_handler(state_admin_plan_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_name"))
     tg.msg_handler(state_admin_plan_devices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_devices"))
@@ -4551,8 +4633,7 @@ def _admin_main_keyboard() -> K:
         B("📢 Канал подписки", callback_data=f"{CB_PREFIX}admin:channel", style="success"),
         B("🆘 Админ поддержки", callback_data=f"{CB_PREFIX}admin:support", style="success"),
         B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token", style="primary"),
-        B("🖼 Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media", style="success"),
-        B("🖼 Медиа меню", callback_data=f"{CB_PREFIX}admin:menu_media", style="success"),
+        B("🖼 Медиа сообщений", callback_data=f"{CB_PREFIX}admin:message_media", style="success"),
         B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq", style="success"),
         B("🖥 Серверы", callback_data=f"{CB_PREFIX}admin:hosts", style="primary"),
         B("📋 Планы и цены", callback_data=f"{CB_PREFIX}admin:plans", style="success"),
@@ -4696,32 +4777,43 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_crypto_token")
             return
 
-        if section == "welcome_media":
-            file_id = storage.config.get("welcome_media_file_id")
-            media_type = storage.config.get("welcome_media_type", "не задано")
-            text = (f"<b>Приветственное медиа</b>\n"
-                    f"Текущее: {media_type if file_id else 'не задано'}\n\n"
-                    f"Отправьте фото, GIF или видео, которое будет показываться при первом /start.")
-            kb = K()
-            if file_id:
-                kb.add(B("🗑 Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_welcome_media", style="danger"))
+        if section == "message_media":
+            kb = K(row_width=2)
+            mm = storage.config.setdefault("message_media", {})
+            for key, label in MESSAGE_MEDIA_LABELS.items():
+                data = mm.get(key, {})
+                status = f" ({data.get('media_type', '')})" if data.get("file_id") else " — не задано"
+                kb.add(B(f"{label}{status}", callback_data=f"{CB_PREFIX}admin:msg_media:{key}"))
             kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
-            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_welcome_media")
+            bot.edit_message_text("<b>🖼 Медиа сообщений</b>\n\nВыберите сообщение, для которого задать фото/видео:", chat_id, c.message.message_id, reply_markup=kb)
             return
 
-        if section == "menu_media":
-            file_id = storage.config.get("menu_media_file_id")
-            media_type = storage.config.get("menu_media_type", "не задано")
-            text = (f"<b>Медиа меню</b>\n"
+        if section == "msg_media" and len(args) >= 1:
+            key = args[0]
+            label = MESSAGE_MEDIA_LABELS.get(key, key)
+            mm = storage.config.setdefault("message_media", {})
+            data = mm.get(key, {})
+            file_id = data.get("file_id")
+            media_type = data.get("media_type", "не задано")
+            text = (f"<b>{label}</b>\n"
                     f"Текущее: {media_type if file_id else 'не задано'}\n\n"
-                    f"Отправьте фото, GIF или видео, которое будет показываться в меню бота (приветствие, проверка канала и т.д.).")
+                    f"Отправьте фото, GIF или видео, которое будет показываться для этого сообщения.")
             kb = K()
             if file_id:
-                kb.add(B("🗑 Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_menu_media", style="danger"))
-            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
+                kb.add(B("🗑 Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_msg_media:{key}", style="danger"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:message_media", style="primary"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_menu_media")
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_msg_media", {"key": key})
+            return
+
+        if section == "del_msg_media" and len(args) >= 1:
+            key = args[0]
+            mm = storage.config.setdefault("message_media", {})
+            if key in mm:
+                del mm[key]
+            storage.save_config()
+            bot.edit_message_text("Медиа удалено.", chat_id, c.message.message_id,
+                                  reply_markup=_admin_main_keyboard())
             return
 
         if section == "faq":
