@@ -208,26 +208,27 @@ class VPNStorage:
 
     def _migrate_config(self) -> None:
         with self._lock:
-            # migrate legacy single server to hosts
-            if not self.config.get("hosts") and self.config.get("server"):
-                legacy = self.config.get("server", {})
-                host_id = "main"
-                host = dict(legacy)
-                host.setdefault("host_id", host_id)
-                host.setdefault("name", "Основной")
-                self.config["hosts"] = {host_id: host}
-                self.config["default_host_id"] = host_id
+            # migrate legacy single server to hosts and remove legacy key
+            if self.config.get("server"):
+                if not self.config.get("hosts"):
+                    legacy = self.config["server"]
+                    host_id = "main"
+                    host = dict(legacy)
+                    host.setdefault("host_id", host_id)
+                    host.setdefault("name", "Основной")
+                    self.config["hosts"] = {host_id: host}
+                    self.config["default_host_id"] = host_id
+                del self.config["server"]
                 self.save_config()
             # ensure default host exists
             default = self.config.get("default_host_id", "main")
-            if default not in self.config.get("hosts", {}):
-                self.config["hosts"] = self.config.get("hosts", {})
-                self.config["hosts"][default] = asdict(ServerConfig(host_id=default, name="Основной"))
+            hosts = self.config.setdefault("hosts", {})
+            if default not in hosts:
+                hosts[default] = asdict(ServerConfig(host_id=default, name="Основной"))
                 self.save_config()
 
     def _default_config(self) -> dict[str, Any]:
         return {
-            "server": asdict(ServerConfig()),  # legacy, migrated to hosts
             "hosts": {},
             "default_host_id": "main",
             "expired_cleanup_days": 5,
@@ -414,9 +415,6 @@ class VPNStorage:
         host_id = host_id or self.config.get("default_host_id", "main")
         data = self.config.get("hosts", {}).get(host_id)
         if not data:
-            if host_id == "main" and self.config.get("server"):
-                # legacy fallback
-                return ServerConfig(**self.config["server"])
             return None
         return ServerConfig(**data)
 
@@ -448,9 +446,6 @@ class VPNStorage:
         }
         if not self.config.get("default_host_id"):
             self.config["default_host_id"] = server.host_id
-        # keep legacy server in sync for older code paths
-        if server.host_id == self.config.get("default_host_id"):
-            self.config["server"] = self.config["hosts"][server.host_id]
         self.save_config()
 
     def delete_host(self, host_id: str) -> bool:
@@ -5250,28 +5245,6 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         return
 
 
-def handle_new_order(cardinal: Cardinal, e) -> None:
-    """Авто-реакция на заказ FunPay с VPN-лотом."""
-    try:
-        order = e.order
-        desc = (order.description or "").lower()
-        if "vpn" not in desc:
-            return
-        chat_id = order.chat_id
-        try:
-            chat = cardinal.account.get_chat_by_name(order.buyer_username)
-            if chat:
-                chat_id = chat.id
-        except Exception:
-            pass
-        msg = ("Спасибо за покупку VPN!\n\n"
-               "Напишите нашему Telegram-боту и используйте команду /vpn.\n"
-               f"Ваш ник FunPay: <code>{_escape(order.buyer_username)}</code>")
-        cardinal.send_message(chat_id, msg, order.buyer_username)
-    except Exception:
-        logger.exception("Ошибка обработки VPN-заказа")
-
-
 def cleanup(cardinal: Cardinal, *args) -> None:
     storage.save_config()
     storage.save_users()
@@ -5286,5 +5259,4 @@ storage = VPNStorage()
 
 
 BIND_TO_PRE_INIT = [init_plugin]
-BIND_TO_NEW_ORDER = [handle_new_order]
 BIND_TO_PRE_STOP = [cleanup]
