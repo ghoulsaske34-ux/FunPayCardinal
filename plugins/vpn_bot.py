@@ -183,8 +183,6 @@ class Subscription:
     expires_at: float
     devices: list[dict[str, Any]] = field(default_factory=list)
     active: bool = True
-    frozen_until: float | None = None
-    freeze_started: float | None = None
     warnings: dict[str, bool] = field(default_factory=dict)
     email: str = ""  # email клиента в 3X-UI
     xray_sub_id: str = ""  # subId для subscription URL
@@ -193,15 +191,7 @@ class Subscription:
 
     @property
     def is_expired(self) -> bool:
-        if self.frozen_until and time.time() < self.frozen_until:
-            return False
         return time.time() > self.expires_at
-
-    @property
-    def effective_expires_at(self) -> float:
-        if self.frozen_until and self.freeze_started:
-            return self.expires_at + max(0.0, self.frozen_until - self.freeze_started)
-        return self.expires_at
 
 
 class VPNStorage:
@@ -621,21 +611,6 @@ class VPNStorage:
         if code.upper() in self.config.get("activation_codes", {}):
             del self.config["activation_codes"][code.upper()]
             self.save_config()
-
-    def freeze_subscription(self, sub: Subscription, days: int) -> None:
-        now = time.time()
-        sub.freeze_started = now
-        sub.frozen_until = now + days * 86400
-        self.update_subscription(sub)
-        XrayAPI.update_expiry(sub, enable=False)
-
-    def unfreeze_subscription(self, sub: Subscription) -> None:
-        if sub.frozen_until and sub.freeze_started and time.time() >= sub.frozen_until:
-            sub.expires_at = sub.expires_at + max(0.0, sub.frozen_until - sub.freeze_started)
-        sub.frozen_until = None
-        sub.freeze_started = None
-        self.update_subscription(sub)
-        XrayAPI.add_or_update_client(sub, enable=True)
 
     def refund_subscription(self, sub: Subscription, refund_amount: Decimal) -> None:
         user = self.get_user(sub.user_id)
@@ -1114,12 +1089,12 @@ class VPNStorage:
                                      _csv_safe(u.get("referral_balance")), _csv_safe(u.get("trial_used")),
                                      _csv_safe(_format_time(u.get("joined_at", 0))), _csv_safe(u.get("referred_by"))])
             elif kind == "subscriptions":
-                writer.writerow(["sub_id", "user_id", "plan_id", "months", "created_at", "expires_at", "active", "frozen_until", "devices_count"])
+                writer.writerow(["sub_id", "user_id", "plan_id", "months", "created_at", "expires_at", "active", "devices_count"])
                 for s in self.subscriptions.get("subs", {}).values():
                     sub = self._sub_from_dict(s)
                     writer.writerow([_csv_safe(s.get("sub_id")), _csv_safe(s.get("user_id")), _csv_safe(s.get("plan_id")), _csv_safe(s.get("months")),
                                      _csv_safe(_format_time(s.get("created_at", 0))), _csv_safe(_format_time(s.get("expires_at", 0))),
-                                     _csv_safe(s.get("active")), _csv_safe(s.get("frozen_until")), _csv_safe(len(s.get("devices", [])))])
+                                     _csv_safe(s.get("active")), _csv_safe(len(s.get("devices", [])))])
             elif kind == "transactions":
                 writer.writerow(["id", "user_id", "type", "amount", "method", "payload", "created_at"])
                 for t in self.transactions.get("txs", {}).values():
@@ -1243,10 +1218,7 @@ def _price_text(plan: Plan, months: str) -> str:
 
 def format_subscription(sub: Subscription) -> str:
     plan = storage.plan(sub.plan_id)
-    if sub.frozen_until and time.time() < sub.frozen_until:
-        status = f"Заморожена до {_format_time(sub.frozen_until)}"
-    else:
-        status = "Активна" if sub.active and not sub.is_expired else "Истекла/неактивна"
+    status = "Активна" if sub.active and not sub.is_expired else "Истекла/неактивна"
     host = storage.get_host(sub.host_id) or storage.server()
     host_name = _escape(host.name if host else sub.host_id)
     lines = [
@@ -1255,7 +1227,7 @@ def format_subscription(sub: Subscription) -> str:
         f"Сервер: {host_name}",
         f"Срок: {sub.months} мес." if sub.months else f"Пробный период",
         f"Статус: {status}",
-        f"Действует до: {_format_time(sub.effective_expires_at)}",
+        f"Действует до: {_format_time(sub.expires_at)}",
         f"Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}",
     ]
     return "\n".join(lines)
@@ -1384,7 +1356,7 @@ class CryptoBotPoller:
 
 
 class SubscriptionScheduler:
-    """Фоновый поток автопродления, заморозки и уведомлений о подписках."""
+    """Фоновый поток автопродления и уведомлений о подписках."""
 
     def __init__(self, bot: "UserBot") -> None:
         self.bot = bot
@@ -1430,14 +1402,7 @@ class SubscriptionScheduler:
                 continue
         for sub_id, data in list(storage.subscriptions["subs"].items()):
             sub = storage._sub_from_dict(data)
-            if not sub.active and not sub.frozen_until:
-                continue
-            # unfreeze
-            if sub.frozen_until and now >= sub.frozen_until:
-                storage.unfreeze_subscription(sub)
-                self._notify(sub.user_id, f"Подписка #{sub.sub_id} разморожена. Действует до {_format_time(sub.expires_at)}.")
-                continue
-            if sub.frozen_until:
+            if not sub.active:
                 continue
             remaining = sub.expires_at - now
             warnings = sub.warnings or {}
@@ -2037,7 +2002,7 @@ class XrayAPI:
 
     @staticmethod
     def _expiry_ms(sub: Subscription) -> int:
-        return XrayAPI._timestamp_to_xray_ms(sub.effective_expires_at)
+        return XrayAPI._timestamp_to_xray_ms(sub.expires_at)
 
     @staticmethod
     def _build_client_data(
@@ -2520,10 +2485,6 @@ class UserBot:
         def on_activation_code(m: Message):
             self._on_activation_code(m)
 
-        @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "enter_freeze_days"))
-        def on_freeze_days(m: Message):
-            self._on_freeze_days(m)
-
         @bot.pre_checkout_query_handler(func=lambda q: True)
         def pre_checkout(query):
             bot.answer_pre_checkout_query(query.id, ok=True)
@@ -2587,6 +2548,8 @@ class UserBot:
         source, referred_by = self._parse_start_param(m, user_id)
         is_new = str(user_id) not in storage.users
         user = storage.get_user(user_id, username, source=source)
+        if source and source != "direct" and user.get("source") == "direct":
+            user["source"] = source
         if referred_by and not user.get("referred_by"):
             try:
                 ref_id = int(referred_by)
@@ -2605,10 +2568,19 @@ class UserBot:
 
     def _parse_start_param(self, m: Message, user_id: int) -> tuple[str, int | None]:
         """Возвращает (source, referred_by). source='direct' если без параметра."""
-        parts = m.text.split() if m.text else []
-        if len(parts) < 2:
+        text = (m.text or "").strip()
+        if not text:
             return "direct", None
-        param = parts[1].strip()
+        # Ссылка вида https://t.me/bot?start=PARAM приходит как /start PARAM (возможно с @username бота)
+        match = re.match(r"^/(?:start|vpn)(?:@[\w_]+)?\s+(\S+)", text, re.IGNORECASE)
+        if match:
+            param = match.group(1).strip()
+        elif not text.startswith("/"):
+            param = text.split()[0]
+        else:
+            return "direct", None
+        if not param:
+            return "direct", None
         if param.startswith("ref_"):
             try:
                 return "referral", int(param.split("_", 1)[1])
@@ -2918,13 +2890,6 @@ class UserBot:
             self._renew_menu(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "sub_freeze":
-            sub_id = args[0]
-            self.set_state(user_id, "enter_freeze_days", {"sub_id": sub_id})
-            self.bot.edit_message_text("Отправьте количество дней заморозки:", chat_id, c.message.message_id,
-                                       reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}")))
-            return
-
         if action == "renew_confirm":
             sub_id, months = args[0], int(args[1])
             self._renew(user_id, chat_id, c.message.message_id, sub_id, months)
@@ -3196,7 +3161,6 @@ class UserBot:
         kb.add(B("Статистика", callback_data=f"{CB_PREFIX}sub_stats:{sub_id}"))
         kb.add(B("Продлить", callback_data=f"{CB_PREFIX}sub_renew:{sub_id}"))
         kb.add(B("Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
-        kb.add(B("Заморозка", callback_data=f"{CB_PREFIX}sub_freeze:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}my_subs"))
         self.bot.edit_message_text(format_subscription(sub), chat_id, message_id, reply_markup=kb)
 
@@ -3572,29 +3536,6 @@ class UserBot:
         self.clear_state(user_id)
         self.bot.send_message(m.chat.id, f"Заявка #{req_id} на вывод {_money_str(amount)}₽ создана. Ожидайте подтверждения администратора.",
                               reply_markup=self._keyboard_main())
-
-    def _on_freeze_days(self, m: Message) -> None:
-        user_id = m.from_user.id
-        if self._check_maintenance(user_id, m.chat.id):
-            return
-        state = self.get_state(user_id)
-        if not state:
-            return
-        try:
-            days = int(m.text.strip())
-            sub_id = state["data"].get("sub_id")
-            sub = storage.get_subscription(sub_id)
-            if not sub or sub.user_id != user_id:
-                self.bot.send_message(m.chat.id, "Подписка не найдена.")
-                return
-            if days <= 0:
-                self.bot.send_message(m.chat.id, "Введите положительное число дней.")
-                return
-            storage.freeze_subscription(sub, days)
-            self.clear_state(user_id)
-            self.bot.send_message(m.chat.id, f"Подписка #{sub_id} заморожена на {days} дней.", reply_markup=self._keyboard_main())
-        except ValueError:
-            self.bot.send_message(m.chat.id, "Введите целое число дней.")
 
     def _on_complaint_text(self, m: Message) -> None:
         user_id = m.from_user.id
@@ -4279,26 +4220,6 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         storage.update_subscription(sub)
         bot.send_message(m.chat.id, f"Устройство {ip} удалено." if len(sub.devices) < before else f"Устройство {ip} не найдено.")
 
-    def state_admin_freeze_days(m: Message):
-        state = tg.get_state(m.chat.id, m.from_user.id)
-        if not state:
-            return
-        try:
-            days = int(m.text.strip())
-            sub_id = state["data"]["sub_id"]
-            sub = storage.get_subscription(sub_id)
-            if not sub:
-                bot.send_message(m.chat.id, "Подписка не найдена.")
-                return
-            if days <= 0:
-                bot.send_message(m.chat.id, "Введите положительное число дней.")
-                return
-            storage.freeze_subscription(sub, days)
-            bot.send_message(m.chat.id, f"Подписка #{sub_id} заморожена на {days} дней.")
-        except ValueError:
-            bot.send_message(m.chat.id, "Введите целое число дней.")
-        tg.clear_state(m.chat.id, m.from_user.id)
-
     def state_admin_refund_amount(m: Message):
         state = tg.get_state(m.chat.id, m.from_user.id)
         if not state:
@@ -4314,7 +4235,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
                 # auto-calc remaining value
                 total = storage.price(sub.plan_id, sub.months) or Decimal("0.00")
                 total_days = sub.months * 30 if sub.months else 3
-                remaining_days = max(0, (sub.effective_expires_at - time.time()) / 86400)
+                remaining_days = max(0, (sub.expires_at - time.time()) / 86400)
                 amount = _money_round(_to_dec(total) * _to_dec(remaining_days) / _to_dec(total_days))
             storage.refund_subscription(sub, amount)
             bot.send_message(m.chat.id, f"Возвращено {_money_str(amount)}₽ пользователю {sub.user_id} за подписку #{sub.sub_id}.")
@@ -4622,7 +4543,6 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_balance_amount, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_balance_amount"))
     tg.msg_handler(state_device_ip, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_device_ip"))
     tg.msg_handler(state_del_ip, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_del_ip"))
-    tg.msg_handler(state_admin_freeze_days, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_freeze_days"))
     tg.msg_handler(state_admin_refund_amount, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_refund_amount"))
     tg.msg_handler(state_admin_security_window, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_security_window"))
     tg.msg_handler(state_admin_security_cooldown, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_security_cooldown"))
@@ -5527,16 +5447,9 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         kb.add(B("Добавить IP", callback_data=f"{CB_PREFIX}admin_add_ip:{sub_id}"))
         kb.add(B("Удалить IP", callback_data=f"{CB_PREFIX}admin_del_ip:{sub_id}"))
         kb.add(B("Удалить все IP", callback_data=f"{CB_PREFIX}admin_del_all_ip:{sub_id}"))
-        kb.add(B("Заморозить", callback_data=f"{CB_PREFIX}admin_freeze:{sub_id}"))
         kb.add(B("Возврат", callback_data=f"{CB_PREFIX}admin_refund:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:subs"))
         bot.edit_message_text(format_subscription(sub), chat_id, c.message.message_id, reply_markup=kb)
-        return
-
-    if action == "admin_freeze" and len(args) >= 1:
-        sub_id = args[0]
-        bot.send_message(chat_id, "Введите количество дней заморозки:")
-        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_freeze_days", {"sub_id": sub_id})
         return
 
     if action == "admin_refund" and len(args) >= 1:
