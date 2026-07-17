@@ -4261,6 +4261,9 @@ class UserBot:
         kb.row_width = 2
         if user_id is not None and not storage.get_user(user_id).get("trial_used"):
             kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
+        mini_url = storage.config.get("mini_app_public_url", "")
+        if mini_url and storage.config.get("mini_app_enabled", True):
+            kb.add(B("🌐 Личный кабинет", web_app={"url": mini_url}, style="primary"))
         kb.add(
             B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="success"),
             B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
@@ -5429,9 +5432,9 @@ class UserBot:
                 timeout=30,
             )
             if r.status_code == 200 and r.json().get("ok"):
-                logger.info("Mini App menu button set to %s", url)
+                logger.info("Mini App menu button set")
         except Exception:
-            logger.exception("Mini App button setup failed")
+            logger.error("Mini App button setup failed (network or API error)")
 
     # ---- lifecycle ----
     def start(self) -> None:
