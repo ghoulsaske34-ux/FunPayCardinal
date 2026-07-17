@@ -77,6 +77,7 @@ logger = logging.getLogger("FPC.vpn_bot")
 
 STORAGE_DIR = Path("storage/cache/vpn")
 EXPORTS_DIR = STORAGE_DIR / "exports"
+MEDIA_DIR = STORAGE_DIR / "media"
 DB_FILE = STORAGE_DIR / "vpn_bot.db"
 
 CB_PREFIX = "vpn:"
@@ -2440,29 +2441,38 @@ class UserBot:
             self._states.pop(user_id, None)
 
     def _send_captioned_media(self, chat_id: int, text: str, file_id: str, media_type: str, reply_markup=None) -> None:
-        if media_type == "video":
-            self.bot.send_video(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
-        elif media_type == "animation":
-            self.bot.send_animation(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
-        else:
-            self.bot.send_photo(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        from telebot.types import InputFile
+        try:
+            if isinstance(file_id, (str, Path)) and (str(file_id).startswith("/") or Path(file_id).is_file()):
+                photo = InputFile(str(file_id))
+            else:
+                photo = file_id
+            if media_type == "video":
+                self.bot.send_video(chat_id, photo, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+            elif media_type == "animation":
+                self.bot.send_animation(chat_id, photo, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+            else:
+                self.bot.send_photo(chat_id, photo, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        except Exception:
+            logger.exception("Ошибка отправки медиа, отправляю текстом")
+            self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
 
     def _send_menu_message(self, chat_id: int, text: str, reply_markup=None, prefer_welcome_media: bool = False, media_key: str | None = None) -> None:
-        file_id = ""
+        file_source = ""
         media_type = "photo"
         if media_key:
             mm = storage.config.get("message_media", {})
             data = mm.get(media_key, {})
-            file_id = data.get("file_id", "")
+            file_source = data.get("file_path") or data.get("file_id", "")
             media_type = data.get("media_type", "photo")
-        if prefer_welcome_media and not file_id:
-            file_id = storage.config.get("welcome_media_file_id", "")
+        if prefer_welcome_media and not file_source:
+            file_source = storage.config.get("welcome_media_file_id", "")
             media_type = storage.config.get("welcome_media_type", "photo")
-        if not file_id:
-            file_id = storage.config.get("menu_media_file_id", "")
+        if not file_source:
+            file_source = storage.config.get("menu_media_file_id", "")
             media_type = storage.config.get("menu_media_type", "photo")
-        if file_id:
-            self._send_captioned_media(chat_id, text, file_id, media_type, reply_markup)
+        if file_source:
+            self._send_captioned_media(chat_id, text, file_source, media_type, reply_markup)
         else:
             self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
 
@@ -4000,10 +4010,23 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not file_id:
             bot.send_message(m.chat.id, "Отправьте фото, GIF (анимацию) или видео. Для отмены отправьте '-'.")
             return
-        mm = storage.config.setdefault("message_media", {})
-        mm[key] = {"file_id": file_id, "media_type": media_type}
-        storage.save_config()
-        bot.send_message(m.chat.id, f"Медиа для «{label}» ({media_type}) сохранено.")
+        try:
+            file_info = bot.get_file(file_id)
+            ext = Path(file_info.file_path).suffix
+            if not ext:
+                ext = {("video",): ".mp4", ("animation",): ".mp4"}.get((media_type,), ".jpg")
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            save_path = MEDIA_DIR / f"{key}{ext}"
+            data = bot.download_file(file_info.file_path)
+            with open(save_path, "wb") as f:
+                f.write(data)
+            mm = storage.config.setdefault("message_media", {})
+            mm[key] = {"file_path": str(save_path), "media_type": media_type}
+            storage.save_config()
+            bot.send_message(m.chat.id, f"Медиа для «{label}» ({media_type}) сохранено.")
+        except Exception as e:
+            logger.exception("Ошибка сохранения медиа")
+            bot.send_message(m.chat.id, f"Ошибка сохранения медиа: {e}")
         tg.clear_state(m.chat.id, m.from_user.id)
 
     def state_set_welcome_media(m: Message):
@@ -4782,7 +4805,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             mm = storage.config.setdefault("message_media", {})
             for key, label in MESSAGE_MEDIA_LABELS.items():
                 data = mm.get(key, {})
-                status = f" ({data.get('media_type', '')})" if data.get("file_id") else " — не задано"
+                status = f" ({data.get('media_type', '')})" if (data.get("file_path") or data.get("file_id")) else " — не задано"
                 kb.add(B(f"{label}{status}", callback_data=f"{CB_PREFIX}admin:msg_media:{key}"))
             kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
             bot.edit_message_text("<b>🖼 Медиа сообщений</b>\n\nВыберите сообщение, для которого задать фото/видео:", chat_id, c.message.message_id, reply_markup=kb)
@@ -4793,7 +4816,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             label = MESSAGE_MEDIA_LABELS.get(key, key)
             mm = storage.config.setdefault("message_media", {})
             data = mm.get(key, {})
-            file_id = data.get("file_id")
+            file_id = data.get("file_path") or data.get("file_id")
             media_type = data.get("media_type", "не задано")
             text = (f"<b>{label}</b>\n"
                     f"Текущее: {media_type if file_id else 'не задано'}\n\n"
