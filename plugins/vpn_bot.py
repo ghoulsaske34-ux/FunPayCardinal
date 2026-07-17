@@ -23,7 +23,44 @@ from urllib.parse import urlencode, quote
 
 import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B, Message, CallbackQuery, LabeledPrice
+from telebot.types import InlineKeyboardMarkup as _InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton, Message, CallbackQuery, LabeledPrice
+
+
+def _style_button_init(self, text, url=None, callback_data=None, web_app=None, switch_inline_query=None,
+                       switch_inline_query_current_chat=None, callback_game=None, pay=None, login_url=None,
+                       switch_inline_query_chosen_chat=None, copy_text=None, style=None,
+                       icon_custom_emoji_id=None, **kwargs):
+    _InlineKeyboardButton.__init__(self, text, url=url, callback_data=callback_data, web_app=web_app,
+                                  switch_inline_query=switch_inline_query,
+                                  switch_inline_query_current_chat=switch_inline_query_current_chat,
+                                  callback_game=callback_game, pay=pay, login_url=login_url,
+                                  switch_inline_query_chosen_chat=switch_inline_query_chosen_chat, copy_text=copy_text, **kwargs)
+    self.style = style
+    self.icon_custom_emoji_id = icon_custom_emoji_id
+
+
+def _style_button_to_dict(self):
+    d = _InlineKeyboardButton.to_dict(self)
+    if getattr(self, 'style', None):
+        d['style'] = self.style
+    if getattr(self, 'icon_custom_emoji_id', None):
+        d['icon_custom_emoji_id'] = self.icon_custom_emoji_id
+    return d
+
+
+class B(_InlineKeyboardButton):
+    __init__ = _style_button_init
+    to_dict = _style_button_to_dict
+
+
+class K(_InlineKeyboardMarkup):
+    def __init__(self, row_width=2, keyboard=None):
+        super().__init__(keyboard=keyboard, row_width=row_width)
+
+    def to_dict(self):
+        flat = [button for row in self.keyboard for button in row]
+        rows = [flat[i:i + self.row_width] for i in range(0, len(flat), self.row_width)]
+        return {'inline_keyboard': [[button.to_dict() for button in row] for row in rows]}
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -263,6 +300,10 @@ class VPNStorage:
             "support": "@support",
             "bot_username": "",
             "trial_days": TRIAL_DAYS,
+            "welcome_media_file_id": "",
+            "welcome_media_type": "photo",
+            "menu_media_file_id": "",
+            "menu_media_type": "photo",
         }
 
     def _default_users(self) -> dict[str, Any]:
@@ -2384,6 +2425,28 @@ class UserBot:
         with self._state_lock:
             self._states.pop(user_id, None)
 
+    def _send_captioned_media(self, chat_id: int, text: str, file_id: str, media_type: str, reply_markup=None) -> None:
+        if media_type == "video":
+            self.bot.send_video(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        elif media_type == "animation":
+            self.bot.send_animation(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        else:
+            self.bot.send_photo(chat_id, file_id, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+
+    def _send_menu_message(self, chat_id: int, text: str, reply_markup=None, prefer_welcome_media: bool = False) -> None:
+        file_id = ""
+        media_type = "photo"
+        if prefer_welcome_media:
+            file_id = storage.config.get("welcome_media_file_id", "")
+            media_type = storage.config.get("welcome_media_type", "photo")
+        if not file_id:
+            file_id = storage.config.get("menu_media_file_id", "")
+            media_type = storage.config.get("menu_media_type", "photo")
+        if file_id:
+            self._send_captioned_media(chat_id, text, file_id, media_type, reply_markup)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
+
     # ---- handlers ----
     def _register_handlers(self) -> None:
         bot = self.bot
@@ -2523,15 +2586,17 @@ class UserBot:
     def _send_welcome(self, user_id: int, chat_id: int) -> None:
         """Отправляет приветственное медиа и главное/пробное меню."""
         user = storage.get_user(user_id)
-        self._send_welcome_media(chat_id)
         text = storage.config.get("welcome", "Добро пожаловать!")
         if not user.get("trial_used"):
             kb = K()
-            kb.add(B("Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
-            kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
-            self.bot.send_message(chat_id, f"{text}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период.", reply_markup=kb)
+            kb.add(
+                B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"),
+                B("🏠 Главное меню", callback_data=f"{CB_PREFIX}main", style="primary"),
+            )
+            caption = f"{text}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
+            self._send_menu_message(chat_id, caption, reply_markup=kb, prefer_welcome_media=True)
         else:
-            self.bot.send_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main())
+            self._send_menu_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main(), prefer_welcome_media=True)
 
     def _check_maintenance(self, user_id: int, chat_id: int) -> bool:
         if storage.is_banned(user_id):
@@ -2581,7 +2646,6 @@ class UserBot:
         with self._state_lock:
             self._channel_cache[user_id] = (False, now)
         kb = K()
-        kb.add(B("Проверить подписку", callback_data=f"{CB_PREFIX}check_channel"))
         invite = None
         try:
             chat = self.bot.get_chat(channel_id)
@@ -2594,20 +2658,24 @@ class UserBot:
             elif channel_id.startswith("https://"):
                 invite = channel_id
         if invite:
-            kb.add(B("Подписаться", url=invite))
+            kb.add(B("👉 Перейти в канал", url=invite, style="success"))
+        kb.add(B("🔄 Проверить подписку", callback_data=f"{CB_PREFIX}check_channel", style="primary"))
         channel_text = f"<b>{_escape(channel_id)}</b>" if channel_id else "наш канал"
-        self.bot.send_message(chat_id, f"Для использования бота необходимо подписаться на {channel_text}.", reply_markup=kb)
+        self._send_menu_message(chat_id, f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>", reply_markup=kb, prefer_welcome_media=False)
         return False
 
     def _keyboard_main(self) -> K:
         kb = K()
-        kb.add(B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile"))
-        kb.add(B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy"))
-        kb.add(B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs"))
-        kb.add(B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
-        kb.add(B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
-        kb.add(B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral"))
-        kb.add(B("❓ Помощь", callback_data=f"{CB_PREFIX}help"))
+        kb.row_width = 2
+        kb.add(
+            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="success"),
+            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
+            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs", style="danger"),
+            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit", style="danger"),
+            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code", style="success"),
+            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral", style="success"),
+            B("❓ Помощь", callback_data=f"{CB_PREFIX}help", style="success"),
+        )
         return kb
 
     # ---- callbacks ----
@@ -3771,7 +3839,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             bot.send_message(m.chat.id, f"Ошибка: {e}")
         tg.clear_state(m.chat.id, m.from_user.id)
 
-    def state_set_welcome_media(m: Message):
+    def _set_media_from_message(m: Message, key_prefix: str, label: str) -> None:
         file_id = None
         media_type = "photo"
         if m.content_type == "photo" and m.photo:
@@ -3785,11 +3853,17 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not file_id:
             bot.send_message(m.chat.id, "Отправьте фото, GIF (анимацию) или видео.")
             return
-        storage.config["welcome_media_file_id"] = file_id
-        storage.config["welcome_media_type"] = media_type
+        storage.config[f"{key_prefix}_media_file_id"] = file_id
+        storage.config[f"{key_prefix}_media_type"] = media_type
         storage.save_config()
-        bot.send_message(m.chat.id, f"Приветственное {media_type} сохранено.")
+        bot.send_message(m.chat.id, f"{label} {media_type} сохранено.")
         tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_welcome_media(m: Message):
+        _set_media_from_message(m, "welcome", "Приветственное")
+
+    def state_set_menu_media(m: Message):
+        _set_media_from_message(m, "menu", "Медиа меню")
 
     def state_set_faq_text(m: Message):
         storage.config["faq_text"] = m.text.strip() if m.text else ""
@@ -4343,6 +4417,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_host_edit, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_host_edit"))
     tg.msg_handler(state_set_temp_profiles, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_temp_profiles"))
     tg.msg_handler(state_set_welcome_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_welcome_media"))
+    tg.msg_handler(state_set_menu_media, content_types=["photo", "video", "animation", "text"], func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_menu_media"))
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
     tg.msg_handler(state_admin_plan_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_name"))
     tg.msg_handler(state_admin_plan_devices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_devices"))
@@ -4385,37 +4460,41 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
 
 def _admin_main_keyboard() -> K:
     kb = K()
-    kb.add(B("🔑 Токен user-бота", callback_data=f"{CB_PREFIX}admin:user_token"))
-    kb.add(B("🔄 Перезапустить user-бота", callback_data=f"{CB_PREFIX}admin:start_bot"))
-    kb.add(B("📢 Канал подписки", callback_data=f"{CB_PREFIX}admin:channel"))
-    kb.add(B("🆘 Админ поддержки", callback_data=f"{CB_PREFIX}admin:support"))
-    kb.add(B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token"))
-    kb.add(B("🖼 Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media"))
-    kb.add(B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq"))
-    kb.add(B("🖥 Серверы", callback_data=f"{CB_PREFIX}admin:hosts"))
-    kb.add(B("📋 Планы и цены", callback_data=f"{CB_PREFIX}admin:plans"))
-    kb.add(B("🎟 Промокоды", callback_data=f"{CB_PREFIX}admin:promos"))
-    kb.add(B("🎁 Подарочные коды", callback_data=f"{CB_PREFIX}admin:codes"))
-    kb.add(B("🎁 Выдать подписку", callback_data=f"{CB_PREFIX}admin:give"))
-    kb.add(B("💳 Баланс пользователя", callback_data=f"{CB_PREFIX}admin:balance"))
-    kb.add(B("👤 Пользователи", callback_data=f"{CB_PREFIX}admin:users"))
-    kb.add(B("🚫 Баны", callback_data=f"{CB_PREFIX}admin:bans"))
-    kb.add(B("📄 Подписки", callback_data=f"{CB_PREFIX}admin:subs"))
-    kb.add(B("📊 Источники", callback_data=f"{CB_PREFIX}admin:sources"))
-    kb.add(B("💸 Выводы", callback_data=f"{CB_PREFIX}admin:withdrawals"))
-    kb.add(B("🔒 Безопасность и логи", callback_data=f"{CB_PREFIX}admin:security"))
-    kb.add(B("🔍 Поиск", callback_data=f"{CB_PREFIX}admin:search"))
-    kb.add(B("📡 Массовые операции", callback_data=f"{CB_PREFIX}admin:bulk"))
-    kb.add(B("📤 Экспорт", callback_data=f"{CB_PREFIX}admin:export"))
-    kb.add(B("📈 Статистика", callback_data=f"{CB_PREFIX}admin:stats"))
-    kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}admin:settings"))
-    kb.add(B("🔔 Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications"))
-    kb.add(B("📝 Жалобы", callback_data=f"{CB_PREFIX}admin:complaints"))
-    kb.add(B("🔄 Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray"))
-    kb.add(B("⏳ Временные профили", callback_data=f"{CB_PREFIX}admin:temp"))
+    kb.row_width = 2
     maintenance = storage.config.get("maintenance")
     maintenance_label = f"{'🟢' if maintenance else '🔴'} Тех. работы: {'Вкл' if maintenance else 'Выкл'}"
-    kb.add(B(maintenance_label, callback_data=f"{CB_PREFIX}admin:maintenance"))
+    kb.add(
+        B("🔑 Токен user-бота", callback_data=f"{CB_PREFIX}admin:user_token", style="primary"),
+        B("🔄 Перезапустить user-бота", callback_data=f"{CB_PREFIX}admin:start_bot", style="primary"),
+        B("📢 Канал подписки", callback_data=f"{CB_PREFIX}admin:channel", style="success"),
+        B("🆘 Админ поддержки", callback_data=f"{CB_PREFIX}admin:support", style="success"),
+        B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token", style="primary"),
+        B("🖼 Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media", style="success"),
+        B("🖼 Медиа меню", callback_data=f"{CB_PREFIX}admin:menu_media", style="success"),
+        B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq", style="success"),
+        B("🖥 Серверы", callback_data=f"{CB_PREFIX}admin:hosts", style="primary"),
+        B("📋 Планы и цены", callback_data=f"{CB_PREFIX}admin:plans", style="success"),
+        B("🎟 Промокоды", callback_data=f"{CB_PREFIX}admin:promos", style="success"),
+        B("🎁 Подарочные коды", callback_data=f"{CB_PREFIX}admin:codes", style="success"),
+        B("🎁 Выдать подписку", callback_data=f"{CB_PREFIX}admin:give", style="success"),
+        B("💳 Баланс пользователя", callback_data=f"{CB_PREFIX}admin:balance", style="primary"),
+        B("👤 Пользователи", callback_data=f"{CB_PREFIX}admin:users", style="success"),
+        B("🚫 Баны", callback_data=f"{CB_PREFIX}admin:bans", style="danger"),
+        B("📄 Подписки", callback_data=f"{CB_PREFIX}admin:subs", style="success"),
+        B("📊 Источники", callback_data=f"{CB_PREFIX}admin:sources", style="success"),
+        B("💸 Выводы", callback_data=f"{CB_PREFIX}admin:withdrawals", style="primary"),
+        B("🔒 Безопасность и логи", callback_data=f"{CB_PREFIX}admin:security", style="primary"),
+        B("🔍 Поиск", callback_data=f"{CB_PREFIX}admin:search", style="success"),
+        B("📡 Массовые операции", callback_data=f"{CB_PREFIX}admin:bulk", style="primary"),
+        B("📤 Экспорт", callback_data=f"{CB_PREFIX}admin:export", style="success"),
+        B("📈 Статистика", callback_data=f"{CB_PREFIX}admin:stats", style="success"),
+        B("⚙️ Настройки", callback_data=f"{CB_PREFIX}admin:settings", style="primary"),
+        B("🔔 Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications", style="success"),
+        B("📝 Жалобы", callback_data=f"{CB_PREFIX}admin:complaints", style="danger"),
+        B("🔄 Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray", style="primary"),
+        B("⏳ Временные профили", callback_data=f"{CB_PREFIX}admin:temp", style="success"),
+        B(maintenance_label, callback_data=f"{CB_PREFIX}admin:maintenance", style="danger" if not maintenance else "success"),
+    )
     return kb
 
 
@@ -4543,10 +4622,24 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                     f"Отправьте фото, GIF или видео, которое будет показываться при первом /start.")
             kb = K()
             if file_id:
-                kb.add(B("Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_welcome_media"))
-            kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+                kb.add(B("🗑 Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_welcome_media", style="danger"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_welcome_media")
+            return
+
+        if section == "menu_media":
+            file_id = storage.config.get("menu_media_file_id")
+            media_type = storage.config.get("menu_media_type", "не задано")
+            text = (f"<b>Медиа меню</b>\n"
+                    f"Текущее: {media_type if file_id else 'не задано'}\n\n"
+                    f"Отправьте фото, GIF или видео, которое будет показываться в меню бота (приветствие, проверка канала и т.д.).")
+            kb = K()
+            if file_id:
+                kb.add(B("🗑 Удалить медиа", callback_data=f"{CB_PREFIX}admin:del_menu_media", style="danger"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_menu_media")
             return
 
         if section == "faq":
@@ -4563,6 +4656,14 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             storage.config.pop("welcome_media_type", None)
             storage.save_config()
             bot.edit_message_text("Приветственное медиа удалено.", chat_id, c.message.message_id,
+                                  reply_markup=_admin_main_keyboard())
+            return
+
+        if section == "del_menu_media":
+            storage.config.pop("menu_media_file_id", None)
+            storage.config.pop("menu_media_type", None)
+            storage.save_config()
+            bot.edit_message_text("Медиа меню удалено.", chat_id, c.message.message_id,
                                   reply_markup=_admin_main_keyboard())
             return
 
