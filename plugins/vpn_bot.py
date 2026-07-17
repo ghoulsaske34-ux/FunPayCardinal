@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import socketserver
+import sqlite3
 import threading
 import time
 from urllib.parse import urlencode, quote
@@ -39,12 +40,7 @@ logger = logging.getLogger("FPC.vpn_bot")
 
 STORAGE_DIR = Path("storage/cache/vpn")
 EXPORTS_DIR = STORAGE_DIR / "exports"
-CONFIG_FILE = STORAGE_DIR / "config.json"
-USERS_FILE = STORAGE_DIR / "users.json"
-SUBS_FILE = STORAGE_DIR / "subscriptions.json"
-TRANS_FILE = STORAGE_DIR / "transactions.json"
-REFERRALS_FILE = STORAGE_DIR / "referrals.json"
-CONNECTIONS_FILE = STORAGE_DIR / "connections.json"
+DB_FILE = STORAGE_DIR / "vpn_bot.db"
 
 CB_PREFIX = "vpn:"
 
@@ -163,14 +159,16 @@ class VPNStorage:
     def __init__(self) -> None:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self.config: dict[str, Any] = self._load_json(CONFIG_FILE, self._default_config)
+        self._init_db()
+        self._migrate_json_to_sqlite()
+        self.config: dict[str, Any] = self._load_db("config", self._default_config)
         self._ensure_config_defaults(self.config, self._default_config())
         self._migrate_config()
-        self.users: dict[str, Any] = self._load_json(USERS_FILE, self._default_users)
-        self.subscriptions: dict[str, Any] = self._load_json(SUBS_FILE, self._default_subscriptions)
-        self.transactions: dict[str, Any] = self._load_json(TRANS_FILE, self._default_transactions)
-        self.referrals: dict[str, Any] = self._load_json(REFERRALS_FILE, self._default_referrals)
-        self.connections: dict[str, Any] = self._load_json(CONNECTIONS_FILE, self._default_connections)
+        self.users: dict[str, Any] = self._load_db("users", self._default_users)
+        self.subscriptions: dict[str, Any] = self._load_db("subscriptions", self._default_subscriptions)
+        self.transactions: dict[str, Any] = self._load_db("transactions", self._default_transactions)
+        self.referrals: dict[str, Any] = self._load_db("referrals", self._default_referrals)
+        self.connections: dict[str, Any] = self._load_db("connections", self._default_connections)
         self._decimalize_loaded()
 
     def _decimalize_loaded(self) -> None:
@@ -281,56 +279,87 @@ class VPNStorage:
     def _default_referrals(self) -> dict[str, Any]:
         return {"paid_invoices": [], "earnings": {}, "crypto_invoices": {}}
 
-    def _load_json(self, path: Path, default_factory) -> dict[str, Any]:
-        if not path.exists():
-            data = default_factory()
-            self._save_json(path, data)
-            return data
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            logger.exception("Ошибка загрузки %s", path)
-            try:
-                backup = path.with_name(f"{path.name}.corrupted.{int(time.time())}")
-                os.replace(path, backup)
-                logger.warning("Сохранён бэкап повреждённого файла: %s", backup)
-            except Exception:
-                pass
-            return default_factory()
+    def _init_db(self) -> None:
+        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    name TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            conn.commit()
 
-    def _save_json(self, path: Path, data: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+    def _load_db(self, name: str, default_factory) -> dict[str, Any]:
+        try:
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                row = conn.execute("SELECT data FROM kv WHERE name=?", (name,)).fetchone()
+            if row:
+                return json.loads(row[0])
+        except Exception:
+            logger.exception("Ошибка загрузки %s из SQLite", name)
+        return default_factory()
+
+    def _save_db(self, name: str, data: dict[str, Any]) -> None:
+        text = json.dumps(data, ensure_ascii=False, default=_json_default)
+        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (name, data, updated_at) VALUES (?, ?, ?)",
+                (name, text, time.time()),
+            )
+            conn.commit()
+
+    def _migrate_json_to_sqlite(self) -> None:
+        """Переносит старые JSON-файлы в SQLite при первом запуске."""
+        migration_map = {
+            STORAGE_DIR / "config.json": "config",
+            STORAGE_DIR / "users.json": "users",
+            STORAGE_DIR / "subscriptions.json": "subscriptions",
+            STORAGE_DIR / "transactions.json": "transactions",
+            STORAGE_DIR / "referrals.json": "referrals",
+            STORAGE_DIR / "connections.json": "connections",
+        }
+        for path, name in migration_map.items():
+            if not path.exists():
+                continue
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                    existing = conn.execute("SELECT 1 FROM kv WHERE name=?", (name,)).fetchone()
+                if existing:
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._save_db(name, data)
+                backup = path.with_name(f"{path.name}.migrated.{int(time.time())}")
+                os.replace(path, backup)
+                logger.info("Мигрирован %s -> SQLite (backup: %s)", path, backup)
+            except Exception:
+                logger.exception("Ошибка миграции %s", path)
 
     def save_config(self) -> None:
         with self._lock:
-            self._save_json(CONFIG_FILE, self.config)
+            self._save_db("config", self.config)
 
     def save_users(self) -> None:
         with self._lock:
-            self._save_json(USERS_FILE, self.users)
+            self._save_db("users", self.users)
 
     def save_subscriptions(self) -> None:
         with self._lock:
-            self._save_json(SUBS_FILE, self.subscriptions)
+            self._save_db("subscriptions", self.subscriptions)
 
     def save_transactions(self) -> None:
         with self._lock:
-            self._save_json(TRANS_FILE, self.transactions)
+            self._save_db("transactions", self.transactions)
 
     def save_connections(self) -> None:
         with self._lock:
-            self._save_json(CONNECTIONS_FILE, self.connections)
+            self._save_db("connections", self.connections)
 
     def save_referrals(self) -> None:
         with self._lock:
-            self._save_json(REFERRALS_FILE, self.referrals)
+            self._save_db("referrals", self.referrals)
 
     def add_crypto_invoice(self, invoice_id: str | int, user_id: int, amount: Decimal, asset: str, rub_amount: Decimal | None = None) -> None:
         self.referrals["crypto_invoices"][str(invoice_id)] = {
