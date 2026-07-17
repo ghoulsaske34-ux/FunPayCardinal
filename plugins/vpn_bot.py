@@ -983,6 +983,25 @@ class VPNStorage:
         level2 = [u for u in self.users.values() if u.get("referred_by") in level1_ids]
         return level1, level2
 
+    def broadcast_recipients(self, filter_type: str, source_value: str | None = None) -> list[int]:
+        out = []
+        for u in self.users.values():
+            uid = int(u.get("user_id", 0))
+            if not uid:
+                continue
+            if filter_type == "active":
+                if not any(s.get("user_id") == uid and not self._sub_from_dict(s).is_expired for s in self.subscriptions.get("subs", {}).values()):
+                    continue
+            elif filter_type == "expired":
+                subs = [s for s in self.subscriptions.get("subs", {}).values() if s.get("user_id") == uid]
+                if not subs or any(not self._sub_from_dict(s).is_expired for s in subs):
+                    continue
+            elif filter_type == "source":
+                if u.get("source") != source_value:
+                    continue
+            out.append(uid)
+        return out
+
     def add_complaint(self, user_id: int, text: str) -> str:
         cid = str(int(time.time() * 1000))
         complaints = self.config.setdefault("complaints", [])
@@ -2582,13 +2601,13 @@ class UserBot:
 
     def _keyboard_main(self) -> K:
         kb = K()
-        kb.add(B("Профиль", callback_data=f"{CB_PREFIX}profile"))
-        kb.add(B("Купить подписку", callback_data=f"{CB_PREFIX}buy"))
-        kb.add(B("Мои подписки", callback_data=f"{CB_PREFIX}my_subs"))
-        kb.add(B("Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
-        kb.add(B("Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
-        kb.add(B("Реферальная система", callback_data=f"{CB_PREFIX}referral"))
-        kb.add(B("Помощь", callback_data=f"{CB_PREFIX}help"))
+        kb.add(B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy"))
+        kb.add(B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs"))
+        kb.add(B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
+        kb.add(B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
+        kb.add(B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral"))
+        kb.add(B("❓ Помощь", callback_data=f"{CB_PREFIX}help"))
         return kb
 
     # ---- callbacks ----
@@ -3181,26 +3200,26 @@ class UserBot:
         ton = rates.get("TON") or "н/д"
         usd_text = _money_str(usd) if isinstance(usd, Decimal) else str(usd)
         ton_text = _money_str(ton) if isinstance(ton, Decimal) else str(ton)
-        text = (f"<b>Пополнение баланса</b>\n\n"
-                f"Текущий баланс: {_money_str(user['balance'])}₽\n"
-                f"Курс: USD {usd_text}₽, TON {ton_text}₽\n"
-                f"Telegram Stars: 1.3 Stars = 1₽\n\n"
+        text = (f"<b>💳 Пополнение баланса</b>\n\n"
+                f"💰 Текущий баланс: {_money_str(user['balance'])}₽\n"
+                f"📈 Курс: USD {usd_text}₽, TON {ton_text}₽\n"
+                f"⭐ Telegram Stars: 1.3 Stars = 1₽\n\n"
                 f"Выберите способ:")
         kb = K()
-        kb.add(B("Crypto Bot USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
-        kb.add(B("Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
-        kb.add(B("Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("💵 Crypto Bot USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
+        kb.add(B("🌐 Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
+        kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     def _amount_keyboard(self, callback_prefix: str, back_callback: str, asset: str | None = None) -> K:
         kb = K()
         for amount in [100, 200, 500, 1000]:
             cb = f"{callback_prefix}:{amount}" if asset is None else f"{callback_prefix}:{asset}:{amount}"
-            kb.add(B(f"{amount}₽", callback_data=cb))
+            kb.add(B(f"💵 {amount}₽", callback_data=cb))
         cb_custom = f"{callback_prefix}:custom" if asset is None else f"{callback_prefix}:{asset}:custom"
-        kb.add(B("Ввести своё", callback_data=cb_custom))
-        kb.add(B("Назад", callback_data=back_callback))
+        kb.add(B("✏️ Ввести своё", callback_data=cb_custom))
+        kb.add(B("◀️ Назад", callback_data=back_callback))
         return kb
 
     def _create_crypto_invoice(self, user_id: int, chat_id: int, message_id: int, asset: str, rub_amount: Decimal) -> None:
@@ -3437,44 +3456,44 @@ class UserBot:
         user = storage.get_user(user_id)
         subs = storage.active_subscriptions(user_id)
         lines = [
-            f"<b>Профиль</b>",
-            f"ID: <code>{user_id}</code>",
-            f"Баланс: {_money_str(user.get('balance', 0))}₽",
+            f"<b>🧑 Профиль</b>",
+            f"🆔 ID: <code>{user_id}</code>",
+            f"💰 Баланс: {_money_str(user.get('balance', 0))}₽",
         ]
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
-            lines.append(f"Активная подписка: {_escape(plan.name if plan else sub.plan_id)} (до {_format_time(sub.expires_at)})")
-            lines.append(f"Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
+            lines.append(f"📱 Активная подписка: {_escape(plan.name if plan else sub.plan_id)} (до {_format_time(sub.expires_at)})")
+            lines.append(f"📱 Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
         else:
-            lines.append("Активных подписок нет.")
+            lines.append("📱 Активных подписок нет.")
         if user.get("trial_used"):
-            lines.append("Пробный период использован.")
+            lines.append("🎁 Пробный период использован.")
         total_spent = _to_dec(user.get("total_spent", 0))
         total_months = user.get("total_months", 0)
         if total_spent or total_months:
-            lines.append(f"Всего потрачено: {_money_str(total_spent)}₽ (куплено {total_months} мес.)")
+            lines.append(f"💳 Всего потрачено: {_money_str(total_spent)}₽ (куплено {total_months} мес.)")
         earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
         total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
         if total_earn:
-            lines.append(f"Заработано с рефералов: {_money_str(total_earn)}₽")
+            lines.append(f"👥 Заработано с рефералов: {_money_str(total_earn)}₽")
         kb = K()
-        kb.add(B("История операций", callback_data=f"{CB_PREFIX}history"))
-        kb.add(B("Настройки", callback_data=f"{CB_PREFIX}settings"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("📜 История операций", callback_data=f"{CB_PREFIX}history"))
+        kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}settings"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self.bot.edit_message_text("\n".join(lines), chat_id, message_id, reply_markup=kb)
 
     def _history_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         txs = storage.get_transactions(user_id)
         if not txs:
-            text = "История операций пуста."
+            text = "📜 История операций пуста."
         else:
-            lines = ["<b>История операций</b> (последние 20):"]
+            lines = ["<b>📜 История операций</b> (последние 20):"]
             type_names = {
-                "deposit": "Пополнение",
-                "purchase": "Списание",
-                "referral": "Реферал",
-                "trial": "Пробный период",
+                "deposit": "💳 Пополнение",
+                "purchase": "🛒 Списание",
+                "referral": "👥 Реферал",
+                "trial": "🎁 Пробный период",
             }
             for tx in txs:
                 tname = type_names.get(tx.get("type"), tx.get("type", "?"))
@@ -3484,39 +3503,39 @@ class UserBot:
                 lines.append(f"{date} — {tname}: {amount:+.2f}₽ ({method})")
             text = "\n".join(lines)
         self.bot.edit_message_text(text, chat_id, message_id,
-                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}profile")))
+                                   reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile")))
 
     def _settings_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
         settings = user.get("settings", {"lang": "ru", "notifications": True, "auto_renew": True})
         lang = settings.get("lang", "ru")
-        notif = "Вкл" if settings.get("notifications", True) else "Выкл"
-        renew = "Вкл" if settings.get("auto_renew", True) else "Выкл"
-        text = (f"<b>Настройки</b>\n\n"
-                f"Язык: {lang.upper()}\n"
-                f"Уведомления: {notif}\n"
-                f"Автопродление: {renew}")
+        notif = "🟢 Вкл" if settings.get("notifications", True) else "🔴 Выкл"
+        renew = "🟢 Вкл" if settings.get("auto_renew", True) else "🔴 Выкл"
+        text = (f"<b>⚙️ Настройки</b>\n\n"
+                f"🌐 Язык: {lang.upper()}\n"
+                f"🔔 Уведомления: {notif}\n"
+                f"🔄 Автопродление: {renew}")
         kb = K()
-        kb.add(B(f"Язык: {lang.upper()}", callback_data=f"{CB_PREFIX}toggle:lang"))
-        kb.add(B(f"Уведомления: {notif}", callback_data=f"{CB_PREFIX}toggle:notifications"))
-        kb.add(B(f"Автопродление: {renew}", callback_data=f"{CB_PREFIX}toggle:auto_renew"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B(f"🌐 Язык: {lang.upper()}", callback_data=f"{CB_PREFIX}toggle:lang"))
+        kb.add(B(f"🔔 Уведомления: {notif}", callback_data=f"{CB_PREFIX}toggle:notifications"))
+        kb.add(B(f"🔄 Автопродление: {renew}", callback_data=f"{CB_PREFIX}toggle:auto_renew"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     def _help_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
-        text = "<b>Помощь</b>\n\nВыберите раздел:"
+        text = "<b>❓ Помощь</b>\n\nВыберите раздел:"
         kb = K()
-        kb.add(B("FAQ", callback_data=f"{CB_PREFIX}faq"))
-        kb.add(B("Поддержка", callback_data=f"{CB_PREFIX}support"))
-        kb.add(B("Пожаловаться", callback_data=f"{CB_PREFIX}complaint"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("📖 FAQ", callback_data=f"{CB_PREFIX}faq"))
+        kb.add(B("🆘 Поддержка", callback_data=f"{CB_PREFIX}support"))
+        kb.add(B("📝 Пожаловаться", callback_data=f"{CB_PREFIX}complaint"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     def _faq_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         faq = storage.config.get("faq_text")
         if not faq:
             faq = (
-                "<b>FAQ</b>\n\n"
+                "<b>📖 FAQ</b>\n\n"
                 "1. Как подключиться?\nПосле покупки подписки вам выдаётся конфигурация для вашего устройства.\n\n"
                 "2. Сколько устройств поддерживается?\n"
                 "Зависит от тарифа: Базовый — 1, Семейный — 5, Корпоративный — безлимит.\n\n"
@@ -3524,13 +3543,13 @@ class UserBot:
                 "4. Пробный период?\n3 дня, 1 устройство, один раз на аккаунт."
             )
         self.bot.edit_message_text(faq, chat_id, message_id,
-                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}help")))
+                                   reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
 
     def _support_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         support = storage.config.get("support", "@support")
-        text = f"<b>Поддержка</b>\n\nПо всем вопросам обращайтесь: {support}"
+        text = f"<b>🆘 Поддержка</b>\n\nПо всем вопросам обращайтесь: {support}"
         self.bot.edit_message_text(text, chat_id, message_id,
-                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}help")))
+                                   reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
 
     def _referral_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         bot_username = storage.config.get("bot_username", "")
@@ -3541,18 +3560,18 @@ class UserBot:
         earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
         ref_balance = _to_dec(user.get("referral_balance", 0))
         total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
-        text = (f"<b>Реферальная система</b>\n\n"
-                f"Ваша ссылка: {link}\n\n"
-                f"Рефералы 1 уровня: {len(level1)}\n"
-                f"Рефералы 2 уровня: {len(level2)}\n"
-                f"Заработано: {_money_str(total_earn)}₽\n"
-                f"  1 уровень (10%): {_money_str(earnings.get('level1', 0))}₽\n"
-                f"  2 уровень (5%): {_money_str(earnings.get('level2', 0))}₽\n\n"
-                f"Реферальный баланс: {_money_str(ref_balance)}₽\n"
+        text = (f"<b>👥 Реферальная система</b>\n\n"
+                f"🔗 Ваша ссылка: {link}\n\n"
+                f"👤 Рефералы 1 уровня: {len(level1)}\n"
+                f"👥 Рефералы 2 уровня: {len(level2)}\n"
+                f"💵 Заработано: {_money_str(total_earn)}₽\n"
+                f"  1️⃣ уровень (10%): {_money_str(earnings.get('level1', 0))}₽\n"
+                f"  2️⃣ уровень (5%): {_money_str(earnings.get('level2', 0))}₽\n\n"
+                f"💰 Реферальный баланс: {_money_str(ref_balance)}₽\n"
                 f"Минимум для вывода: 3000₽")
         kb = K()
-        kb.add(B("Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("💸 Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     # ---- lifecycle ----
@@ -3649,7 +3668,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if not is_admin(cardinal, m.from_user.id):
             bot.send_message(m.chat.id, "Нет доступа.")
             return
-        bot.send_message(m.chat.id, "<b>VPN Admin</b>", reply_markup=_admin_main_keyboard())
+        bot.send_message(m.chat.id, "<b>🛡 VPN Admin</b>\n\nВыберите раздел:", reply_markup=_admin_main_keyboard())
 
     tg.msg_handler(cmd_vpnadmin, commands=["vpnadmin"])
 
@@ -4126,41 +4145,50 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         if filter_type == "source" and "source_value" not in state["data"]:
             state["data"]["source_value"] = m.text.strip()
             tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_bulk_text", state["data"])
-            bot.send_message(m.chat.id, "Введите текст рассылки:")
+            bot.send_message(m.chat.id, "✏️ Введите текст рассылки:")
             return
-        source_value = state["data"].get("source_value")
         text = m.text.strip()
         if op != "broadcast" or not text:
             bot.send_message(m.chat.id, "Ошибка рассылки.")
             tg.clear_state(m.chat.id, m.from_user.id)
             return
+        state["data"]["text"] = text
+        tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_bulk_photo", state["data"])
+        bot.send_message(m.chat.id, "📎 Приложите фото к рассылке или отправьте '-' / 'пропустить' для отправки только текста:")
+
+    def state_admin_bulk_photo(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        text = state["data"].get("text", "")
+        filter_type = state["data"].get("filter_type")
+        source_value = state["data"].get("source_value")
+        photo_file_id = None
+        if m.photo:
+            photo_file_id = m.photo[-1].file_id
+        elif m.text and m.text.strip() in ("-", "пропустить", "skip"):
+            photo_file_id = None
+        else:
+            bot.send_message(m.chat.id, "📎 Приложите фото или отправьте '-' / 'пропустить'.")
+            return
         if not _user_bot_instance:
             bot.send_message(m.chat.id, "User-бот не запущен. Сначала запустите его в /vpnadmin.")
             tg.clear_state(m.chat.id, m.from_user.id)
             return
+        recipients = storage.broadcast_recipients(filter_type, source_value)
         sent = 0
         failed = 0
-        now = time.time()
-        for u in storage.users.values():
-            uid = int(u.get("user_id", 0))
-            if not uid:
-                continue
-            if filter_type == "active":
-                if not any(s.get("user_id") == uid and not storage._sub_from_dict(s).is_expired for s in storage.subscriptions.get("subs", {}).values()):
-                    continue
-            elif filter_type == "expired":
-                subs = [s for s in storage.subscriptions.get("subs", {}).values() if s.get("user_id") == uid]
-                if not subs or any(not storage._sub_from_dict(s).is_expired for s in subs):
-                    continue
-            elif filter_type == "source":
-                if u.get("source") != source_value:
-                    continue
+        safe_text = _escape(text)
+        for uid in recipients:
             try:
-                _user_bot_instance.bot.send_message(uid, _escape(text), parse_mode="HTML")
+                if photo_file_id:
+                    _user_bot_instance.bot.send_photo(uid, photo=photo_file_id, caption=safe_text, parse_mode="HTML")
+                else:
+                    _user_bot_instance.bot.send_message(uid, safe_text, parse_mode="HTML")
                 sent += 1
             except Exception:
                 failed += 1
-        bot.send_message(m.chat.id, f"Рассылка завершена. Отправлено: {sent}, не удалось: {failed}.")
+        bot.send_message(m.chat.id, f"✅ Рассылка завершена. Отправлено: {sent}, не удалось: {failed}.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
     def _parse_host_line(parts: list[str], host_id: str) -> ServerConfig | None:
@@ -4264,6 +4292,47 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             bot.send_message(m.chat.id, "Введите числа.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
+    def state_admin_user_msg_text(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        text = m.text.strip()
+        if not text:
+            bot.send_message(m.chat.id, "Текст не может быть пустым.")
+            return
+        state["data"]["text"] = text
+        tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_user_msg_photo", state["data"])
+        bot.send_message(m.chat.id, "📎 Приложите фото или отправьте '-' / 'пропустить' для отправки только текста:")
+
+    def state_admin_user_msg_photo(m: Message):
+        state = tg.get_state(m.chat.id, m.from_user.id)
+        if not state:
+            return
+        target_uid = state["data"].get("target_uid")
+        text = state["data"].get("text", "")
+        photo_file_id = None
+        if m.photo:
+            photo_file_id = m.photo[-1].file_id
+        elif m.text and m.text.strip() in ("-", "пропустить", "skip"):
+            photo_file_id = None
+        else:
+            bot.send_message(m.chat.id, "📎 Приложите фото или отправьте '-' / 'пропустить'.")
+            return
+        if not _user_bot_instance:
+            bot.send_message(m.chat.id, "User-бот не запущен. Сначала запустите его в /vpnadmin.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        try:
+            if photo_file_id:
+                _user_bot_instance.bot.send_photo(target_uid, photo=photo_file_id, caption=_escape(text), parse_mode="HTML")
+            else:
+                _user_bot_instance.bot.send_message(target_uid, _escape(text), parse_mode="HTML")
+            bot.send_message(m.chat.id, "✅ Сообщение отправлено.")
+        except Exception:
+            logger.exception("Failed to send message to user %s", target_uid)
+            bot.send_message(m.chat.id, "❌ Не удалось отправить сообщение пользователю.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
     tg.msg_handler(state_set_token, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_user_token"))
     tg.msg_handler(state_set_channel, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_channel"))
     tg.msg_handler(state_set_support, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_support"))
@@ -4302,6 +4371,9 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_bulk_extend, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_extend"))
     tg.msg_handler(state_admin_bulk_balance, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_balance"))
     tg.msg_handler(state_admin_bulk_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_text"))
+    tg.msg_handler(state_admin_bulk_photo, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_bulk_photo"), content_types=["photo", "text"])
+    tg.msg_handler(state_admin_user_msg_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_user_msg_text"))
+    tg.msg_handler(state_admin_user_msg_photo, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_user_msg_photo"), content_types=["photo", "text"])
 
     token = storage.config.get("user_bot_token", "")
     if token:
@@ -4313,36 +4385,37 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
 
 def _admin_main_keyboard() -> K:
     kb = K()
-    kb.add(B("Токен user-бота", callback_data=f"{CB_PREFIX}admin:user_token"))
-    kb.add(B("Перезапустить user-бота", callback_data=f"{CB_PREFIX}admin:start_bot"))
-    kb.add(B("Канал подписки", callback_data=f"{CB_PREFIX}admin:channel"))
-    kb.add(B("Админ поддержки", callback_data=f"{CB_PREFIX}admin:support"))
-    kb.add(B("Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token"))
-    kb.add(B("Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media"))
-    kb.add(B("Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq"))
-    kb.add(B("Серверы", callback_data=f"{CB_PREFIX}admin:hosts"))
-    kb.add(B("Планы и цены", callback_data=f"{CB_PREFIX}admin:plans"))
-    kb.add(B("Промокоды", callback_data=f"{CB_PREFIX}admin:promos"))
-    kb.add(B("Подарочные коды", callback_data=f"{CB_PREFIX}admin:codes"))
-    kb.add(B("Выдать подписку", callback_data=f"{CB_PREFIX}admin:give"))
-    kb.add(B("Баланс пользователя", callback_data=f"{CB_PREFIX}admin:balance"))
-    kb.add(B("Пользователи", callback_data=f"{CB_PREFIX}admin:users"))
-    kb.add(B("Баны", callback_data=f"{CB_PREFIX}admin:bans"))
-    kb.add(B("Подписки", callback_data=f"{CB_PREFIX}admin:subs"))
-    kb.add(B("Источники", callback_data=f"{CB_PREFIX}admin:sources"))
-    kb.add(B("Выводы", callback_data=f"{CB_PREFIX}admin:withdrawals"))
-    kb.add(B("Безопасность и логи", callback_data=f"{CB_PREFIX}admin:security"))
-    kb.add(B("Поиск", callback_data=f"{CB_PREFIX}admin:search"))
-    kb.add(B("Массовые операции", callback_data=f"{CB_PREFIX}admin:bulk"))
-    kb.add(B("Экспорт", callback_data=f"{CB_PREFIX}admin:export"))
-    kb.add(B("Статистика", callback_data=f"{CB_PREFIX}admin:stats"))
-    kb.add(B("Настройки", callback_data=f"{CB_PREFIX}admin:settings"))
-    kb.add(B("Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications"))
-    kb.add(B("Жалобы", callback_data=f"{CB_PREFIX}admin:complaints"))
-    kb.add(B("Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray"))
-    kb.add(B("Временные профили", callback_data=f"{CB_PREFIX}admin:temp"))
-    maintenance = "Вкл" if storage.config.get("maintenance") else "Выкл"
-    kb.add(B(f"Тех. работы: {maintenance}", callback_data=f"{CB_PREFIX}admin:maintenance"))
+    kb.add(B("🔑 Токен user-бота", callback_data=f"{CB_PREFIX}admin:user_token"))
+    kb.add(B("🔄 Перезапустить user-бота", callback_data=f"{CB_PREFIX}admin:start_bot"))
+    kb.add(B("📢 Канал подписки", callback_data=f"{CB_PREFIX}admin:channel"))
+    kb.add(B("🆘 Админ поддержки", callback_data=f"{CB_PREFIX}admin:support"))
+    kb.add(B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token"))
+    kb.add(B("🖼 Приветственное медиа", callback_data=f"{CB_PREFIX}admin:welcome_media"))
+    kb.add(B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq"))
+    kb.add(B("🖥 Серверы", callback_data=f"{CB_PREFIX}admin:hosts"))
+    kb.add(B("📋 Планы и цены", callback_data=f"{CB_PREFIX}admin:plans"))
+    kb.add(B("🎟 Промокоды", callback_data=f"{CB_PREFIX}admin:promos"))
+    kb.add(B("🎁 Подарочные коды", callback_data=f"{CB_PREFIX}admin:codes"))
+    kb.add(B("🎁 Выдать подписку", callback_data=f"{CB_PREFIX}admin:give"))
+    kb.add(B("💳 Баланс пользователя", callback_data=f"{CB_PREFIX}admin:balance"))
+    kb.add(B("👤 Пользователи", callback_data=f"{CB_PREFIX}admin:users"))
+    kb.add(B("🚫 Баны", callback_data=f"{CB_PREFIX}admin:bans"))
+    kb.add(B("📄 Подписки", callback_data=f"{CB_PREFIX}admin:subs"))
+    kb.add(B("📊 Источники", callback_data=f"{CB_PREFIX}admin:sources"))
+    kb.add(B("💸 Выводы", callback_data=f"{CB_PREFIX}admin:withdrawals"))
+    kb.add(B("🔒 Безопасность и логи", callback_data=f"{CB_PREFIX}admin:security"))
+    kb.add(B("🔍 Поиск", callback_data=f"{CB_PREFIX}admin:search"))
+    kb.add(B("📡 Массовые операции", callback_data=f"{CB_PREFIX}admin:bulk"))
+    kb.add(B("📤 Экспорт", callback_data=f"{CB_PREFIX}admin:export"))
+    kb.add(B("📈 Статистика", callback_data=f"{CB_PREFIX}admin:stats"))
+    kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}admin:settings"))
+    kb.add(B("🔔 Уведомления админу", callback_data=f"{CB_PREFIX}admin:notifications"))
+    kb.add(B("📝 Жалобы", callback_data=f"{CB_PREFIX}admin:complaints"))
+    kb.add(B("🔄 Синхронизация Xray", callback_data=f"{CB_PREFIX}admin:sync_xray"))
+    kb.add(B("⏳ Временные профили", callback_data=f"{CB_PREFIX}admin:temp"))
+    maintenance = storage.config.get("maintenance")
+    maintenance_label = f"{'🟢' if maintenance else '🔴'} Тех. работы: {'Вкл' if maintenance else 'Выкл'}"
+    kb.add(B(maintenance_label, callback_data=f"{CB_PREFIX}admin:maintenance"))
     return kb
 
 
@@ -4351,7 +4424,7 @@ def _admin_plans_keyboard(action: str) -> K:
     for pid, plan in storage.plans().items():
         if pid == "trial":
             continue
-        kb.add(B(plan.name, callback_data=f"{CB_PREFIX}{action}:{pid}"))
+        kb.add(B(f"📋 {plan.name}", callback_data=f"{CB_PREFIX}{action}:{pid}"))
     return kb
 
 
@@ -4359,7 +4432,7 @@ def _admin_durations_keyboard(plan_id: str, action: str) -> K:
     plan = storage.plan(plan_id)
     kb = K()
     for months in DURATIONS:
-        kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}{action}:{plan_id}:{months}"))
+        kb.add(B(f"🗓 {months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}{action}:{plan_id}:{months}"))
     return kb
 
 
@@ -4390,18 +4463,19 @@ def _admin_user_card(target_uid: int) -> tuple[str, K]:
     kb = K()
     for s in subs:
         kb.add(B(f"Подписка #{s.get('sub_id')}", callback_data=f"{CB_PREFIX}admin_sub:{s.get('sub_id')}"))
-    ban_label = "Разблокировать" if user.get("is_banned") else "Заблокировать"
+    ban_label = "🟢 Разблокировать" if user.get("is_banned") else "🔴 Заблокировать"
     kb.add(B(ban_label, callback_data=f"{CB_PREFIX}admin_ban:{target_uid}"))
-    kb.add(B("История платежей", callback_data=f"{CB_PREFIX}admin_user_payments:{target_uid}"))
-    kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
+    kb.add(B("💳 История платежей", callback_data=f"{CB_PREFIX}admin_user_payments:{target_uid}"))
+    kb.add(B("✉️ Написать пользователю", callback_data=f"{CB_PREFIX}admin_user_msg:{target_uid}"))
+    kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main"))
     return "\n".join(lines), kb
 
 
 def _admin_bulk_filter_keyboard(op: str) -> K:
     kb = K()
-    for key, label in [("all", "Всем"), ("active", "С активной подпиской"), ("expired", "С истёкшей"), ("source", "По источнику")]:
+    for key, label in [("all", "🌍 Всем"), ("active", "✅ С активной подпиской"), ("expired", "❌ С истёкшей"), ("source", "🏷 По источнику")]:
         kb.add(B(label, callback_data=f"{CB_PREFIX}admin_bulk_filter:{op}:{key}"))
-    kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:bulk"))
+    kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:bulk"))
     return kb
 
 
@@ -4421,7 +4495,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         return
 
     if action == "admin" and (not args or args[0] == "main"):
-        bot.edit_message_text("<b>VPN Admin</b>", chat_id, c.message.message_id, reply_markup=_admin_main_keyboard())
+        bot.edit_message_text("<b>🛡 VPN Admin</b>\n\nВыберите раздел:", chat_id, c.message.message_id, reply_markup=_admin_main_keyboard())
         return
 
     if action == "admin":
@@ -5052,7 +5126,13 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                 lines.append(f"{_format_time(t.get('created_at', 0))} — {t.get('type')} {t.get('amount', 0):+.2f}₽ ({t.get('method', '')})")
             text = "\n".join(lines)
         bot.edit_message_text(text, chat_id, c.message.message_id,
-                              reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin_user:{target_uid}")))
+                              reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin_user:{target_uid}")))
+        return
+
+    if action == "admin_user_msg" and len(args) >= 1:
+        target_uid = int(args[0])
+        tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}admin_user_msg_text", {"target_uid": target_uid})
+        bot.send_message(chat_id, "✏️ Введите текст сообщения для пользователя:")
         return
 
     if action == "admin_bulk" and len(args) >= 1:
