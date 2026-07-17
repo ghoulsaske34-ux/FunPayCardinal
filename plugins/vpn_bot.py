@@ -2604,19 +2604,14 @@ class UserBot:
         return param, None
 
     def _send_welcome(self, user_id: int, chat_id: int) -> None:
-        """Отправляет приветственное медиа и главное/пробное меню."""
+        """Отправляет приветственное меню."""
         user = storage.get_user(user_id)
         text = storage.config.get("welcome", "Добро пожаловать!")
         if not user.get("trial_used"):
-            kb = K()
-            kb.add(
-                B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"),
-                B("🏠 Главное меню", callback_data=f"{CB_PREFIX}main", style="primary"),
-            )
             caption = f"{text}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
-            self._send_menu_message(chat_id, caption, reply_markup=kb, prefer_welcome_media=True, media_key="welcome")
         else:
-            self._send_menu_message(chat_id, f"{text}\n\nВыберите раздел:", reply_markup=self._keyboard_main(), prefer_welcome_media=True, media_key="main")
+            caption = f"{text}\n\nВыберите раздел:"
+        self._send_menu_message(chat_id, caption, reply_markup=self._keyboard_main(user_id), prefer_welcome_media=True, media_key="welcome")
 
     def _check_maintenance(self, user_id: int, chat_id: int) -> bool:
         if storage.is_banned(user_id):
@@ -2761,9 +2756,11 @@ class UserBot:
             return f"https://t.me/{channel_id.lstrip('@')}"
         return None
 
-    def _keyboard_main(self) -> K:
+    def _keyboard_main(self, user_id: int | None = None) -> K:
         kb = K()
         kb.row_width = 2
+        if user_id is not None and not storage.get_user(user_id).get("trial_used"):
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
         kb.add(
             B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="success"),
             B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
@@ -2774,6 +2771,22 @@ class UserBot:
             B("❓ Помощь", callback_data=f"{CB_PREFIX}help", style="success"),
         )
         return kb
+
+    def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        """Отправляет главное меню с медиа и кнопкой пробного периода, если он не использован."""
+        user = storage.get_user(user_id)
+        welcome = storage.config.get("welcome", "Добро пожаловать!")
+        if not user.get("trial_used"):
+            text = f"{welcome}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
+        else:
+            text = f"{welcome}\n\nВыберите раздел:"
+        kb = self._keyboard_main(user_id)
+        if message_id is not None:
+            try:
+                self.bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+        self._send_menu_message(chat_id, text, reply_markup=kb, media_key="main")
 
     # ---- callbacks ----
     def _handle_callback(self, c: CallbackQuery) -> None:
@@ -2799,7 +2812,7 @@ class UserBot:
             return
 
         if action == "main":
-            self._edit_message("Главное меню:", chat_id, c.message.message_id, reply_markup=self._keyboard_main())
+            self._main_menu(user_id, chat_id, c.message.message_id)
             return
 
         if action == "profile":
@@ -3031,7 +3044,7 @@ class UserBot:
         user = storage.get_user(user_id)
         if user.get("trial_used"):
             self._edit_message("Пробный период уже использован.", chat_id, message_id,
-                                       reply_markup=self._keyboard_main())
+                                       reply_markup=self._keyboard_main(user_id))
             return
         sub = storage.create_subscription(user_id, "trial", 0, is_trial=True)
         user["trial_used"] = True
@@ -3039,7 +3052,7 @@ class UserBot:
         storage._add_transaction(user_id, 0, "trial", "trial", f"sub_{sub.sub_id}")
         XrayAPI.add_or_update_client(sub)
         self._edit_message(f"Пробный период активирован!\n{format_subscription(sub)}", chat_id, message_id,
-                                   reply_markup=self._keyboard_main())
+                                   reply_markup=self._keyboard_main(user_id))
 
     def _buy_menu(self, chat_id: int, message_id: int) -> None:
         hosts = storage.list_hosts()
