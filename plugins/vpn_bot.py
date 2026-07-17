@@ -42,7 +42,7 @@ except Exception:
     HAS_FASTAPI = False
 
 import telebot
-from telebot.types import InlineKeyboardMarkup as _InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton, Message, CallbackQuery, LabeledPrice
+from telebot.types import InlineKeyboardMarkup as _InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, WebAppInfo
 
 
 class B(_InlineKeyboardButton):
@@ -4263,7 +4263,7 @@ class UserBot:
             kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("🌐 Личный кабинет", web_app={"url": mini_url}, style="primary"))
+            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
         kb.add(
             B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="success"),
             B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
