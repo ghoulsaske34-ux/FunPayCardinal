@@ -943,12 +943,28 @@ class VPNStorage:
         return count
 
     def bulk_add_balance(self, amount: float) -> int:
-        count = 0
-        for u in self.users.values():
-            uid = int(u.get("user_id", 0))
-            if uid:
-                self.add_balance(uid, amount, "bulk", "admin", notify=False)
+        with self._lock:
+            ts = str(int(time.time()))
+            count = 0
+            for u in self.users.values():
+                uid = int(u.get("user_id", 0))
+                if not uid:
+                    continue
+                u["balance"] = round(u.get("balance", 0.0) + amount, 2)
+                tid = str(self.transactions["next_id"])
+                self.transactions["next_id"] += 1
+                self.transactions["txs"][tid] = {
+                    "id": tid,
+                    "user_id": uid,
+                    "amount": amount,
+                    "type": "deposit",
+                    "method": "bulk",
+                    "payload": f"admin:{ts}:{uid}",
+                    "created_at": time.time(),
+                }
                 count += 1
+            self.save_users()
+            self.save_transactions()
         return count
 
     def export_csv(self, kind: str) -> Path:
