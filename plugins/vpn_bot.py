@@ -2647,7 +2647,7 @@ class UserBot:
             pass
         with self._state_lock:
             self._channel_cache[user_id] = (False, now)
-        kb = K()
+        kb = K(row_width=1)
         invite = self._get_channel_invite(channel_id)
         if invite:
             kb.add(B("👉 Перейти в канал", url=invite, style="success"))
