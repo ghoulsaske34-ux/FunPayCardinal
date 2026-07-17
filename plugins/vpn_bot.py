@@ -2622,7 +2622,7 @@ class UserBot:
         except Exception:
             logger.exception("Не удалось отправить приветственное медиа")
 
-    def _channel_check(self, user_id: int, chat_id: int, force: bool = False) -> bool:
+    def _channel_check(self, user_id: int, chat_id: int, force: bool = False, message_id: int | None = None) -> bool:
         channel_id = storage.config.get("channel_id", "")
         if not channel_id:
             return True
@@ -2632,21 +2632,29 @@ class UserBot:
                 self._channel_cache.pop(user_id, None)
             cached = self._channel_cache.get(user_id)
             if cached and (now - cached[1]) < 60:
+                if cached[0]:
+                    self._on_channel_ok(user_id, chat_id, message_id)
+                else:
+                    self._prompt_channel(user_id, chat_id, message_id)
                 return cached[0]
         try:
             member = self.bot.get_chat_member(channel_id, user_id)
             ok = member.status in ("member", "administrator", "creator")
-            if ok:
-                user = storage.get_user(user_id)
-                user["channel_ok"] = True
-                storage.update_user(user)
             with self._state_lock:
                 self._channel_cache[user_id] = (ok, now)
+            if ok:
+                self._on_channel_ok(user_id, chat_id, message_id)
+            else:
+                self._prompt_channel(user_id, chat_id, message_id)
             return ok
         except Exception:
-            pass
+            logger.exception("Ошибка проверки подписки на канал")
         with self._state_lock:
             self._channel_cache[user_id] = (False, now)
+        self._prompt_channel(user_id, chat_id, message_id)
+        return False
+
+    def _channel_keyboard(self, channel_id: str) -> K:
         kb = K(row_width=1)
         invite = self._get_channel_invite(channel_id)
         if invite:
@@ -2657,9 +2665,30 @@ class UserBot:
                 support_user = support.lstrip("@")
                 kb.add(B("🆘 Написать админу", url=f"https://t.me/{support_user}", style="danger"))
         kb.add(B("🔄 Проверить подписку", callback_data=f"{CB_PREFIX}check_channel", style="primary"))
+        return kb
+
+    def _prompt_channel(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        channel_id = storage.config.get("channel_id", "")
         channel_text = f"<b>{_escape(channel_id)}</b>" if channel_id else "наш канал"
-        self._send_menu_message(chat_id, f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>", reply_markup=kb, prefer_welcome_media=False)
-        return False
+        text = f"<b>📢 Для использования бота необходимо подписаться на {channel_text}.</b>"
+        kb = self._channel_keyboard(channel_id)
+        if message_id is not None:
+            try:
+                self.bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+        self._send_menu_message(chat_id, text, reply_markup=kb, prefer_welcome_media=False)
+
+    def _on_channel_ok(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        user = storage.get_user(user_id)
+        user["channel_ok"] = True
+        storage.update_user(user)
+        if message_id is not None:
+            try:
+                self.bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+        self._send_welcome(user_id, chat_id)
 
     def _get_channel_invite(self, channel_id: str) -> str | None:
         """Пытается получить рабочую ссылку-приглашение на канал."""
@@ -2718,7 +2747,7 @@ class UserBot:
 
         if self._check_maintenance(user_id, chat_id):
             return
-        if not self._channel_check(user_id, chat_id):
+        if not self._channel_check(user_id, chat_id, message_id=c.message.message_id):
             return
 
         if action == "main":
@@ -2761,11 +2790,10 @@ class UserBot:
             return
 
         if action == "check_channel":
-            if self._channel_check(user_id, chat_id, force=True):
-                self.bot.answer_callback_query(c.id, "Подписка подтверждена!")
-                self._send_welcome(user_id, chat_id)
+            if self._channel_check(user_id, chat_id, force=True, message_id=c.message.message_id):
+                self.bot.answer_callback_query(c.id, "✅ Подписка подтверждена!", show_alert=True)
             else:
-                self.bot.answer_callback_query(c.id, "Вы ещё не подписались на канал.")
+                self.bot.answer_callback_query(c.id, "❌ Подписка не найдена. Нажмите кнопку перехода и попробуйте снова.", show_alert=True)
             return
 
         if action == "trial":
