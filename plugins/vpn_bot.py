@@ -290,6 +290,7 @@ class VPNStorage:
             "hosts": {},
             "default_host_id": "main",
             "expired_cleanup_days": 5,
+            "autorenew_days_before": 1,
             "referral_first_discount": 0,
             "plans": copy.deepcopy(DEFAULT_PLANS),
             "promocodes": {},
@@ -429,6 +430,17 @@ class VPNStorage:
             CREATE INDEX IF NOT EXISTS idx_pending_payments_user_id ON pending_payments(user_id);
             CREATE INDEX IF NOT EXISTS idx_pending_payments_status ON pending_payments(status);
             CREATE INDEX IF NOT EXISTS idx_pending_payments_method_status ON pending_payments(method, status);
+
+            CREATE TABLE IF NOT EXISTS processed_payments (
+                payment_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                method TEXT,
+                amount TEXT,
+                payload TEXT,
+                created_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_processed_payments_user_id ON processed_payments(user_id);
+            CREATE INDEX IF NOT EXISTS idx_processed_payments_method ON processed_payments(method);
         """
         with self._lock:
             self._db_conn.executescript(schema)
@@ -824,6 +836,22 @@ class VPNStorage:
             self._db_conn.execute(
                 "UPDATE pending_payments SET status = ? WHERE payment_id = ?",
                 (status, payment_id),
+            )
+            self._db_conn.commit()
+
+    def is_payment_processed(self, payment_id: str) -> bool:
+        with self._lock:
+            cur = self._db_conn.execute(
+                "SELECT 1 FROM processed_payments WHERE payment_id = ? LIMIT 1",
+                (payment_id,),
+            )
+            return cur.fetchone() is not None
+
+    def mark_payment_processed(self, payment_id: str, user_id: int, method: str, amount: Decimal, payload: str = "") -> None:
+        with self._lock:
+            self._db_conn.execute(
+                "INSERT OR IGNORE INTO processed_payments (payment_id, user_id, method, amount, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (payment_id, int(user_id), method, str(amount), payload or "", time.time()),
             )
             self._db_conn.commit()
 
@@ -1901,12 +1929,63 @@ class SubscriptionScheduler:
                 del storage.subscriptions["subs"][sub_id]
                 storage.save_subscriptions()
                 continue
+        renew_window = max(0, int(storage.config.get("autorenew_days_before", 1))) * 86400
+        retry_interval = 6 * 3600
         for sub_id, data in list(storage.subscriptions["subs"].items()):
             sub = storage._sub_from_dict(data)
             if not sub.active:
                 continue
             remaining = sub.expires_at - now
             warnings = sub.warnings or {}
+            # early auto-renewal or renewal at expiry
+            if remaining <= renew_window:
+                user = storage.get_user(sub.user_id)
+                auto_renew = user.get("settings", {}).get("auto_renew", True) if user else True
+                if not auto_renew:
+                    if remaining <= 0:
+                        sub.active = False
+                        data["active"] = False
+                        storage.save_subscriptions()
+                        XrayAPI.remove_client(sub)
+                        self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Пополните баланс и продлите.")
+                    continue
+                last_attempt = warnings.get("renewal_attempted_at", 0)
+                if remaining > 0 and (now - last_attempt) < retry_interval:
+                    continue
+                # try renew same plan/months, fallback to 1 month
+                plan = storage.plan(sub.plan_id)
+                months = sub.months if sub.months else 1
+                price = storage.price(sub.plan_id, months) if sub.months else None
+                if price is None:
+                    months = 1
+                    price = storage.price(sub.plan_id, months)
+                if price is None or (user and user["balance"] < price):
+                    warnings["renewal_attempted_at"] = now
+                    if remaining > 0:
+                        warnings["renewal_insufficient"] = True
+                    data["warnings"] = warnings
+                    storage.save_subscriptions()
+                    if remaining <= 0:
+                        sub.active = False
+                        data["active"] = False
+                        storage.save_subscriptions()
+                        XrayAPI.remove_client(sub)
+                        self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Недостаточно средств для автопродления.")
+                    continue
+                # perform renewal
+                user["balance"] = _money_round(user["balance"] - price)
+                storage.update_user(user)
+                storage._add_transaction(sub.user_id, -price, "purchase", "autorenew", f"sub:{sub.sub_id}")
+                base = max(now, sub.expires_at) if remaining <= 0 else sub.expires_at
+                sub.expires_at = base + months * 30 * 86400
+                sub.warnings = {}
+                sub.active = True
+                storage.update_subscription(sub)
+                storage.process_referral_rewards(sub.user_id, price)
+                storage.add_purchase_stats(sub.user_id, price, months)
+                XrayAPI.add_or_update_client(sub)
+                self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {_money_str(price)}₽.")
+                continue
             # 24h warning
             if remaining <= 86400 and remaining > 3600 and not warnings.get("24h"):
                 warnings["24h"] = True
@@ -1920,42 +1999,6 @@ class SubscriptionScheduler:
                 data["warnings"] = warnings
                 storage.save_subscriptions()
                 self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекает через час. Пополните баланс.")
-            # expired or renewal
-            elif remaining <= 0 and sub.active:
-                user = storage.get_user(sub.user_id)
-                if not user or not user.get("settings", {}).get("auto_renew", True):
-                    sub.active = False
-                    data["active"] = False
-                    storage.save_subscriptions()
-                    XrayAPI.remove_client(sub)
-                    self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Пополните баланс и продлите.")
-                    continue
-                # try renew same plan/months, fallback to 1 month
-                plan = storage.plan(sub.plan_id)
-                months = sub.months if sub.months else 1
-                price = storage.price(sub.plan_id, months) if sub.months else None
-                if price is None:
-                    # try 1 month price
-                    months = 1
-                    price = storage.price(sub.plan_id, months)
-                if price is None or user["balance"] < price:
-                    sub.active = False
-                    data["active"] = False
-                    storage.save_subscriptions()
-                    XrayAPI.remove_client(sub)
-                    self._notify(sub.user_id, f"Подписка #{sub.sub_id} истекла. Недостаточно средств для автопродления.")
-                    continue
-                user["balance"] = _money_round(user["balance"] - price)
-                storage.update_user(user)
-                storage._add_transaction(sub.user_id, -price, "purchase", "autorenew", f"sub:{sub.sub_id}")
-                sub.expires_at = sub.expires_at + months * 30 * 86400
-                sub.warnings = {}
-                sub.active = True
-                storage.update_subscription(sub)
-                storage.process_referral_rewards(sub.user_id, price)
-                storage.add_purchase_stats(sub.user_id, price, months)
-                XrayAPI.add_or_update_client(sub)
-                self._notify(sub.user_id, f"Подписка #{sub.sub_id} автоматически продлена на {months} мес. Списано {_money_str(price)}₽.")
 
     def stop(self) -> None:
         self._stop.set()
@@ -2519,6 +2562,26 @@ class TempProfileServer:
 class StarsPayment:
     """Реальная отправка инвойса Telegram Stars."""
 
+    STARS_RATE = Decimal("1.3")  # 1 Star ≈ 1.3₽
+
+    @staticmethod
+    def _rub_to_stars(rub_amount: Decimal) -> int:
+        return int((rub_amount * StarsPayment.STARS_RATE).to_integral_value(rounding=ROUND_HALF_UP))
+
+    @staticmethod
+    def _api_call(bot, method: str, params: dict[str, Any]) -> Any | None:
+        url = f"https://api.telegram.org/bot{bot.token}/{method}"
+        try:
+            r = requests.post(url, json=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result")
+            logger.error("Telegram API %s failed: %s", method, data.get("description"))
+        except Exception:
+            logger.exception("Telegram API %s failed", method)
+        return None
+
     @staticmethod
     def send_invoice(bot, chat_id: int, user_id: int, amount: int, title: str = "Пополнение", description: str = "Баланс VPN-бота", rub_amount: Decimal | None = None) -> bool:
         """Отправляет инвойс на указанное количество Telegram Stars."""
@@ -2538,6 +2601,28 @@ class StarsPayment:
         except Exception as e:
             logger.exception("Stars invoice creation failed: %s", e)
             return False
+
+    @staticmethod
+    def create_subscription_link(bot, user_id: int, plan_id: str, months: int, rub_amount: Decimal, title: str, description: str) -> str | None:
+        """Создаёт рекуррентную Stars-подписку через createInvoiceLink."""
+        stars_amount = StarsPayment._rub_to_stars(rub_amount)
+        if stars_amount <= 0:
+            return None
+        rub_cents = int(rub_amount * 100)
+        payload = json.dumps({"t": "ssub", "u": user_id, "p": plan_id, "m": months, "r": rub_cents}, ensure_ascii=False)
+        params = {
+            "title": title,
+            "description": description,
+            "payload": payload,
+            "provider_token": "",
+            "currency": "XTR",
+            "prices": [{"label": "Подписка", "amount": stars_amount}],
+            "subscription_period": 30 * 24 * 60 * 60,  # Telegram разрешает только 30 дней
+        }
+        result = StarsPayment._api_call(bot, "createInvoiceLink", params)
+        if isinstance(result, str) and result.startswith(("http://", "https://")):
+            return result
+        return None
 
 
 class XrayAPI:
@@ -3519,6 +3604,11 @@ class UserBot:
             self._purchase(user_id, chat_id, c.message.message_id, plan_id, months)
             return
 
+        if action == "purchase_stars_sub" and len(args) >= 2:
+            plan_id = args[0]
+            self._create_stars_subscription(user_id, chat_id, c.message.message_id, plan_id)
+            return
+
         if action == "promo" and len(args) >= 2:
             plan_id, months = args[0], args[1]
             state_data = {"plan_id": plan_id, "months": months}
@@ -3783,6 +3873,7 @@ class UserBot:
                 f"Подтвердите покупку:")
         kb = K()
         kb.add(B("Купить", callback_data=f"{CB_PREFIX}purchase:{plan_id}:{months}"))
+        kb.add(B("⭐ Подписка через Stars", callback_data=f"{CB_PREFIX}purchase_stars_sub:{plan_id}:{months}"))
         if not discount:
             kb.add(B("Применить промокод", callback_data=f"{CB_PREFIX}promo:{plan_id}:{months}"))
         if user["balance"] < price:
@@ -3832,6 +3923,40 @@ class UserBot:
         self.clear_state(user_id)
         self._edit_message(f"Подписка оформлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
+
+    def _create_stars_subscription(self, user_id: int, chat_id: int, message_id: int, plan_id: str) -> None:
+        plan = storage.plan(plan_id)
+        if not plan:
+            self._edit_message("Тариф не найден.", chat_id, message_id, reply_markup=self._keyboard_main())
+            return
+        months = 1
+        monthly_price = storage.price(plan_id, months)
+        if monthly_price is None:
+            # try derive from any available duration
+            for d in DURATIONS:
+                p = storage.price(plan_id, d)
+                if p is not None:
+                    monthly_price = _money_round(p / Decimal(d))
+                    break
+        if monthly_price is None or monthly_price <= 0:
+            self._edit_message("Цена для Stars-подписки не установлена.", chat_id, message_id, reply_markup=self._keyboard_main())
+            return
+        title = f"Подписка {plan.name}"
+        description = f"Автопродление каждые 30 дней — {_money_str(monthly_price)}₽/мес."
+        link = StarsPayment.create_subscription_link(self.bot, user_id, plan_id, months, monthly_price, title, description)
+        if not link:
+            self._edit_message("Не удалось создать Stars-подписку. Проверьте настройки бота.", chat_id, message_id,
+                                       reply_markup=self._keyboard_main())
+            return
+        kb = K()
+        kb.add(B("⭐ Оформить подписку", url=link))
+        kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
+        self._edit_message(
+            f"<b>{_escape(plan.name)}</b>\n"
+            f"Стоимость: {_money_str(monthly_price)}₽/мес.\n"
+            f"Оплата Stars — Telegram сам будет списывать сумму каждые 30 дней.\n\n"
+            f"Нажмите кнопку, чтобы подписаться:",
+            chat_id, message_id, reply_markup=kb)
 
     def _my_subscriptions(self, user_id: int, chat_id: int, message_id: int) -> None:
         subs = storage.active_subscriptions(user_id)
@@ -4113,7 +4238,7 @@ class UserBot:
 
     def _create_stars_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal) -> None:
         rub_amount = _money_round(rub_amount)
-        stars_amount = int((rub_amount * Decimal("1.3")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        stars_amount = StarsPayment._rub_to_stars(rub_amount)
         if stars_amount <= 0:
             self._edit_message("Сумма слишком мала.", chat_id, message_id,
                                        reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
@@ -4325,6 +4450,45 @@ class UserBot:
         if self._check_maintenance(user_id, m.chat.id):
             return
         payload = m.successful_payment.invoice_payload
+        payment_id = getattr(m.successful_payment, "telegram_payment_charge_id", "") or payload
+        if storage.is_payment_processed(payment_id):
+            self.bot.send_message(m.chat.id, "Этот платёж уже был обработан ранее.",
+                                  reply_markup=self._keyboard_main())
+            return
+        # Stars subscription payload is JSON; deposit payload is "stars_<user_id>_<rub>"
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        if isinstance(data, dict) and data.get("t") == "ssub":
+            try:
+                uid = int(data["u"])
+                plan_id = data["p"]
+                months = int(data.get("m", 1))
+                rub_amount = _to_dec(data["r"]) / 100
+            except (ValueError, TypeError, KeyError, InvalidOperation):
+                return
+            # extend existing active subscription or create a new one
+            subs = storage.active_subscriptions(uid)
+            sub = next((s for s in subs if s.plan_id == plan_id), None)
+            if sub:
+                sub.expires_at = sub.expires_at + months * 30 * 86400
+                sub.active = True
+                storage.update_subscription(sub)
+                action_text = "продлена"
+            else:
+                sub = storage.create_subscription(uid, plan_id, months)
+                action_text = "оформлена"
+            storage.mark_payment_processed(payment_id, uid, "stars_sub", rub_amount, payload)
+            storage._add_transaction(uid, -rub_amount, "purchase", "Telegram Stars", f"stars_sub:{payment_id}")
+            storage.process_referral_rewards(uid, rub_amount)
+            storage.add_purchase_stats(uid, rub_amount, months)
+            XrayAPI.add_or_update_client(sub)
+            self.bot.send_message(
+                m.chat.id,
+                f"Подписка {action_text}!\n{format_subscription(sub)}\n\nСписано {getattr(m.successful_payment, 'total_amount', 0)} Stars (~{_money_str(rub_amount)}₽).",
+                reply_markup=self._keyboard_main())
+            return
         if payload.startswith("stars_"):
             try:
                 _, uid_str, rub_str = payload.split("_")
@@ -4333,9 +4497,9 @@ class UserBot:
             except (ValueError, TypeError, InvalidOperation):
                 return
             stars_amount = getattr(m.successful_payment, "total_amount", 0)
-            payment_id = getattr(m.successful_payment, "telegram_payment_charge_id", payload) or payload
             credited = storage.add_balance(uid, rub_amount, "Telegram Stars", "stars", payment_id)
             if credited:
+                storage.mark_payment_processed(payment_id, uid, "stars_deposit", rub_amount, payload)
                 self.bot.send_message(m.chat.id, f"Баланс пополнен на {_money_str(rub_amount)}₽ ({stars_amount} Stars) через Telegram Stars.",
                                       reply_markup=self._keyboard_main())
             else:
@@ -5262,13 +5426,15 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     def state_admin_settings(m: Message):
         parts = m.text.strip().split()
         if len(parts) < 2:
-            bot.send_message(m.chat.id, "Нужно два числа: <code>referral_discount cleanup_days</code>")
+            bot.send_message(m.chat.id, "Нужно: <code>referral_discount cleanup_days [autorenew_days_before]</code>")
             return
         try:
             discount = float(parts[0].replace(",", "."))
             cleanup = int(parts[1])
+            autorenew = int(parts[2]) if len(parts) >= 3 else storage.config.get("autorenew_days_before", 1)
             storage.config["referral_first_discount"] = max(0.0, min(100.0, discount))
             storage.config["expired_cleanup_days"] = max(0, cleanup)
+            storage.config["autorenew_days_before"] = max(0, autorenew)
             storage.save_config()
             bot.send_message(m.chat.id, "Настройки сохранены.")
         except ValueError:
@@ -6397,10 +6563,12 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
     if section == "settings":
         discount = storage.config.get("referral_first_discount", 0)
         cleanup = storage.config.get("expired_cleanup_days", 5)
+        autorenew = storage.config.get("autorenew_days_before", 1)
         text = (f"<b>Настройки</b>\n\n"
                 f"Реферальная скидка на первую покупку: {discount}%\n"
-                f"Автоудаление истёкших подписок через: {cleanup} дн.\n\n"
-                f"Отправьте одной строкой: <code>referral_discount cleanup_days</code>")
+                f"Автоудаление истёкших подписок через: {cleanup} дн.\n"
+                f"Автопродление за: {autorenew} дн. до истечения\n\n"
+                f"Отправьте одной строкой: <code>referral_discount cleanup_days autorenew_days_before</code>")
         kb = K()
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
         bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
