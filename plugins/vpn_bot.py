@@ -23,7 +23,7 @@ import socketserver
 import sqlite3
 import threading
 import time
-from urllib.parse import urlencode, quote, parse_qsl
+from urllib.parse import urlencode, quote, parse_qsl, urlparse
 
 import requests
 
@@ -358,6 +358,9 @@ class VPNStorage:
             "backup_send_admin": True,
             "welcome": "Добро пожаловать в VPN-бот!",
             "support": "@support",
+            "terms_url": "",
+            "privacy_url": "",
+            "telegraph_access_token": "",
             "bot_username": "",
             "trial_days": TRIAL_DAYS,
             "welcome_media_file_id": "",
@@ -1101,7 +1104,7 @@ class VPNStorage:
                     "user_id": user_id,
                     "username": username or "",
                     "source": source,
-                    "settings": {"lang": "ru", "notifications": True, "auto_renew": True},
+                    "settings": {"lang": "ru", "notifications": True, "auto_renew": True, "agreed_terms": False},
                     "balance": Decimal("0.00"),
                     "referral_balance": Decimal("0.00"),
                     "referral_code": f"ref_{user_id}",
@@ -2248,7 +2251,7 @@ class MiniAppAPI:
                 })
         return {
             "bot_username": storage.config.get("bot_username", ""),
-            "support": storage.config.get("support", "@support"),
+            "support": storage.config.get("support_id") or storage.config.get("support", "@support"),
             "support_id": storage.config.get("support_id", ""),
             "channel_id": storage.config.get("channel_id", ""),
             "trial_days": storage.config.get("trial_days", TRIAL_DAYS),
@@ -4077,6 +4080,9 @@ class UserBot:
         storage.update_user(user)
         if is_new:
             storage._notify_admins(f"Новый пользователь: {user_id} (@{username}) из источника {source}.", "new_user")
+        if not self._terms_agreed(user_id):
+            self._prompt_terms_agreement(user_id, m.chat.id)
+            return
         if not self._channel_check(user_id, m.chat.id):
             return
         self._send_welcome(user_id, m.chat.id)
@@ -4112,6 +4118,32 @@ class UserBot:
         else:
             caption = f"{text}\n\nВыберите раздел:"
         self._send_menu_message(chat_id, caption, reply_markup=self._keyboard_main(user_id), prefer_welcome_media=True, media_key="welcome")
+
+    def _terms_agreed(self, user_id: int) -> bool:
+        return bool(storage.get_user(user_id).get("settings", {}).get("agreed_terms", False))
+
+    def _prompt_terms_agreement(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        terms_url, privacy_url = _ensure_default_terms_pages()
+        kb = K()
+        if terms_url:
+            kb.add(B("📄 Пользовательское соглашение", url=terms_url))
+        if privacy_url:
+            kb.add(B("🔒 Политика конфиденциальности", url=privacy_url))
+        if not terms_url or not privacy_url:
+            kb.add(B("🔄 Повторить", callback_data=f"{CB_PREFIX}terms_retry"))
+        parts = [
+            "<b>📄 Пользовательское соглашение</b>\n\nПродолжая использовать бота, вы соглашаетесь с ",
+            f'<a href="{terms_url}">Пользовательским соглашением</a>' if terms_url else "Пользовательским соглашением",
+            " и ",
+            f'<a href="{privacy_url}">Политикой конфиденциальности</a>' if privacy_url else "Политикой конфиденциальности",
+            ".\n\nПожалуйста, нажмите «Согласен», чтобы продолжить.",
+        ]
+        text = "".join(parts)
+        kb.add(B("✅ Согласен", callback_data=f"{CB_PREFIX}terms_agree"))
+        if message_id is not None:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
     def _check_maintenance(self, user_id: int, chat_id: int) -> bool:
         if storage.is_banned(user_id):
@@ -4171,10 +4203,13 @@ class UserBot:
         if invite:
             kb.add(B("👉 Перейти в канал", url=invite, style="success"))
         else:
-            support = storage.config.get("support", "")
+            support = storage.config.get("support_id") or storage.config.get("support", "")
             if support and isinstance(support, str):
-                support_user = support.lstrip("@")
-                kb.add(B("🆘 Написать админу", url=f"https://t.me/{support_user}", style="danger"))
+                if support.isdigit():
+                    kb.add(B("🆘 Написать админу", url=f"tg://user?id={support}", style="danger"))
+                else:
+                    support_user = support.lstrip("@")
+                    kb.add(B("🆘 Написать админу", url=f"https://t.me/{support_user}", style="danger"))
         kb.add(B("🔄 Проверить подписку", callback_data=f"{CB_PREFIX}check_channel", style="primary"))
         return kb
 
@@ -4193,6 +4228,9 @@ class UserBot:
         self.set_state(user_id, "manual_channel_verify", {})
 
     def _on_channel_ok(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        if not self._terms_agreed(user_id):
+            self._prompt_terms_agreement(user_id, chat_id, message_id)
+            return
         user = storage.get_user(user_id)
         user["channel_ok"] = True
         storage.update_user(user)
@@ -4206,6 +4244,9 @@ class UserBot:
     def _on_manual_channel_verify(self, m: Message) -> None:
         user_id = m.from_user.id
         chat_id = m.chat.id
+        if not self._terms_agreed(user_id):
+            self._prompt_terms_agreement(user_id, chat_id)
+            return
         channel_id = storage.config.get("channel_id", "")
         if not channel_id:
             self.clear_state(user_id)
@@ -4301,6 +4342,28 @@ class UserBot:
         args = parts[1:]
 
         if self._check_maintenance(user_id, chat_id):
+            return
+
+        if action == "terms_agree":
+            user = storage.get_user(user_id)
+            settings = user.setdefault("settings", {"lang": "ru", "notifications": True, "auto_renew": True})
+            settings["agreed_terms"] = True
+            storage.update_user(user)
+            self.bot.answer_callback_query(c.id, "✅ Спасибо за согласие!")
+            if self._channel_check(user_id, chat_id, force=True, message_id=c.message.message_id):
+                self._on_channel_ok(user_id, chat_id, c.message.message_id)
+            return
+
+        if action == "terms_retry":
+            self._prompt_terms_agreement(user_id, chat_id, c.message.message_id)
+            return
+
+        if not self._terms_agreed(user_id) and action not in ("terms_show", "privacy_show"):
+            self._prompt_terms_agreement(user_id, chat_id, c.message.message_id)
+            try:
+                self.bot.answer_callback_query(c.id, "Сначала примите пользовательское соглашение.", show_alert=True)
+            except Exception:
+                pass
             return
 
         if action == "check_channel":
@@ -4485,19 +4548,19 @@ class UserBot:
                 return
             self.set_state(user_id, "deposit_crypto_rubles", {"asset": asset, "message_id": c.message.message_id})
             self._edit_message(f"Выберите сумму пополнения в рублях ({asset}):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_crypto", f"{CB_PREFIX}deposit", asset))
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_crypto_preset", f"{CB_PREFIX}deposit", asset))
             return
 
         if action == "deposit_stars":
             self.set_state(user_id, "deposit_stars_rubles", {"message_id": c.message.message_id})
             self._edit_message("Выберите сумму пополнения в рублях (Telegram Stars):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars", f"{CB_PREFIX}deposit"))
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars_preset", f"{CB_PREFIX}deposit"))
             return
 
         if action == "deposit_yookassa":
             self.set_state(user_id, "deposit_yookassa_rubles", {"message_id": c.message.message_id})
             self._edit_message("Выберите сумму пополнения в рублях (YooKassa):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_yookassa", f"{CB_PREFIX}deposit"))
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_yookassa_preset", f"{CB_PREFIX}deposit"))
             return
 
         if action == "deposit_crypto_preset" and len(args) >= 2:
@@ -5357,9 +5420,14 @@ class UserBot:
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _help_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
+        terms_url, privacy_url = _ensure_default_terms_pages()
         text = "<b>❓ Помощь</b>\n\nВыберите раздел:"
         kb = K()
         kb.add(B("📖 FAQ", callback_data=f"{CB_PREFIX}faq"))
+        if terms_url:
+            kb.add(B("📄 Соглашение", url=terms_url))
+        if privacy_url:
+            kb.add(B("🔒 Privacy", url=privacy_url))
         kb.add(B("🆘 Поддержка", callback_data=f"{CB_PREFIX}support"))
         kb.add(B("📝 Пожаловаться", callback_data=f"{CB_PREFIX}complaint"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
@@ -5380,10 +5448,17 @@ class UserBot:
                                    reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
 
     def _support_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
-        support = storage.config.get("support", "@support")
-        text = f"<b>🆘 Поддержка</b>\n\nПо всем вопросам обращайтесь: {support}"
-        self._edit_message(text, chat_id, message_id,
-                                   reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help")))
+        support = storage.config.get("support_id") or storage.config.get("support", "@support")
+        if support and not support.startswith("@") and support.isdigit():
+            support_link = f'<a href="tg://user?id={support}">написать администратору</a>'
+        elif support and support.startswith("@"):
+            support_link = f'<a href="https://t.me/{support.lstrip("@")}">{_escape(support)}</a>'
+        else:
+            support_link = _escape(support) if support else "@support"
+        text = f"<b>🆘 Поддержка</b>\n\nПо всем вопросам обращайтесь: {support_link}"
+        kb = K()
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}help"))
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _referral_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         bot_username = storage.config.get("bot_username", "")
@@ -5537,6 +5612,9 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     if not tg:
         return
     bot = tg.bot
+
+    # Generate default terms/privacy pages on Telegraph in background if missing.
+    threading.Thread(target=_ensure_default_terms_pages, daemon=True).start()
 
     cardinal.add_telegram_commands(UUID, [
         ("vpnadmin", "Админ-панель VPN", True),
@@ -5811,6 +5889,32 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         storage.config["faq_text"] = m.text.strip() if m.text else ""
         storage.save_config()
         bot.send_message(m.chat.id, "Текст FAQ сохранен.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_terms_url(m: Message):
+        url = m.text.strip()
+        if url in ("-", "", "none"):
+            storage.config["terms_url"] = ""
+        elif url.startswith(("http://", "https://")):
+            storage.config["terms_url"] = url
+        else:
+            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://, или <code>-</code> для сброса.")
+            return
+        storage.save_config()
+        bot.send_message(m.chat.id, "URL соглашения сохранён.")
+        tg.clear_state(m.chat.id, m.from_user.id)
+
+    def state_set_privacy_url(m: Message):
+        url = m.text.strip()
+        if url in ("-", "", "none"):
+            storage.config["privacy_url"] = ""
+        elif url.startswith(("http://", "https://")):
+            storage.config["privacy_url"] = url
+        else:
+            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://, или <code>-</code> для сброса.")
+            return
+        storage.save_config()
+        bot.send_message(m.chat.id, "URL политики конфиденциальности сохранён.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
     def state_admin_plan_name(m: Message):
@@ -6357,6 +6461,8 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_msg_media, content_types=["video", "animation", "text"],
                    func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_msg_media"))
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
+    tg.msg_handler(state_set_terms_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_terms_url"))
+    tg.msg_handler(state_set_privacy_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_privacy_url"))
     tg.msg_handler(state_admin_plan_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_name"))
     tg.msg_handler(state_admin_plan_devices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_devices"))
     tg.msg_handler(state_admin_plan_price, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_price"))
@@ -6409,6 +6515,8 @@ def _admin_main_keyboard() -> K:
         B("💳 YooKassa", callback_data=f"{CB_PREFIX}admin:yookassa", style="primary"),
         B("🖼 Медиа сообщений", callback_data=f"{CB_PREFIX}admin:message_media", style="success"),
         B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq", style="success"),
+        B("📄 Соглашение", callback_data=f"{CB_PREFIX}admin:terms", style="success"),
+        B("🔒 Privacy", callback_data=f"{CB_PREFIX}admin:privacy", style="success"),
         B("🖥 Серверы", callback_data=f"{CB_PREFIX}admin:hosts", style="primary"),
         B("📋 Планы и цены", callback_data=f"{CB_PREFIX}admin:plans", style="success"),
         B("🎟 Промокоды", callback_data=f"{CB_PREFIX}admin:promos", style="success"),
@@ -6658,6 +6766,68 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:main"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_faq_text")
+            return
+
+        if section == "terms":
+            sub = args[1] if len(args) > 1 else ""
+            if sub == "generate":
+                url = _publish_telegraph_page(
+                    "terms_url",
+                    "Пользовательское соглашение",
+                    lambda: _build_terms_nodes(storage.config.get("support_id") or storage.config.get("support") or "@support"),
+                )
+                if url:
+                    bot.answer_callback_query(c.id, "Статья на telegra.ph обновлена.")
+                else:
+                    bot.answer_callback_query(c.id, "Не удалось создать статью.", show_alert=True)
+            elif sub == "edit":
+                bot.edit_message_text(
+                    "<b>URL соглашения</b>\n\nОтправьте URL (https://...) или <code>-</code> чтобы сбросить:",
+                    chat_id, c.message.message_id, reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:terms")),
+                )
+                tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_terms_url")
+                return
+            terms_url = storage.config.get("terms_url") or "не задан"
+            text = (f"<b>📄 Пользовательское соглашение</b>\n\n"
+                    f"Текущий URL: {terms_url}\n\n"
+                    f"Нажмите «Сгенерировать», чтобы создать/обновить статью на telegra.ph, "
+                    f"или «Свой URL» для ручной ссылки.")
+            kb = K()
+            kb.add(B("🔄 Сгенерировать telegra.ph", callback_data=f"{CB_PREFIX}admin:terms:generate"))
+            kb.add(B("✏️ Свой URL", callback_data=f"{CB_PREFIX}admin:terms:edit"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
+            return
+
+        if section == "privacy":
+            sub = args[1] if len(args) > 1 else ""
+            if sub == "generate":
+                url = _publish_telegraph_page(
+                    "privacy_url",
+                    "Политика конфиденциальности",
+                    lambda: _build_privacy_nodes(storage.config.get("support_id") or storage.config.get("support") or "@support"),
+                )
+                if url:
+                    bot.answer_callback_query(c.id, "Статья на telegra.ph обновлена.")
+                else:
+                    bot.answer_callback_query(c.id, "Не удалось создать статью.", show_alert=True)
+            elif sub == "edit":
+                bot.edit_message_text(
+                    "<b>URL политики конфиденциальности</b>\n\nОтправьте URL (https://...) или <code>-</code> чтобы сбросить:",
+                    chat_id, c.message.message_id, reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:privacy")),
+                )
+                tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_privacy_url")
+                return
+            privacy_url = storage.config.get("privacy_url") or "не задан"
+            text = (f"<b>🔒 Политика конфиденциальности</b>\n\n"
+                    f"Текущий URL: {privacy_url}\n\n"
+                    f"Нажмите «Сгенерировать», чтобы создать/обновить статью на telegra.ph, "
+                    f"или «Свой URL» для ручной ссылки.")
+            kb = K()
+            kb.add(B("🔄 Сгенерировать telegra.ph", callback_data=f"{CB_PREFIX}admin:privacy:generate"))
+            kb.add(B("✏️ Свой URL", callback_data=f"{CB_PREFIX}admin:privacy:edit"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
             return
 
         if section == "del_welcome_media":
@@ -7518,6 +7688,157 @@ def cleanup(cardinal: Cardinal, *args) -> None:
     storage.save_referrals()
     if _user_bot_instance:
         _user_bot_instance.stop()
+
+
+_terms_pages_lock = threading.Lock()
+
+
+def _build_terms_nodes(support: str = "@support") -> list[dict]:
+    date = datetime.now().strftime("%d.%m.%Y")
+    contact = f"Telegram: {support}" if support.startswith("@") else f"Telegram: {support}"
+    return [
+        {"tag": "h3", "children": ["Пользовательское соглашение"]},
+        {"tag": "p", "children": [f"Дата обновления: {date}"]},
+        {"tag": "p", "children": ["VPN-сервис предоставляет доступ к защищённому интернет-подключению, сетевым конфигурациям и технологиям безопасного подключения."]},
+        {"tag": "h3", "children": ["1. Предмет соглашения"]},
+        {"tag": "p", "children": ["Сервис предоставляет доступ к защищённому интернет-подключению, сетевым конфигурациям, подписочным сервисам, тестовому доступу, Telegram-боту и веб-интерфейсу."]},
+        {"tag": "h3", "children": ["2. Использование сервиса"]},
+        {"tag": "p", "children": ["Пользователь обязуется использовать сервис только законными способами, не нарушать законодательство своей страны, не использовать сервис для мошенничества, фишинга, спама, распространения вредоносного ПО и иных незаконных действий."]},
+        {"tag": "h3", "children": ["3. Подписка и оплата"]},
+        {"tag": "p", "children": ["Сервис предоставляется по модели подписки. После успешной оплаты пользователю предоставляется доступ к выбранному тарифу."]},
+        {"tag": "h3", "children": ["4. Пробный доступ"]},
+        {"tag": "p", "children": ["VPN-сервис может предоставлять бесплатный пробный доступ, ограниченный по времени, трафику, IP, устройству или иным техническим параметрам."]},
+        {"tag": "h3", "children": ["5. Ограничение ответственности"]},
+        {"tag": "p", "children": ["Сервис предоставляется по принципу «как есть». Администрация не гарантирует непрерывную работу, отсутствие технических сбоев и совместимость со всеми устройствами и сетями."]},
+        {"tag": "h3", "children": ["6. Изменение условий"]},
+        {"tag": "p", "children": ["Администрация вправе изменять настоящее соглашение. Продолжение использования сервиса означает согласие с обновлённой версией."]},
+        {"tag": "h3", "children": ["7. Контакты"]},
+        {"tag": "p", "children": [contact]},
+    ]
+
+
+def _build_privacy_nodes(support: str = "@support") -> list[dict]:
+    date = datetime.now().strftime("%d.%m.%Y")
+    contact = f"Telegram: {support}" if support.startswith("@") else f"Telegram: {support}"
+    return [
+        {"tag": "h3", "children": ["Политика конфиденциальности"]},
+        {"tag": "p", "children": [f"Дата обновления: {date}"]},
+        {"tag": "h3", "children": ["1. Какие данные собираются"]},
+        {"tag": "p", "children": ["Сервис может обрабатывать Telegram ID, username Telegram, технические данные подключения, IP-адрес, данные о подписке и события использования сервиса."]},
+        {"tag": "h3", "children": ["2. Для чего используются данные"]},
+        {"tag": "p", "children": ["Данные используются для предоставления доступа, работы подписок, предотвращения злоупотреблений, аналитики, технической поддержки и обработки платежей."]},
+        {"tag": "h3", "children": ["3. Передача данных"]},
+        {"tag": "p", "children": ["Сервис не продаёт персональные данные третьим лицам. Передача возможна только для обработки платежей, технической работы сервера или по требованиям законодательства."]},
+        {"tag": "h3", "children": ["4. Безопасность"]},
+        {"tag": "p", "children": ["Администрация принимает разумные технические меры для защиты пользовательских данных."]},
+        {"tag": "h3", "children": ["5. Контакты"]},
+        {"tag": "p", "children": [contact]},
+    ]
+
+
+def _telegraph_create_account(short_name: str, author_name: str) -> str | None:
+    try:
+        r = requests.post(
+            "https://api.telegra.ph/createAccount",
+            data={"short_name": short_name, "author_name": author_name},
+            timeout=20,
+        )
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]["access_token"]
+    except Exception:
+        logger.exception("Ошибка создания аккаунта Telegraph")
+    return None
+
+
+def _telegraph_create_page(token: str, title: str, content: list, author_name: str) -> str | None:
+    try:
+        r = requests.post(
+            "https://api.telegra.ph/createPage",
+            data={
+                "access_token": token,
+                "title": title,
+                "author_name": author_name,
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+            timeout=20,
+        )
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]["url"]
+    except Exception:
+        logger.exception("Ошибка создания страницы Telegraph")
+    return None
+
+
+def _telegraph_edit_page(token: str, path: str, title: str, content: list, author_name: str) -> str | None:
+    try:
+        r = requests.post(
+            f"https://api.telegra.ph/editPage/{path}",
+            data={
+                "access_token": token,
+                "title": title,
+                "author_name": author_name,
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+            timeout=20,
+        )
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]["url"]
+    except Exception:
+        logger.exception("Ошибка редактирования страницы Telegraph")
+    return None
+
+
+def _publish_telegraph_page(config_key: str, title: str, content_builder: Any) -> str | None:
+    token = storage.config.get("telegraph_access_token")
+    if not token:
+        token = _telegraph_create_account(
+            storage.config.get("bot_username") or "VPNBot",
+            storage.config.get("bot_username") or "VPN Bot",
+        )
+        if not token:
+            return None
+        storage.config["telegraph_access_token"] = token
+        storage.save_config()
+    author = storage.config.get("bot_username") or "VPN Bot"
+    content = content_builder()
+    existing_url = storage.config.get(config_key)
+    if existing_url:
+        path = urlparse(existing_url).path.lstrip("/")
+        url = _telegraph_edit_page(token, path, title, content, author)
+        if url:
+            storage.config[config_key] = url
+            storage.save_config()
+            return url
+    url = _telegraph_create_page(token, title, content, author)
+    if url:
+        storage.config[config_key] = url
+        storage.save_config()
+    return url
+
+
+def _ensure_default_terms_pages() -> tuple[str, str]:
+    with _terms_pages_lock:
+        terms_url = storage.config.get("terms_url")
+        privacy_url = storage.config.get("privacy_url")
+        if terms_url and privacy_url:
+            return terms_url, privacy_url
+        support = storage.config.get("support_id") or storage.config.get("support") or "@support"
+        if not terms_url:
+            terms_url = _publish_telegraph_page(
+                "terms_url",
+                "Пользовательское соглашение",
+                lambda: _build_terms_nodes(support),
+            ) or ""
+        if not privacy_url:
+            privacy_url = _publish_telegraph_page(
+                "privacy_url",
+                "Политика конфиденциальности",
+                lambda: _build_privacy_nodes(support),
+            ) or ""
+        return terms_url, privacy_url
 
 
 storage = VPNStorage()
