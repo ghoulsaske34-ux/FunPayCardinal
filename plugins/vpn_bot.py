@@ -369,7 +369,6 @@ class VPNStorage:
             "menu_media_type": "photo",
             "message_media": {},
             "start_sticker_file_id": "",
-            "start_sticker_file_path": "",
             "start_sticker_delete_after": 2,
             "start_sticker_test_mode": False,
         }
@@ -4085,10 +4084,9 @@ class UserBot:
         if is_new:
             storage._notify_admins(f"Новый пользователь: {user_id} (@{username}) из источника {source}.", "new_user")
         sticker_id = storage.config.get("start_sticker_file_id", "")
-        sticker_path = storage.config.get("start_sticker_file_path", "")
         test_mode = storage.config.get("start_sticker_test_mode", False)
-        if (sticker_id or sticker_path) and (test_mode or is_new):
-            self._send_start_sticker_then_continue(user_id, m.chat.id)
+        if sticker_id and (test_mode or is_new):
+            self._send_start_sticker_then_continue(user_id, m.chat.id, sticker_id)
             return
         self._continue_start(user_id, m.chat.id)
 
@@ -4100,22 +4098,11 @@ class UserBot:
             return
         self._send_welcome(user_id, chat_id)
 
-    def _send_start_sticker_then_continue(self, user_id: int, chat_id: int) -> None:
-        sticker_id = storage.config.get("start_sticker_file_id", "")
-        sticker_path = storage.config.get("start_sticker_file_path", "")
-        msg = None
-        if sticker_path and Path(sticker_path).is_file():
-            try:
-                from telebot.types import InputFile
-                msg = self.bot.send_sticker(chat_id, InputFile(sticker_path))
-            except Exception:
-                logger.exception("Не удалось отправить стартовый стикер из файла")
-        if not msg and sticker_id:
-            try:
-                msg = self.bot.send_sticker(chat_id, sticker_id)
-            except Exception:
-                logger.exception("Не удалось отправить стартовый стикер по file_id")
-        if not msg:
+    def _send_start_sticker_then_continue(self, user_id: int, chat_id: int, sticker_id: str) -> None:
+        try:
+            msg = self.bot.send_sticker(chat_id, sticker_id)
+        except Exception:
+            logger.exception("Не удалось отправить стартовый стикер")
             self._continue_start(user_id, chat_id)
             return
         delay = max(0, int(storage.config.get("start_sticker_delete_after", 2)))
@@ -5969,21 +5956,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             tg.clear_state(m.chat.id, m.from_user.id)
             return
         if m.content_type == "sticker" and m.sticker:
-            file_id = m.sticker.file_id
-            try:
-                file_info = bot.get_file(file_id)
-                ext = Path(file_info.file_path).suffix or ".webp"
-                STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-                save_path = STORAGE_DIR / f"start_sticker{ext}"
-                data = bot.download_file(file_info.file_path)
-                with open(save_path, "wb") as f:
-                    f.write(data)
-                storage.config["start_sticker_file_path"] = str(save_path)
-            except Exception as e:
-                logger.exception("Ошибка скачивания стикера")
-                bot.send_message(m.chat.id, f"⚠️ Не удалось скачать файл стикера: {e}. Попробуйте другой стикер.")
-                return
-            storage.config["start_sticker_file_id"] = file_id
+            storage.config["start_sticker_file_id"] = m.sticker.file_id
             storage.save_config()
             bot.send_message(m.chat.id, "🎭 Стикер сохранён.")
             tg.clear_state(m.chat.id, m.from_user.id)
@@ -6585,26 +6558,6 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_admin_user_msg_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_user_msg_text"))
     tg.msg_handler(state_admin_user_msg_photo, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_user_msg_photo"), content_types=["photo", "text"])
 
-    def _migrate_start_sticker():
-        file_id = storage.config.get("start_sticker_file_id", "")
-        file_path = storage.config.get("start_sticker_file_path", "")
-        if not file_id or file_path:
-            return
-        try:
-            file_info = bot.get_file(file_id)
-            ext = Path(file_info.file_path).suffix or ".webp"
-            STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-            save_path = STORAGE_DIR / f"start_sticker{ext}"
-            data = bot.download_file(file_info.file_path)
-            with open(save_path, "wb") as f:
-                f.write(data)
-            storage.config["start_sticker_file_path"] = str(save_path)
-            storage.save_config()
-        except Exception:
-            logger.exception("Не удалось смигрировать стартовый стикер")
-
-    threading.Thread(target=_migrate_start_sticker, daemon=True).start()
-
     token = storage.config.get("user_bot_token", "")
     if token:
         try:
@@ -6897,18 +6850,15 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
                 sub = ""
             if sub == "delete":
                 storage.config.pop("start_sticker_file_id", None)
-                storage.config.pop("start_sticker_file_path", None)
                 storage.save_config()
                 bot.answer_callback_query(c.id, "Стикер удалён.")
                 sub = ""
             file_id = storage.config.get("start_sticker_file_id", "")
-            file_path = storage.config.get("start_sticker_file_path", "")
             delay = storage.config.get("start_sticker_delete_after", 2)
             test_mode = storage.config.get("start_sticker_test_mode", False)
-            has_sticker = bool(file_id or file_path)
             text = (
                 f"<b>🎭 Стикер при старте</b>\n\n"
-                f"Стикер: {'задан' if has_sticker else 'не задан'}\n"
+                f"Стикер: {'задан' if file_id else 'не задан'}\n"
                 f"Задержка удаления: {delay} сек.\n"
                 f"Тест-режим (отправлять каждый /start): {'🟢 Вкл' if test_mode else '🔴 Выкл'}\n\n"
                 f"Отправьте стикер через «Загрузить стикер», настройте задержку и включите тест, если нужно отправлять стикер при каждом /start."
@@ -6917,7 +6867,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             kb.add(B("🔄 Загрузить стикер", callback_data=f"{CB_PREFIX}admin:start_sticker:set", style="primary"))
             kb.add(B(f"⏱ Задержка: {delay} сек", callback_data=f"{CB_PREFIX}admin:start_sticker:delay"))
             kb.add(B(f"{'🔴 Выкл' if test_mode else '🟢 Вкл'} тест-режим", callback_data=f"{CB_PREFIX}admin:start_sticker:toggle"))
-            if has_sticker:
+            if file_id:
                 kb.add(B("🗑 Удалить стикер", callback_data=f"{CB_PREFIX}admin:start_sticker:delete", style="danger"))
             kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
             bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
