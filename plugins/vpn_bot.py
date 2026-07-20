@@ -10,6 +10,7 @@ import copy
 import csv
 import ipaddress
 import base64
+import queue
 import gzip
 import hashlib
 import hmac
@@ -3890,6 +3891,8 @@ class UserBot:
         self._backup_scheduler: BackupScheduler | None = None
         self._device_auth_server: DeviceAuthServer | None = None
         self._temp_profile_server: TempProfileServer | None = None
+        self._sticker_queue: queue.Queue[tuple[int, int]] | None = None
+        self._sticker_thread: threading.Thread | None = None
         self._register_handlers()
 
     # ---- state helpers ----
@@ -4089,7 +4092,10 @@ class UserBot:
         sticker_path = storage.config.get("start_sticker_file_path", "")
         test_mode = storage.config.get("start_sticker_test_mode", False)
         if (sticker_id or sticker_path) and (test_mode or is_new):
-            self._send_start_sticker_then_continue(user_id, m.chat.id)
+            if self._sticker_queue is not None:
+                self._sticker_queue.put((user_id, m.chat.id))
+            else:
+                self._send_start_sticker_then_continue(user_id, m.chat.id)
             return
         self._continue_start(user_id, m.chat.id)
 
@@ -4101,19 +4107,33 @@ class UserBot:
             return
         self._send_welcome(user_id, chat_id)
 
+    def _sticker_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                task = self._sticker_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if task is None:
+                continue
+            user_id, chat_id = task
+            try:
+                self._send_start_sticker_then_continue(user_id, chat_id)
+            except Exception:
+                logger.exception("Ошибка в стикер-воркере")
+
     def _send_start_sticker_then_continue(self, user_id: int, chat_id: int) -> None:
         sticker_id = storage.config.get("start_sticker_user_bot_file_id") or storage.config.get("start_sticker_file_id", "")
         sticker_path = storage.config.get("start_sticker_file_path", "")
         msg = None
         if sticker_id:
             try:
-                msg = self.bot.send_sticker(chat_id, sticker_id)
+                msg = self.bot.send_sticker(chat_id, sticker_id, timeout=10)
             except Exception:
                 logger.exception("Не удалось отправить стартовый стикер по file_id")
         if not msg and sticker_path and Path(sticker_path).is_file():
             try:
                 from telebot.types import InputFile
-                msg = self.bot.send_sticker(chat_id, InputFile(sticker_path))
+                msg = self.bot.send_sticker(chat_id, InputFile(sticker_path), timeout=15)
                 if msg and msg.sticker:
                     storage.config["start_sticker_user_bot_file_id"] = msg.sticker.file_id
                     storage.save_config()
@@ -4124,12 +4144,11 @@ class UserBot:
             return
         delay = max(0, int(storage.config.get("start_sticker_delete_after", 2)))
 
-        # Выполняем sleep и удаление в том же worker-потоке, чтобы переиспользовать
-        # уже открытое HTTP-соединение user-бота. В отдельном потоке каждый раз
-        # создавался новый requests.Session и соединение могло устанавливаться долго.
+        # Сон и удаление выполняются в отдельном persistent-воркере, поэтому
+        # основные worker-потоки user-бота не блокируются при долгих API-запросах.
         try:
             time.sleep(delay)
-            self.bot.delete_message(chat_id, msg.message_id)
+            self.bot.delete_message(chat_id, msg.message_id, timeout=10)
         except Exception:
             pass
         try:
@@ -5595,6 +5614,9 @@ class UserBot:
             self._temp_profile_server = TempProfileServer(server_cfg.temp_profile_port)
             self._temp_profile_server.start()
         self._stop.clear()
+        self._sticker_queue = queue.Queue()
+        self._sticker_thread = threading.Thread(target=self._sticker_worker, daemon=True)
+        self._sticker_thread.start()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info("User-бот запущен.")
@@ -5627,6 +5649,13 @@ class UserBot:
             self._device_auth_server.stop()
         if self._temp_profile_server:
             self._temp_profile_server.stop()
+        if self._sticker_queue is not None:
+            try:
+                self._sticker_queue.put(None, block=False)
+            except Exception:
+                pass
+        if self._sticker_thread and self._sticker_thread.is_alive():
+            self._sticker_thread.join(timeout=5)
         if self._thread:
             self._thread.join(timeout=10)
 
