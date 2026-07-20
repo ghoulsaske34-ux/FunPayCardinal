@@ -4124,18 +4124,18 @@ class UserBot:
             return
         delay = max(0, int(storage.config.get("start_sticker_delete_after", 2)))
 
-        def _delayed() -> None:
-            try:
-                time.sleep(delay)
-                self.bot.delete_message(chat_id, msg.message_id)
-            except Exception:
-                pass
-            try:
-                self._continue_start(user_id, chat_id)
-            except Exception:
-                logger.exception("Ошибка после стартового стикера")
-
-        threading.Thread(target=_delayed, daemon=True).start()
+        # Выполняем sleep и удаление в том же worker-потоке, чтобы переиспользовать
+        # уже открытое HTTP-соединение user-бота. В отдельном потоке каждый раз
+        # создавался новый requests.Session и соединение могло устанавливаться долго.
+        try:
+            time.sleep(delay)
+            self.bot.delete_message(chat_id, msg.message_id)
+        except Exception:
+            pass
+        try:
+            self._continue_start(user_id, chat_id)
+        except Exception:
+            logger.exception("Ошибка после стартового стикера")
 
     def _parse_start_param(self, m: Message, user_id: int) -> tuple[str, int | None]:
         """Возвращает (source, referred_by). source='direct' если без параметра."""
