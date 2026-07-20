@@ -368,6 +368,9 @@ class VPNStorage:
             "menu_media_file_id": "",
             "menu_media_type": "photo",
             "message_media": {},
+            "start_sticker_file_id": "",
+            "start_sticker_delete_after": 2,
+            "start_sticker_test_mode": False,
         }
 
     def _default_users(self) -> dict[str, Any]:
@@ -4080,12 +4083,42 @@ class UserBot:
         storage.update_user(user)
         if is_new:
             storage._notify_admins(f"Новый пользователь: {user_id} (@{username}) из источника {source}.", "new_user")
+        sticker_id = storage.config.get("start_sticker_file_id", "")
+        test_mode = storage.config.get("start_sticker_test_mode", False)
+        if sticker_id and (test_mode or is_new):
+            self._send_start_sticker_then_continue(user_id, m.chat.id, sticker_id)
+            return
+        self._continue_start(user_id, m.chat.id)
+
+    def _continue_start(self, user_id: int, chat_id: int) -> None:
         if not self._terms_agreed(user_id):
-            self._prompt_terms_agreement(user_id, m.chat.id)
+            self._prompt_terms_agreement(user_id, chat_id)
             return
-        if not self._channel_check(user_id, m.chat.id):
+        if not self._channel_check(user_id, chat_id):
             return
-        self._send_welcome(user_id, m.chat.id)
+        self._send_welcome(user_id, chat_id)
+
+    def _send_start_sticker_then_continue(self, user_id: int, chat_id: int, sticker_id: str) -> None:
+        try:
+            msg = self.bot.send_sticker(chat_id, sticker_id)
+        except Exception:
+            logger.exception("Не удалось отправить стартовый стикер")
+            self._continue_start(user_id, chat_id)
+            return
+        delay = max(0, int(storage.config.get("start_sticker_delete_after", 2)))
+
+        def _delayed() -> None:
+            try:
+                time.sleep(delay)
+                self.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            try:
+                self._continue_start(user_id, chat_id)
+            except Exception:
+                logger.exception("Ошибка после стартового стикера")
+
+        threading.Thread(target=_delayed, daemon=True).start()
 
     def _parse_start_param(self, m: Message, user_id: int) -> tuple[str, int | None]:
         """Возвращает (source, referred_by). source='direct' если без параметра."""
@@ -5917,6 +5950,34 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         bot.send_message(m.chat.id, "URL политики конфиденциальности сохранён.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
+    def state_set_start_sticker(m: Message):
+        if m.content_type == "text" and m.text and m.text.strip() in ("-", "отмена", "cancel"):
+            bot.send_message(m.chat.id, "Загрузка стикера отменена.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        if m.content_type == "sticker" and m.sticker:
+            storage.config["start_sticker_file_id"] = m.sticker.file_id
+            storage.save_config()
+            bot.send_message(m.chat.id, "🎭 Стикер сохранён.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        bot.send_message(m.chat.id, "Отправьте стикер. Для отмены отправьте '-'.")
+
+    def state_set_start_sticker_delay(m: Message):
+        text = (m.text or "").strip()
+        if text in ("-", "отмена", "cancel"):
+            bot.send_message(m.chat.id, "Отменено.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        try:
+            delay = max(0, int(text))
+            storage.config["start_sticker_delete_after"] = delay
+            storage.save_config()
+            bot.send_message(m.chat.id, f"Задержка удаления стикера: {delay} сек.")
+            tg.clear_state(m.chat.id, m.from_user.id)
+        except (ValueError, TypeError):
+            bot.send_message(m.chat.id, "Введите целое число секунд или '-' для отмены.")
+
     def state_admin_plan_name(m: Message):
         state = tg.get_state(m.chat.id, m.from_user.id)
         if not state:
@@ -6463,6 +6524,10 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_faq_text, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_faq_text"))
     tg.msg_handler(state_set_terms_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_terms_url"))
     tg.msg_handler(state_set_privacy_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_privacy_url"))
+    tg.msg_handler(state_set_start_sticker, content_types=["sticker", "text"],
+                   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_start_sticker"))
+    tg.msg_handler(state_set_start_sticker_delay, content_types=["text"],
+                   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_start_sticker_delay"))
     tg.msg_handler(state_admin_plan_name, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_name"))
     tg.msg_handler(state_admin_plan_devices, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_devices"))
     tg.msg_handler(state_admin_plan_price, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}admin_plan_price"))
@@ -6514,6 +6579,7 @@ def _admin_main_keyboard() -> K:
         B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token", style="primary"),
         B("💳 YooKassa", callback_data=f"{CB_PREFIX}admin:yookassa", style="primary"),
         B("🖼 Медиа сообщений", callback_data=f"{CB_PREFIX}admin:message_media", style="success"),
+        B("🎭 Стикер при старте", callback_data=f"{CB_PREFIX}admin:start_sticker", style="success"),
         B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq", style="success"),
         B("📄 Соглашение", callback_data=f"{CB_PREFIX}admin:terms", style="success"),
         B("🔒 Privacy", callback_data=f"{CB_PREFIX}admin:privacy", style="success"),
@@ -6757,6 +6823,54 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             storage.save_config()
             bot.edit_message_text("Медиа удалено.", chat_id, c.message.message_id,
                                   reply_markup=_admin_main_keyboard())
+            return
+
+        if section == "start_sticker":
+            sub = args[1] if len(args) > 1 else ""
+            if sub == "set":
+                bot.edit_message_text(
+                    "<b>🎭 Стикер при старте</b>\n\nОтправьте стикер, который бот будет показывать перед соглашением. Для отмены отправьте '-':",
+                    chat_id, c.message.message_id,
+                    reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:start_sticker")),
+                )
+                tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_start_sticker")
+                return
+            if sub == "delay":
+                bot.edit_message_text(
+                    f"<b>🎭 Стикер при старте</b>\n\nТекущая задержка удаления: {storage.config.get('start_sticker_delete_after', 2)} сек.\n\nОтправьте новое количество секунд (например, 2):",
+                    chat_id, c.message.message_id,
+                    reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:start_sticker")),
+                )
+                tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_start_sticker_delay")
+                return
+            if sub == "toggle":
+                storage.config["start_sticker_test_mode"] = not storage.config.get("start_sticker_test_mode", False)
+                storage.save_config()
+                bot.answer_callback_query(c.id, "Тест-режим переключён.")
+                sub = ""
+            if sub == "delete":
+                storage.config.pop("start_sticker_file_id", None)
+                storage.save_config()
+                bot.answer_callback_query(c.id, "Стикер удалён.")
+                sub = ""
+            file_id = storage.config.get("start_sticker_file_id", "")
+            delay = storage.config.get("start_sticker_delete_after", 2)
+            test_mode = storage.config.get("start_sticker_test_mode", False)
+            text = (
+                f"<b>🎭 Стикер при старте</b>\n\n"
+                f"Стикер: {'задан' if file_id else 'не задан'}\n"
+                f"Задержка удаления: {delay} сек.\n"
+                f"Тест-режим (отправлять каждый /start): {'🟢 Вкл' if test_mode else '🔴 Выкл'}\n\n"
+                f"Отправьте стикер через «Загрузить стикер», настройте задержку и включите тест, если нужно отправлять стикер при каждом /start."
+            )
+            kb = K(row_width=1)
+            kb.add(B("🔄 Загрузить стикер", callback_data=f"{CB_PREFIX}admin:start_sticker:set", style="primary"))
+            kb.add(B(f"⏱ Задержка: {delay} сек", callback_data=f"{CB_PREFIX}admin:start_sticker:delay"))
+            kb.add(B(f"{'🔴 Выкл' if test_mode else '🟢 Вкл'} тест-режим", callback_data=f"{CB_PREFIX}admin:start_sticker:toggle"))
+            if file_id:
+                kb.add(B("🗑 Удалить стикер", callback_data=f"{CB_PREFIX}admin:start_sticker:delete", style="danger"))
+            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
+            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
             return
 
         if section == "faq":
