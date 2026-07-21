@@ -3877,7 +3877,17 @@ class UserBot:
 
     def __init__(self, token: str) -> None:
         self.token = token
-        self.bot = telebot.TeleBot(token, parse_mode="HTML", allow_sending_without_reply=True, num_threads=5)
+        # Явно подхватываем прокси из _main.cfg, чтобы user-бот точно его использовал
+        try:
+            from configparser import ConfigParser
+            cfg = ConfigParser()
+            cfg.read("configs/_main.cfg")
+            proxy = cfg.get("Telegram", "proxy", fallback="").strip()
+            if proxy:
+                telebot.apihelper.proxy = {"http": proxy, "https": proxy}
+        except Exception:
+            pass
+        self.bot = telebot.TeleBot(token, parse_mode="HTML", allow_sending_without_reply=True, num_threads=10)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._states: dict[int, dict[str, Any]] = {}
@@ -4068,7 +4078,9 @@ class UserBot:
     # ---- commands ----
     def _cmd_start(self, m: Message) -> None:
         user_id = m.from_user.id
-        if self._check_maintenance(user_id, m.chat.id):
+        chat_id = m.chat.id
+        logger.info("[UserBot] Получен /start от user_id=%s chat_id=%s", user_id, chat_id)
+        if self._check_maintenance(user_id, chat_id):
             return
         username = m.from_user.username or ""
         source, referred_by = self._parse_start_param(m, user_id)
@@ -4092,14 +4104,17 @@ class UserBot:
         sticker_path = storage.config.get("start_sticker_file_path", "")
         test_mode = storage.config.get("start_sticker_test_mode", False)
         if (sticker_id or sticker_path) and (test_mode or is_new):
+            logger.info("[UserBot] /start отправлен в стикер-очередь user_id=%s", user_id)
             if self._sticker_queue is not None:
-                self._sticker_queue.put((user_id, m.chat.id))
+                self._sticker_queue.put((user_id, chat_id))
             else:
-                self._send_start_sticker_then_continue(user_id, m.chat.id)
+                self._send_start_sticker_then_continue(user_id, chat_id)
             return
-        self._continue_start(user_id, m.chat.id)
+        logger.info("[UserBot] /start продолжается без стикера user_id=%s", user_id)
+        self._continue_start(user_id, chat_id)
 
     def _continue_start(self, user_id: int, chat_id: int) -> None:
+        logger.info("[UserBot] _continue_start user_id=%s chat_id=%s terms=%s", user_id, chat_id, self._terms_agreed(user_id))
         if not self._terms_agreed(user_id):
             self._prompt_terms_agreement(user_id, chat_id)
             return
@@ -4108,6 +4123,7 @@ class UserBot:
         self._send_welcome(user_id, chat_id)
 
     def _sticker_worker(self) -> None:
+        logger.info("[UserBot] Стикер-воркер запущен")
         while not self._stop.is_set():
             try:
                 task = self._sticker_queue.get(timeout=1)
@@ -4116,18 +4132,22 @@ class UserBot:
             if task is None:
                 continue
             user_id, chat_id = task
+            logger.info("[UserBot] Стикер-воркер обрабатывает user_id=%s chat_id=%s", user_id, chat_id)
             try:
                 self._send_start_sticker_then_continue(user_id, chat_id)
             except Exception:
                 logger.exception("Ошибка в стикер-воркере")
 
     def _send_start_sticker_then_continue(self, user_id: int, chat_id: int) -> None:
+        logger.info("[UserBot] _send_start_sticker_then_continue user_id=%s chat_id=%s", user_id, chat_id)
         sticker_id = storage.config.get("start_sticker_user_bot_file_id") or storage.config.get("start_sticker_file_id", "")
         sticker_path = storage.config.get("start_sticker_file_path", "")
+        logger.info("[UserBot] стикер file_id=%s путь=%s", bool(sticker_id), sticker_path)
         msg = None
         if sticker_id:
             try:
                 msg = self.bot.send_sticker(chat_id, sticker_id, timeout=10)
+                logger.info("[UserBot] стикер отправлен по file_id, msg_id=%s", msg.message_id if msg else None)
             except Exception:
                 logger.exception("Не удалось отправить стартовый стикер по file_id")
         if not msg and sticker_path and Path(sticker_path).is_file():
@@ -4137,9 +4157,11 @@ class UserBot:
                 if msg and msg.sticker:
                     storage.config["start_sticker_user_bot_file_id"] = msg.sticker.file_id
                     storage.save_config()
+                logger.info("[UserBot] стикер отправлен из файла, msg_id=%s", msg.message_id if msg else None)
             except Exception:
                 logger.exception("Не удалось отправить стартовый стикер из файла")
         if not msg:
+            logger.info("[UserBot] стикер не отправлен, продолжаем к соглашению")
             self._continue_start(user_id, chat_id)
             return
         delay = max(0, int(storage.config.get("start_sticker_delete_after", 2)))
@@ -4149,6 +4171,7 @@ class UserBot:
         try:
             time.sleep(delay)
             self.bot.delete_message(chat_id, msg.message_id, timeout=10)
+            logger.info("[UserBot] стикер удалён")
         except Exception:
             pass
         try:
@@ -5619,13 +5642,15 @@ class UserBot:
         self._sticker_thread.start()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("User-бот запущен.")
+        logger.info("[UserBot] User-бот запущен (thread=%s).", self._thread.ident)
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                logger.info("[UserBot] polling стартует")
                 # skip_pending=False чтобы не терять successful_payment после рестарта
                 self.bot.polling(non_stop=True, skip_pending=False, timeout=10, long_polling_timeout=5)
+                logger.info("[UserBot] polling завершён")
             except Exception:
                 logger.exception("Ошибка polling user-бота")
                 time.sleep(5)
@@ -5655,9 +5680,9 @@ class UserBot:
             except Exception:
                 pass
         if self._sticker_thread and self._sticker_thread.is_alive():
-            self._sticker_thread.join(timeout=5)
+            self._sticker_thread.join(timeout=10)
         if self._thread:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=20)
 
 
 # ==================== Admin Panel (Cardinal bot) ====================
@@ -5676,6 +5701,9 @@ def _start_user_bot(cardinal: Cardinal, chat_id: int | None = None) -> None:
         return
     if _user_bot_instance is not None:
         _user_bot_instance.stop()
+        # Даём старому polling'у время корректно завершиться, иначе два
+        # параллельных getUpdates на одном токене конфликтуют.
+        time.sleep(2)
     try:
         _user_bot_instance = UserBot(token)
         _user_bot_instance.start()
