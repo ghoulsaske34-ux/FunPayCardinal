@@ -43,6 +43,9 @@ except Exception:
     HAS_FASTAPI = False
 
 import telebot
+# Прокси часто медленный — даём Telegram API больше времени на соединение и ответ.
+telebot.apihelper.CONNECT_TIMEOUT = 60
+telebot.apihelper.READ_TIMEOUT = 60
 from telebot.types import InlineKeyboardMarkup as _InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, WebAppInfo
 
 
@@ -4146,14 +4149,14 @@ class UserBot:
         msg = None
         if sticker_id:
             try:
-                msg = self.bot.send_sticker(chat_id, sticker_id, timeout=10)
+                msg = self.bot.send_sticker(chat_id, sticker_id, timeout=45)
                 logger.info("[UserBot] стикер отправлен по file_id, msg_id=%s", msg.message_id if msg else None)
             except Exception:
                 logger.exception("Не удалось отправить стартовый стикер по file_id")
         if not msg and sticker_path and Path(sticker_path).is_file():
             try:
                 from telebot.types import InputFile
-                msg = self.bot.send_sticker(chat_id, InputFile(sticker_path), timeout=15)
+                msg = self.bot.send_sticker(chat_id, InputFile(sticker_path), timeout=45)
                 if msg and msg.sticker:
                     storage.config["start_sticker_user_bot_file_id"] = msg.sticker.file_id
                     storage.save_config()
@@ -4170,7 +4173,7 @@ class UserBot:
         # основные worker-потоки user-бота не блокируются при долгих API-запросах.
         try:
             time.sleep(delay)
-            self.bot.delete_message(chat_id, msg.message_id, timeout=10)
+            self.bot.delete_message(chat_id, msg.message_id, timeout=45)
             logger.info("[UserBot] стикер удалён")
         except Exception:
             pass
