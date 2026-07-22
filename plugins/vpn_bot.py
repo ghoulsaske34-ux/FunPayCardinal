@@ -348,11 +348,6 @@ class VPNStorage:
             "support_id": "",
             "crypto_bot_token": "",
             "crypto_bot_webhook_enabled": False,
-            "yookassa_shop_id": "",
-            "yookassa_secret_key": "",
-            "yookassa_return_url": "",
-            "yookassa_webhook_url": "",
-            "yookassa_webhook_enabled": False,
             "subscription_public_url": "",
             "mini_app_public_url": "",
             "mini_app_enabled": True,
@@ -1791,53 +1786,6 @@ class CryptoBotAPI:
             return []
 
 
-class YooKassaAPI:
-    """Реальная интеграция с YooKassa (карты/СБП/ЮMoney)."""
-
-    BASE_URL = "https://api.yookassa.ru/v3/payments"
-
-    def __init__(self, shop_id: str, secret_key: str) -> None:
-        self.shop_id = shop_id
-        self.secret_key = secret_key
-        self._auth = base64.b64encode(f"{shop_id}:{secret_key}".encode()).decode()
-
-    def _headers(self, idempotence_key: str | None = None) -> dict[str, str]:
-        h = {
-            "Authorization": f"Basic {self._auth}",
-            "Content-Type": "application/json",
-        }
-        if idempotence_key:
-            h["Idempotence-Key"] = idempotence_key
-        return h
-
-    def create_payment(self, user_id: int, rub_amount: Decimal, return_url: str) -> dict[str, Any]:
-        rub_amount = _money_round(rub_amount)
-        amount_str = f"{rub_amount:.2f}"
-        idk = f"yookassa_{user_id}_{int(time.time() * 1000)}"
-        payload = {
-            "amount": {"value": amount_str, "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": return_url},
-            "capture": True,
-            "description": f"Пополнение VPN баланса на {amount_str}₽",
-            "metadata": {"user_id": user_id, "rub_amount": str(rub_amount)},
-        }
-        try:
-            r = requests.post(self.BASE_URL, json=payload, headers=self._headers(idk), timeout=30)
-            r.raise_for_status()
-            return {"ok": True, "payment": r.json()}
-        except Exception:
-            logger.exception("YooKassa create_payment failed")
-            return {"ok": False, "error": "YooKassa create payment failed"}
-
-    def get_payment(self, payment_id: str) -> dict[str, Any] | None:
-        try:
-            r = requests.get(f"{self.BASE_URL}/{payment_id}", headers=self._headers(), timeout=30)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            logger.exception("YooKassa get_payment failed")
-            return None
-
 
 class CryptoBotPoller:
     """Фоновый поток опроса статуса инвойсов Crypto Bot."""
@@ -1904,49 +1852,6 @@ class CryptoBotPoller:
         if self._thread:
             self._thread.join(timeout=5)
 
-
-class YooKassaPoller:
-    """Фоновый поток опроса статуса платежей YooKassa (фолбэк, если webhook не настроен)."""
-
-    def __init__(self, bot: "UserBot") -> None:
-        self.bot = bot
-        self.api: YooKassaAPI | None = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        shop_id = storage.config.get("yookassa_shop_id", "")
-        secret_key = storage.config.get("yookassa_secret_key", "")
-        if not shop_id or not secret_key:
-            return
-        self.api = YooKassaAPI(shop_id, secret_key)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._poll()
-            except Exception:
-                logger.exception("YooKassaPoller error")
-            time.sleep(30)
-
-    def _poll(self) -> None:
-        if not self.api:
-            return
-        for payment_id in storage.pending_payments("yookassa"):
-            payment = self.api.get_payment(payment_id)
-            if payment and payment.get("status") == "succeeded":
-                _handle_yookassa_payment(payment)
-            elif payment and payment.get("status") in ("canceled", "expired"):
-                storage.mark_pending_payment(payment_id, payment["status"])
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
 
 
 class SubscriptionScheduler:
@@ -2404,25 +2309,6 @@ class MiniAppAPI:
                 storage.add_crypto_invoice(invoice_id, user_id, crypto_amount, asset, rub_amount)
                 return {"ok": True, "payment_url": pay_url}
             return {"ok": False, "error": result.get("error", "Не удалось создать счёт")}
-        if method == "yookassa":
-            shop_id = storage.config.get("yookassa_shop_id", "")
-            secret_key = storage.config.get("yookassa_secret_key", "")
-            if not shop_id or not secret_key:
-                return {"ok": False, "error": "YooKassa не настроена"}
-            return_url = storage.config.get("yookassa_return_url") or storage.config.get("mini_app_public_url") or f"https://t.me/{storage.config.get('bot_username', '')}"
-            if not return_url:
-                return_url = "https://t.me"
-            api = YooKassaAPI(shop_id, secret_key)
-            result = api.create_payment(user_id, rub_amount, return_url)
-            if not result.get("ok"):
-                return {"ok": False, "error": result.get("error", "Ошибка создания платежа")}
-            payment = result.get("payment") or {}
-            pay_url = payment.get("confirmation", {}).get("confirmation_url")
-            payment_id = payment.get("id")
-            if not pay_url or not payment_id:
-                return {"ok": False, "error": "YooKassa не вернула ссылку"}
-            storage.add_pending_payment(payment_id, user_id, rub_amount, "yookassa")
-            return {"ok": True, "payment_url": pay_url}
         return {"ok": False, "error": "Неизвестный способ оплаты"}
 
 
@@ -2660,42 +2546,6 @@ def _handle_crypto_invoice_paid(invoice: dict[str, Any]) -> None:
             pass
 
 
-def _handle_yookassa_payment(payment: dict[str, Any]) -> None:
-    """Зачисляет оплаченный YooKassa-платёж на баланс пользователя."""
-    payment_id = payment.get("id")
-    if not payment_id:
-        return
-    if payment.get("status") != "succeeded":
-        storage.mark_pending_payment(payment_id, payment.get("status", "unknown"))
-        return
-    amount_data = payment.get("amount", {})
-    try:
-        paid_rub = _to_dec(amount_data.get("value", 0))
-    except Exception:
-        logger.error("YooKassa payment %s has invalid amount", payment_id)
-        return
-    metadata = payment.get("metadata", {})
-    uid = metadata.get("user_id")
-    if not uid:
-        local = storage.get_pending_payment(payment_id)
-        uid = local.get("user_id") if local else None
-    if not uid:
-        logger.warning("YooKassa payment %s has no user_id", payment_id)
-        return
-    rub_amount = _money_round(paid_rub)
-    if rub_amount <= 0:
-        logger.warning("YooKassa payment %s has zero rub amount", payment_id)
-        return
-    credited = storage.add_balance(int(uid), rub_amount, "YooKassa", f"yookassa:{payment_id}", payment_id)
-    if credited:
-        storage.mark_pending_payment(payment_id, "paid")
-        try:
-            msg = f"Баланс пополнен на {_money_str(rub_amount)}₽ через YooKassa."
-            if _user_bot_instance and _user_bot_instance.bot:
-                _user_bot_instance.bot.send_message(int(uid), msg)
-        except Exception:
-            pass
-
 
 class DeviceAuthServer:
     """FastAPI-сервер авторизации устройств и вебхуков CryptoBot."""
@@ -2805,22 +2655,6 @@ class DeviceAuthServer:
                 _handle_crypto_invoice_paid(data.get("payload", {}))
             return {"ok": True}
 
-        @app.post("/yookassa/webhook")
-        async def yookassa_webhook(request: Request) -> dict:
-            ip = request.client.host if request.client else "unknown"
-            if not DeviceAuthServer._rate_limit(ip, max_req=100, window=60):
-                raise HTTPException(status_code=429)
-            if not storage.config.get("yookassa_webhook_enabled", False):
-                raise HTTPException(status_code=503, detail="yookassa webhooks disabled")
-            try:
-                data = await request.json()
-            except Exception:
-                raise HTTPException(status_code=400, detail="invalid json")
-            event = data.get("event", "")
-            payment = data.get("object", {})
-            if event.startswith("payment.") and payment:
-                _handle_yookassa_payment(payment)
-            return {"ok": True}
 
         @app.get("/sub/{sub_id}")
         async def subscription(sub_id: str, request: Request, format: str = "raw") -> Any:
@@ -3897,7 +3731,6 @@ class UserBot:
         self._state_lock = threading.RLock()
         self._channel_cache: dict[int, tuple[bool, float]] = {}
         self._crypto_poller: CryptoBotPoller | None = None
-        self._yookassa_poller: YooKassaPoller | None = None
         self._scheduler: SubscriptionScheduler | None = None
         self._rates_fetcher: RatesFetcher | None = None
         self._health_checker: HealthChecker | None = None
@@ -3992,9 +3825,6 @@ class UserBot:
         def on_deposit_stars_amount(m: Message):
             self._on_deposit_stars_amount(m)
 
-        @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "deposit_yookassa_rubles"))
-        def on_deposit_yookassa_amount(m: Message):
-            self._on_deposit_yookassa_amount(m)
 
         @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "withdraw_amount"))
         def on_withdraw_amount(m: Message):
@@ -4652,11 +4482,6 @@ class UserBot:
                                        reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars_preset", f"{CB_PREFIX}deposit"))
             return
 
-        if action == "deposit_yookassa":
-            self.set_state(user_id, "deposit_yookassa_rubles", {"message_id": c.message.message_id})
-            self._edit_message("Выберите сумму пополнения в рублях (YooKassa):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_yookassa_preset", f"{CB_PREFIX}deposit"))
-            return
 
         if action == "deposit_crypto_preset" and len(args) >= 2:
             asset, rub_str = args[0], args[1]
@@ -4686,19 +4511,6 @@ class UserBot:
             self._create_stars_invoice(user_id, chat_id, c.message.message_id, rub)
             return
 
-        if action == "deposit_yookassa_preset" and len(args) >= 1:
-            rub_str = args[0]
-            if rub_str == "custom":
-                self.set_state(user_id, "deposit_yookassa_rubles", {"message_id": c.message.message_id})
-                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
-                                           reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
-                return
-            try:
-                rub = int(rub_str)
-            except ValueError:
-                return
-            self._create_yookassa_invoice(user_id, chat_id, c.message.message_id, rub)
-            return
 
         if action == "check_crypto":
             self._edit_message("Оплатите счёт выше, затем нажмите «Проверить оплату».\n"
@@ -4708,10 +4520,6 @@ class UserBot:
                                                           B("Главное меню", callback_data=f"{CB_PREFIX}main")))
             return
 
-        if action == "check_yookassa" and args:
-            payment_id = args[0]
-            self._check_yookassa_payment(user_id, chat_id, c.message.message_id, payment_id)
-            return
 
         if action == "referral":
             self._referral_menu(user_id, chat_id, c.message.message_id)
@@ -5107,7 +4915,6 @@ class UserBot:
                 f"⭐ Telegram Stars: 1.3 Stars = 1₽\n\n"
                 f"Выберите способ:")
         kb = K()
-        kb.add(B("💳 YooKassa (карта/СБП)", callback_data=f"{CB_PREFIX}deposit_yookassa"))
         kb.add(B("💵 Crypto Bot USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
         kb.add(B("🌐 Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
         kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
@@ -5205,80 +5012,6 @@ class UserBot:
         message_id = state["data"].get("message_id")
         self.clear_state(user_id)
         self._create_stars_invoice(user_id, m.chat.id, message_id, rub_amount)
-
-    def _create_yookassa_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal) -> None:
-        shop_id = storage.config.get("yookassa_shop_id", "")
-        secret_key = storage.config.get("yookassa_secret_key", "")
-        if not shop_id or not secret_key:
-            self._edit_message("YooKassa не настроена. Обратитесь к администратору.", chat_id, message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
-            return
-        rub_amount = _money_round(rub_amount)
-        return_url = storage.config.get("yookassa_return_url") or f"https://t.me/{storage.config.get('bot_username', '')}"
-        if not return_url:
-            return_url = "https://t.me"
-        api = YooKassaAPI(shop_id, secret_key)
-        result = api.create_payment(user_id, rub_amount, return_url)
-        if not result.get("ok"):
-            self._edit_message(f"Ошибка создания платежа: {result.get('error', 'unknown')}", chat_id, message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
-            return
-        payment = result.get("payment") or {}
-        pay_url = payment.get("confirmation", {}).get("confirmation_url")
-        payment_id = payment.get("id")
-        if not pay_url or not payment_id:
-            self._edit_message("Ошибка: YooKassa не вернула ссылку на оплату.", chat_id, message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
-            return
-        storage.add_pending_payment(payment_id, user_id, rub_amount, "yookassa")
-        kb = K()
-        kb.add(B("Оплатить", url=pay_url))
-        kb.add(B("Проверить оплату", callback_data=f"{CB_PREFIX}check_yookassa:{payment_id}"))
-        kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
-        self._edit_message(f"Платёж на {_money_str(rub_amount)}₽ создан. Оплатите по кнопке ниже.",
-                                   chat_id, message_id, reply_markup=kb)
-
-    def _on_deposit_yookassa_amount(self, m: Message) -> None:
-        user_id = m.from_user.id
-        if self._check_maintenance(user_id, m.chat.id):
-            return
-        state = self.get_state(user_id)
-        if not state:
-            return
-        rub_amount = self._is_valid_amount(m.text)
-        if rub_amount is None:
-            self.bot.send_message(m.chat.id, "Введите положительную числовую сумму.")
-            return
-        message_id = state["data"].get("message_id")
-        self.clear_state(user_id)
-        self._create_yookassa_invoice(user_id, m.chat.id, message_id, rub_amount)
-
-    def _check_yookassa_payment(self, user_id: int, chat_id: int, message_id: int, payment_id: str) -> None:
-        shop_id = storage.config.get("yookassa_shop_id", "")
-        secret_key = storage.config.get("yookassa_secret_key", "")
-        if not shop_id or not secret_key:
-            self._edit_message("YooKassa не настроена.", chat_id, message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
-            return
-        api = YooKassaAPI(shop_id, secret_key)
-        payment = api.get_payment(payment_id)
-        if not payment:
-            self._edit_message("Не удалось получить статус платежа. Попробуйте позже.", chat_id, message_id,
-                                       reply_markup=K().add(B("Проверить оплату", callback_data=f"{CB_PREFIX}check_yookassa:{payment_id}"),
-                                                          B("Главное меню", callback_data=f"{CB_PREFIX}main")))
-            return
-        if payment.get("status") == "succeeded":
-            _handle_yookassa_payment(payment)
-            self._edit_message("Платёж успешно зачислен!", chat_id, message_id,
-                                       reply_markup=self._keyboard_main(user_id))
-        elif payment.get("status") in ("canceled", "expired"):
-            storage.mark_pending_payment(payment_id, payment["status"])
-            self._edit_message("Платёж отменён или истёк.", chat_id, message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
-        else:
-            self._edit_message("Платёж ещё не оплачен. Оплатите по ссылке и нажмите «Проверить оплату».", chat_id, message_id,
-                                       reply_markup=K().add(B("Проверить оплату", callback_data=f"{CB_PREFIX}check_yookassa:{payment_id}"),
-                                                          B("Главное меню", callback_data=f"{CB_PREFIX}main")))
 
     def _on_promo_code(self, m: Message) -> None:
         user_id = m.from_user.id
@@ -5623,8 +5356,6 @@ class UserBot:
         else:
             self._crypto_poller = CryptoBotPoller(self)
             self._crypto_poller.start()
-        self._yookassa_poller = YooKassaPoller(self)
-        self._yookassa_poller.start()
         self._scheduler = SubscriptionScheduler(self)
         self._scheduler.start()
         self._rates_fetcher = RatesFetcher()
@@ -5663,8 +5394,6 @@ class UserBot:
         self.bot.stop_polling()
         if self._crypto_poller:
             self._crypto_poller.stop()
-        if self._yookassa_poller:
-            self._yookassa_poller.stop()
         if self._scheduler:
             self._scheduler.stop()
         if self._rates_fetcher:
@@ -5783,37 +5512,6 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
         bot.send_message(m.chat.id, "Токен Crypto Bot сохранен.")
         tg.clear_state(m.chat.id, m.from_user.id)
 
-    def state_set_yookassa_shop_id(m: Message):
-        storage.config["yookassa_shop_id"] = m.text.strip()
-        storage.save_config()
-        bot.send_message(m.chat.id, "Shop ID YooKassa сохранён.")
-        tg.clear_state(m.chat.id, m.from_user.id)
-
-    def state_set_yookassa_secret(m: Message):
-        storage.config["yookassa_secret_key"] = m.text.strip()
-        storage.save_config()
-        bot.send_message(m.chat.id, "Secret key YooKassa сохранён.")
-        tg.clear_state(m.chat.id, m.from_user.id)
-
-    def state_set_yookassa_return(m: Message):
-        url = m.text.strip()
-        if not url.startswith(("http://", "https://")):
-            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://")
-            return
-        storage.config["yookassa_return_url"] = url
-        storage.save_config()
-        bot.send_message(m.chat.id, "Return URL YooKassa сохранён.")
-        tg.clear_state(m.chat.id, m.from_user.id)
-
-    def state_set_yookassa_webhook(m: Message):
-        url = m.text.strip()
-        if not url.startswith(("http://", "https://")):
-            bot.send_message(m.chat.id, "Нужен URL, начинающийся с http:// или https://")
-            return
-        storage.config["yookassa_webhook_url"] = url
-        storage.save_config()
-        bot.send_message(m.chat.id, "Webhook URL YooKassa сохранён. Не забудьте указать его в личном кабинете YooKassa.")
-        tg.clear_state(m.chat.id, m.from_user.id)
 
     def state_set_sub_url(m: Message):
         url = m.text.strip()
@@ -6614,10 +6312,6 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
     tg.msg_handler(state_set_channel, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_channel"))
     tg.msg_handler(state_set_support, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_support"))
     tg.msg_handler(state_set_crypto_token, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_crypto_token"))
-    tg.msg_handler(state_set_yookassa_shop_id, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_shop_id"))
-    tg.msg_handler(state_set_yookassa_secret, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_secret"))
-    tg.msg_handler(state_set_yookassa_return, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_return"))
-    tg.msg_handler(state_set_yookassa_webhook, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_yookassa_webhook"))
     tg.msg_handler(state_set_sub_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_sub_url"))
     tg.msg_handler(state_set_mini_app_url, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_mini_app_url"))
     tg.msg_handler(state_set_server, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, f"{CB_PREFIX}set_server"))
@@ -6725,7 +6419,6 @@ def _admin_main_keyboard() -> K:
         B("📢 Канал подписки", callback_data=f"{CB_PREFIX}admin:channel", style="success"),
         B("🆘 Админ поддержки", callback_data=f"{CB_PREFIX}admin:support", style="success"),
         B("🔐 Токен Crypto Bot", callback_data=f"{CB_PREFIX}admin:crypto_token", style="primary"),
-        B("💳 YooKassa", callback_data=f"{CB_PREFIX}admin:yookassa", style="primary"),
         B("🖼 Медиа сообщений", callback_data=f"{CB_PREFIX}admin:message_media", style="success"),
         B("🎭 Стикер при старте", callback_data=f"{CB_PREFIX}admin:start_sticker", style="success"),
         B("📖 Текст FAQ", callback_data=f"{CB_PREFIX}admin:faq", style="success"),
@@ -6876,63 +6569,6 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
             tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_crypto_token")
             return
 
-        if section == "yookassa":
-            shop_id = storage.config.get('yookassa_shop_id') or 'не задан'
-            secret = storage.config.get('yookassa_secret_key') or ''
-            return_url = storage.config.get('yookassa_return_url') or 'не задан'
-            webhook_url = storage.config.get('yookassa_webhook_url') or 'не задан'
-            enabled = storage.config.get('yookassa_webhook_enabled', False)
-            text = (
-                f"<b>💳 YooKassa</b>\n\n"
-                f"Shop ID: <code>{shop_id}</code>\n"
-                f"Secret key: <code>{'*' * (len(secret) - 4) + secret[-4:] if len(secret) > 4 else 'не задан'}</code>\n"
-                f"Return URL: <code>{return_url}</code>\n"
-                f"Webhook URL: <code>{webhook_url}</code>\n"
-                f"Webhook-уведомления: {'вкл' if enabled else 'выкл'}\n\n"
-                f"Укажите webhook URL в личном кабинете YooKassa: Settings → Integration → Notifications."
-            )
-            kb = K(row_width=2)
-            kb.add(B("🆔 Shop ID", callback_data=f"{CB_PREFIX}admin:yookassa_shop_id"))
-            kb.add(B("🔑 Secret key", callback_data=f"{CB_PREFIX}admin:yookassa_secret"))
-            kb.add(B("🔁 Return URL", callback_data=f"{CB_PREFIX}admin:yookassa_return"))
-            kb.add(B("🌐 Webhook URL", callback_data=f"{CB_PREFIX}admin:yookassa_webhook"))
-            toggle_label = f"{'🟢 Вкл' if enabled else '🔴 Выкл'} webhook-уведомления"
-            kb.add(B(toggle_label, callback_data=f"{CB_PREFIX}admin:yookassa_toggle"))
-            kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}admin:main", style="primary"))
-            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=kb)
-            return
-
-        if section == "yookassa_shop_id":
-            bot.edit_message_text("<b>YooKassa Shop ID</b>\n\nОтправьте Shop ID (число):", chat_id, c.message.message_id,
-                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:yookassa")))
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_yookassa_shop_id")
-            return
-
-        if section == "yookassa_secret":
-            bot.edit_message_text("<b>YooKassa Secret key</b>\n\nОтправьте секретный ключ (live_... или test_...):", chat_id, c.message.message_id,
-                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:yookassa")))
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_yookassa_secret")
-            return
-
-        if section == "yookassa_return":
-            bot.edit_message_text("<b>YooKassa Return URL</b>\n\nОтправьте URL, на который вернётся пользователь после оплаты (например, https://t.me/ваш_бот):", chat_id, c.message.message_id,
-                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:yookassa")))
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_yookassa_return")
-            return
-
-        if section == "yookassa_webhook":
-            bot.edit_message_text("<b>YooKassa Webhook URL</b>\n\nОтправьте URL для уведомлений, который надо указать в личном кабинете YooKassa:", chat_id, c.message.message_id,
-                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:yookassa")))
-            tg.set_state(chat_id, c.message.message_id, user_id, f"{CB_PREFIX}set_yookassa_webhook")
-            return
-
-        if section == "yookassa_toggle":
-            storage.config["yookassa_webhook_enabled"] = not storage.config.get("yookassa_webhook_enabled", False)
-            storage.save_config()
-            # re-render yookassa screen by simulating callback
-            bot.edit_message_text("Настройки сохранены.", chat_id, c.message.message_id,
-                                  reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:yookassa")))
-            return
 
         if section == "message_media":
             kb = K(row_width=2)
