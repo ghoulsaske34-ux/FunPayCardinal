@@ -3749,11 +3749,13 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription)
 
 def _subscription_headers(sub: Subscription) -> dict[str, str]:
     """HTTP-заголовки с мета-информацией подписки для клиентов."""
-    title = storage.config.get(
-        "profile_title",
+    title = storage.config.get("profile_title", "🐸 Пепе ВПН")
+    title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+    announce = storage.config.get(
+        "profile_announce",
         "🐸 Защита лягушки Пепе\n🔰Наш бот: @vpnpepe_robot\n❗️Если что-то не работает обновите подписку 🔄",
     )
-    title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+    announce_b64 = "base64:" + base64.b64encode(announce.encode("utf-8")).decode("ascii")
     support = storage.config.get("support_id", "@support").lstrip("@")
     support_url = f"https://t.me/{support}" if support else ""
     bot_username = storage.config.get("bot_username", "vpnpepe_robot").lstrip("@")
@@ -3765,11 +3767,13 @@ def _subscription_headers(sub: Subscription) -> dict[str, str]:
         "profile-title": title_b64,
         "subscription-userinfo": userinfo,
         "profile-update-interval": "1",
+        "announce": announce_b64,
     }
     if support_url:
         headers["support-url"] = support_url
     if bot_url:
         headers["profile-web-page-url"] = bot_url
+        headers["announce-url"] = bot_url
     return headers
 
 
