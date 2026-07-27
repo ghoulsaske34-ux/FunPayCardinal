@@ -3,133 +3,187 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>VPN — Личный кабинет</title>
+<title>Pepe VPN</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root {
-  --accent: var(--tg-theme-button-color, #3390ec);
-  --accent-text: var(--tg-theme-button-text-color, #ffffff);
-  --bg: var(--tg-theme-bg-color, #ffffff);
-  --secondary-bg: var(--tg-theme-secondary-bg-color, #f5f5f5);
+  --accent: var(--tg-theme-button-color, #007AFF);
+  --accent-text: var(--tg-theme-button-text-color, #FFFFFF);
+  --bg: var(--tg-theme-bg-color, #F2F2F7);
+  --secondary-bg: var(--tg-theme-secondary-bg-color, #FFFFFF);
   --text: var(--tg-theme-text-color, #000000);
-  --hint: var(--tg-theme-hint-color, #8c8c8c);
-  --link: var(--tg-theme-link-color, #3390ec);
-  --danger: #ff3b30;
-  --success: #34c759;
-  --radius: 14px;
-  --shadow: 0 4px 20px rgba(0,0,0,0.08);
+  --hint: var(--tg-theme-hint-color, #8E8E93);
+  --link: var(--tg-theme-link-color, #007AFF);
+  --danger: #FF3B30;
+  --success: #34C759;
+  --radius: 22px;
+  --radius-sm: 14px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.06);
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; margin: 0; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   background: var(--bg);
   color: var(--text);
   display: flex; flex-direction: column; overflow: hidden;
 }
 #app { display: flex; flex-direction: column; height: 100%; }
 header {
-  padding: 16px; text-align: center; font-weight: 700; font-size: 18px;
-  background: var(--bg); border-bottom: 1px solid var(--secondary-bg);
-  position: relative; flex-shrink: 0;
+  padding: 18px 20px 10px;
+  background: var(--bg);
+  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  position: relative;
 }
 header .back {
-  position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
-  background: none; border: none; color: var(--link); font-size: 24px; cursor: pointer;
-  display: none;
+  position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--link); cursor: pointer;
+  padding: 8px; display: none;
 }
-main { flex: 1; overflow-y: auto; padding: 16px; padding-bottom: 80px; }
+header .title { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+main { flex: 1; overflow-y: auto; padding: 16px 16px 100px; }
 .page { display: none; }
-.page.active { display: block; animation: fade .18s ease; }
-@keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.page.active { display: block; animation: fade .22s ease; }
+@keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .card {
-  background: var(--secondary-bg); border-radius: var(--radius); padding: 16px;
-  margin-bottom: 12px; box-shadow: var(--shadow);
+  background: var(--secondary-bg);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
 }
-.card-title { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--hint); margin-bottom: 8px; }
-.big-value { font-size: 32px; font-weight: 700; }
-.btn {
-  display: block; width: 100%; padding: 14px; border: none; border-radius: 10px;
-  background: var(--accent); color: var(--accent-text); font-size: 16px; font-weight: 600;
-  cursor: pointer; margin-top: 10px; text-align: center;
-}
-.btn:disabled { opacity: .6; cursor: not-allowed; }
-.btn-outline {
-  background: transparent; color: var(--accent); border: 1px solid var(--accent);
-}
-.btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-input, select {
-  width: 100%; padding: 14px; border-radius: 10px; border: none;
-  background: var(--secondary-bg); color: var(--text); font-size: 16px; outline: none;
+.card-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--hint);
   margin-bottom: 10px;
+  font-weight: 600;
 }
-label { display: block; color: var(--hint); font-size: 13px; margin: 10px 0 4px; }
+.big-value { font-size: 36px; font-weight: 700; letter-spacing: -0.6px; }
+.btn {
+  display: block; width: 100%; padding: 16px;
+  border: none; border-radius: var(--radius-sm);
+  background: var(--accent); color: var(--accent-text);
+  font-size: 16px; font-weight: 600;
+  cursor: pointer; margin-top: 12px; text-align: center;
+  transition: opacity .15s, transform .1s;
+}
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-outline {
+  background: transparent; color: var(--accent);
+  border: 1px solid rgba(128,128,128,0.18);
+}
+.btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+input, select {
+  width: 100%; padding: 16px; border-radius: var(--radius-sm);
+  border: none; background: var(--bg); color: var(--text);
+  font-size: 16px; outline: none; margin-bottom: 12px;
+  -webkit-appearance: none;
+}
+label { display: block; color: var(--hint); font-size: 13px; margin: 12px 0 6px; font-weight: 600; }
 .list-item {
-  background: var(--secondary-bg); border-radius: var(--radius); padding: 14px;
-  margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;
+  background: var(--secondary-bg);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 12px;
+  display: flex; justify-content: space-between; align-items: center;
   cursor: pointer; transition: transform .1s;
+  box-shadow: var(--shadow);
 }
-.list-item:active { transform: scale(.99); }
+.list-item:active { transform: scale(0.99); }
 .list-item .info { flex: 1; }
-.list-item .title { font-weight: 600; }
-.list-item .subtitle { font-size: 13px; color: var(--hint); margin-top: 3px; }
-.list-item .arrow { color: var(--hint); font-size: 18px; }
+.list-item .title { font-weight: 600; font-size: 16px; }
+.list-item .subtitle { font-size: 13px; color: var(--hint); margin-top: 4px; }
+.list-item .arrow { color: var(--hint); font-size: 20px; font-weight: 300; }
 .status-badge {
-  display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px;
+  display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px;
   font-weight: 600; margin-left: 8px;
 }
-.status-active { background: rgba(52,199,89,.15); color: var(--success); }
-.status-expired { background: rgba(255,59,48,.15); color: var(--danger); }
+.status-active { background: rgba(52,199,89,.12); color: var(--success); }
+.status-expired { background: rgba(255,59,48,.12); color: var(--danger); }
 .bottom-nav {
   position: fixed; bottom: 0; left: 0; right: 0;
-  background: var(--bg); border-top: 1px solid var(--secondary-bg);
-  display: flex; justify-content: space-around; padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
+  background: rgba(242,242,247,.92);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-top: 1px solid rgba(128,128,128,0.08);
+  display: flex; justify-content: space-around;
+  padding: 10px 0 calc(10px + env(safe-area-inset-bottom));
   z-index: 100;
 }
 .bottom-nav button {
-  background: none; border: none; color: var(--hint); font-size: 11px; flex: 1;
-  display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer;
+  background: none; border: none; color: var(--hint);
+  font-size: 11px; flex: 1;
+  display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer;
+  transition: color .15s;
 }
 .bottom-nav button.active { color: var(--accent); }
-.bottom-nav .icon { font-size: 22px; }
-.hero { text-align: center; padding: 30px 10px; }
-.hero h1 { margin: 0; font-size: 22px; }
-.hero p { color: var(--hint); margin: 6px 0 0; }
+.bottom-nav .icon { width: 24px; height: 24px; }
+.hero { text-align: center; padding: 24px 10px 20px; }
+.hero h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.4px; }
+.hero p { color: var(--hint); margin: 8px 0 0; font-size: 15px; }
 .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .code-block {
-  background: var(--bg); border-radius: 10px; padding: 10px; font-family: monospace;
-  word-break: break-all; font-size: 13px; margin: 8px 0; border: 1px solid rgba(128,128,128,.2);
+  background: var(--bg); border-radius: var(--radius-sm); padding: 14px;
+  font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-break: break-all; font-size: 13px; margin: 10px 0; color: var(--text);
 }
-.qr-wrap { text-align: center; margin: 12px 0; }
-.qr-wrap img { max-width: 220px; border-radius: 12px; background: #fff; padding: 8px; }
-.copy-row { display: flex; gap: 8px; align-items: center; }
+.qr-wrap { text-align: center; margin: 14px 0; }
+.qr-wrap img { max-width: 220px; border-radius: 18px; background: #fff; padding: 10px; }
+.copy-row { display: flex; gap: 10px; align-items: center; }
 .copy-row input { flex: 1; margin: 0; }
-.copy-row button { padding: 12px 16px; border: none; border-radius: 10px; background: var(--accent); color: var(--accent-text); }
-.empty { text-align: center; color: var(--hint); padding: 40px 20px; }
+.copy-row button { padding: 12px 16px; border: none; border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-text); }
+.empty { text-align: center; color: var(--hint); padding: 50px 20px; }
 .link { color: var(--link); text-decoration: none; }
 .toast {
-  position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
-  background: rgba(0,0,0,.85); color: #fff; padding: 10px 20px; border-radius: 20px;
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+  background: rgba(0,0,0,.82); color: #fff; padding: 12px 22px; border-radius: 24px;
   font-size: 14px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 200;
+  backdrop-filter: blur(10px);
 }
 .toast.show { opacity: 1; }
-#loading { text-align: center; color: var(--hint); padding: 40px; }
+#loading { text-align: center; color: var(--hint); padding: 60px 20px; }
+.icon-inline { width: 18px; height: 18px; vertical-align: middle; margin-right: 6px; }
+.icon-btn { width: 20px; height: 20px; vertical-align: middle; margin-right: 8px; }
+.section-label { font-size: 13px; font-weight: 600; color: var(--hint); margin: 24px 0 10px; padding-left: 6px; }
+.stat-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(128,128,128,0.08); }
+.stat-row:last-child { border-bottom: none; }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <button class="back" id="backBtn">←</button>
-    <span id="pageTitle">VPN</span>
+    <button class="back" id="backBtn" aria-label="Back">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <span class="title" id="pageTitle">Pepe VPN</span>
   </header>
-  <main id="main"></main>
+  <main id="main"><div id="loading">Загрузка...</div></main>
 </div>
 <nav class="bottom-nav" id="nav">
-  <button data-page="home" class="active"><span class="icon">🏠</span><span>Главная</span></button>
-  <button data-page="subs"><span class="icon">📱</span><span>Подписки</span></button>
-  <button data-page="store"><span class="icon">🛒</span><span>Магазин</span></button>
-  <button data-page="refs"><span class="icon">👥</span><span>Рефералы</span></button>
-  <button data-page="profile"><span class="icon">👤</span><span>Профиль</span></button>
+  <button data-page="home" class="active">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+    <span>Главная</span>
+  </button>
+  <button data-page="subs">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+    <span>Подписки</span>
+  </button>
+  <button data-page="store">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+    <span>Магазин</span>
+  </button>
+  <button data-page="refs">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+    <span>Рефералы</span>
+  </button>
+  <button data-page="profile">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    <span>Профиль</span>
+  </button>
 </nav>
 <div class="toast" id="toast"></div>
 
@@ -141,11 +195,9 @@ let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {
 
 function $(id){ return document.getElementById(id); }
 function showToast(text){ const t=$('toast'); t.textContent=text; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000); }
-function copy(text){ navigator.clipboard.writeText(text).then(()=>showToast('Скопировано!')).catch(()=>showToast('Не удалось скопировать')); }
+function copy(text){ navigator.clipboard.writeText(text).then(()=>showToast('Скопировано')).catch(()=>showToast('Не удалось скопировать')); }
 
-function initData(){
-  return encodeURIComponent(tg.initData || '');
-}
+function initData(){ return encodeURIComponent(tg.initData || ''); }
 
 async function api(path, method='GET', body){
   const sep = path.includes('?') ? '&' : '?';
@@ -183,26 +235,43 @@ function updateNav(){
   document.querySelectorAll('.bottom-nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===state.page));
 }
 
+function icon(name, cls='icon-inline'){
+  const svgs = {
+    copy: '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    support: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5a8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
+    bot: '<rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><path d="M8 12h8"/><path d="M12 8v8"/>',
+    qr: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>',
+    share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>',
+    renew: '<path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+    wallet: '<path d="M1 7V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v2"/><path d="M1 7h20v10a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7z"/><path d="M16 11h2"/>',
+    bag: '<path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/>',
+    phone: '<rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>',
+    people: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  };
+  return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${svgs[name]||''}</svg>`;
+}
+
 function renderHome(main){
-  $('pageTitle').textContent = 'VPN';
+  $('pageTitle').textContent = 'Pepe VPN';
   const active = state.subscriptions.filter(s=>s.active && s.expires_at*1000>Date.now()).length;
   const u = state.user || {};
   main.innerHTML = `
     <div class="hero">
       <h1>Привет${u.username?', '+u.username:''}</h1>
-      <p>Твой персональный VPN-кабинет</p>
+      <p>Твой персональный VPN</p>
     </div>
     <div class="card" style="text-align:center;">
       <div class="card-title">Баланс</div>
       <div class="big-value">${fmtMoney(u.balance||0)} ₽</div>
       <div class="btn-group">
-        <button class="btn" onclick="render('deposit')">Пополнить</button>
-        <button class="btn btn-outline" onclick="render('store')">Купить VPN</button>
+        <button class="btn" onclick="render('deposit')">${icon('wallet','icon-btn')}Пополнить</button>
+        <button class="btn btn-outline" onclick="render('store')">${icon('bag','icon-btn')}Купить VPN</button>
       </div>
     </div>
     <div class="card">
       <div class="card-title">Активные подписки</div>
-      <div style="font-size:28px;font-weight:700;">${active}</div>
+      <div class="big-value" style="font-size:28px;">${active}</div>
       ${active?`<button class="btn btn-outline" onclick="render('subs')">Управлять</button>`:'<p style="color:var(--hint)">Нет активных подписок. <a class="link" onclick="render('store')">Купить</a></p>'}
     </div>
     <div class="quick-actions">
@@ -233,29 +302,34 @@ function renderSubDetail(main){
   $('pageTitle').textContent = 'Подписка';
   const s = state.selectedSub; if(!s){ render('subs'); return; }
   const active = s.active && s.expires_at*1000>Date.now();
+  const devicesText = `${s.devices_count||0} / ${s.max_devices||'?'}`;
   main.innerHTML = `
     <div class="card">
       <div class="card-title">${s.plan_name||s.plan_id}</div>
-      <p>Статус: <span class="status-badge ${active?'status-active':'status-expired'}">${active?'Активна':'Истекла'}</span></p>
-      <p>Действует до: <b>${fmtDate(s.expires_at)}</b></p>
-      <p>Осталось: ${daysLeft(s.expires_at)}</p>
-      <p>Устройств: ${s.devices_count||0} / ${s.max_devices||'?'}</p>
+      <div class="stat-row"><span>Статус</span><span class="status-badge ${active?'status-active':'status-expired'}">${active?'Активна':'Истекла'}</span></div>
+      <div class="stat-row"><span>Действует до</span><b>${fmtDate(s.expires_at)}</b></div>
+      <div class="stat-row"><span>Осталось</span><b>${daysLeft(s.expires_at)}</b></div>
+      <div class="stat-row"><span>Устройств</span><b>${devicesText}</b></div>
     </div>
     <div class="card">
-      <div class="card-title">🐸 Пепе ВПН</div>
-      <p style="font-size:13px;color:var(--hint);margin:0 0 8px 0">Добавьте ссылку в v2rayNG, v2rayTun или V2Box. Ссылка автоматически подтянет срок, трафик и поддержку.</p>
-      <input value="${s.sub_url||''}" readonly onclick="copy(this.value)">
-      <div class="btn-group" style="margin-top:8px">
-        <a class="btn btn-outline" href="https://t.me/kruzid" target="_blank">💬 Поддержка</a>
-        <a class="btn btn-outline" href="https://t.me/vpnpepe_robot" target="_blank">ℹ️ Бот</a>
+      <div class="card-title">Pepe VPN</div>
+      <p style="font-size:13px;color:var(--hint);margin:0 0 12px 0">Добавьте ссылку в v2rayNG, v2rayTun, Hiddify или V2Box. Ссылка подтянет срок, трафик и поддержку.</p>
+      <div class="copy-row">
+        <input value="${s.sub_url||''}" readonly onclick="copy(this.value)">
+        <button onclick="copy('${s.sub_url||'')}')">${icon('copy')}</button>
+      </div>
+      ${s.qr_url?`<div class="qr-wrap"><img src="${s.qr_url}" alt="QR"></div>`:''}
+      <div class="btn-group" style="margin-top:12px">
+        <a class="btn btn-outline" href="https://t.me/kruzid" target="_blank">${icon('support','icon-btn')}Поддержка</a>
+        <a class="btn btn-outline" href="https://t.me/vpnpepe_robot" target="_blank">${icon('bot','icon-btn')}Бот</a>
       </div>
     </div>
-    ${active?`<button class="btn" onclick="renewSubPrompt('${s.sub_id}')">Продлить</button>`:''}
+    ${active?`<button class="btn" onclick="renewSubPrompt('${s.sub_id}')">${icon('renew','icon-btn')}Продлить</button>`:''}
   `;
 }
 
 async function renewSubPrompt(id){
-  const months = prompt('На сколько месяцев продлить? (1,3,6,12):', '1'); if(!months) return;
+  const months = prompt('На сколько месяцев продлить? (1, 3, 6, 12):', '1'); if(!months) return;
   try {
     await api('/purchase', 'POST', { plan_id: state.selectedSub.plan_id, months: parseInt(months) });
     showToast('Подписка продлена'); await loadMe(); render('subs');
@@ -273,7 +347,7 @@ function renderStore(main){
       </div>
       <label>Срок</label>
       <select id="dur-${p.id}">${Object.entries(p.prices).map(([m,price])=>`<option value="${m}">${m} мес. — ${price} ₽</option>`).join('')}</select>
-      <button class="btn" onclick="buy('${p.id}')">Купить / Оформить</button>
+      <button class="btn" onclick="buy('${p.id}')">Купить</button>
     </div>
   `).join('');
 }
@@ -282,7 +356,7 @@ async function buy(planId){
   const months = parseInt($('dur-'+planId).value);
   try {
     const res = await api('/purchase', 'POST', { plan_id: planId, months });
-    if (res.ok) { showToast('Подписка оформлена!'); await loadMe(); render('subs'); }
+    if (res.ok) { showToast('Подписка оформлена'); await loadMe(); render('subs'); }
     else if (res.need_payment) { showToast('Недостаточно средств. Пополните баланс.'); render('deposit'); }
   } catch(e){ showToast(e.message||'Ошибка'); }
 }
@@ -294,18 +368,17 @@ function renderDeposit(main){
       <div class="card-title">Сумма пополнения</div>
       <input type="number" id="depAmount" placeholder="100" value="200">
       <div class="btn-group">
-        <button class="btn" onclick="setDep(100)">100 ₽</button>
-        <button class="btn" onclick="setDep(500)">500 ₽</button>
-        <button class="btn" onclick="setDep(1000)">1000 ₽</button>
-        <button class="btn" onclick="setDep(2000)">2000 ₽</button>
+        <button class="btn btn-outline" onclick="setDep(100)">100 ₽</button>
+        <button class="btn btn-outline" onclick="setDep(500)">500 ₽</button>
+        <button class="btn btn-outline" onclick="setDep(1000)">1000 ₽</button>
+        <button class="btn btn-outline" onclick="setDep(2000)">2000 ₽</button>
       </div>
     </div>
     <div class="card">
       <div class="card-title">Способ оплаты</div>
-      <button class="btn" onclick="doDeposit('yookassa')">💳 YooKassa (карта/СБП)</button>
-      <button class="btn" onclick="doDeposit('cryptobot','USDT')">💵 CryptoBot USDT</button>
-      <button class="btn" onclick="doDeposit('cryptobot','TON')">🌐 CryptoBot TON</button>
-      <button class="btn" onclick="doDeposit('stars')">⭐ Telegram Stars</button>
+      <button class="btn" onclick="doDeposit('cryptobot','USDT')">CryptoBot USDT</button>
+      <button class="btn" onclick="doDeposit('cryptobot','TON')">CryptoBot TON</button>
+      <button class="btn" onclick="doDeposit('stars')">Telegram Stars</button>
     </div>
   `;
 }
@@ -329,15 +402,15 @@ function renderRefs(main){
   const link = `https://t.me/${bot}?start=${u.referral_code||''}`;
   main.innerHTML = `
     <div class="card" style="text-align:center;">
-      <div class="card-title">Твоя реферальная ссылка</div>
+      <div class="card-title">Реферальная ссылка</div>
       <div class="code-block" onclick="copy('${link}')">${link}</div>
-      <button class="btn" onclick="copy('${link}')">Скопировать ссылку</button>
+      <button class="btn" onclick="copy('${link}')">${icon('copy','icon-btn')}Копировать ссылку</button>
     </div>
     <div class="card">
       <div class="card-title">Статистика</div>
-      <p>Рефералов 1 уровня: <b>${state.referrals.level1_count||0}</b></p>
-      <p>Рефералов 2 уровня: <b>${state.referrals.level2_count||0}</b></p>
-      <p>Заработано: <b>${fmtMoney(state.referrals.earnings||0)} ₽</b></p>
+      <div class="stat-row"><span>Рефералов 1 уровня</span><b>${state.referrals.level1_count||0}</b></div>
+      <div class="stat-row"><span>Рефералов 2 уровня</span><b>${state.referrals.level2_count||0}</b></div>
+      <div class="stat-row"><span>Заработано</span><b>${fmtMoney(state.referrals.earnings||0)} ₽</b></div>
     </div>
   `;
 }
@@ -348,13 +421,13 @@ function renderProfile(main){
   main.innerHTML = `
     <div class="card">
       <div class="card-title">Пользователь</div>
-      <p>ID: <code>${u.user_id||''}</code></p>
-      <p>Баланс: <b>${fmtMoney(u.balance||0)} ₽</b></p>
-      <p>Всего потрачено: <b>${fmtMoney(u.total_spent||0)} ₽</b></p>
-      <p>Куплено месяцев: <b>${u.total_months||0}</b></p>
-      <p>Пробный период: <b>${u.trial_used?'использован':'не использован'}</b></p>
+      <div class="stat-row"><span>ID</span><code>${u.user_id||''}</code></div>
+      <div class="stat-row"><span>Баланс</span><b>${fmtMoney(u.balance||0)} ₽</b></div>
+      <div class="stat-row"><span>Всего потрачено</span><b>${fmtMoney(u.total_spent||0)} ₽</b></div>
+      <div class="stat-row"><span>Куплено месяцев</span><b>${u.total_months||0}</b></div>
+      <div class="stat-row"><span>Пробный период</span><b>${u.trial_used?'использован':'не использован'}</b></div>
     </div>
-    <button class="btn" onclick="openSupport()">Написать в поддержку</button>
+    <button class="btn" onclick="openSupport()">${icon('support','icon-btn')}Написать в поддержку</button>
     ${state.isAdmin?`<button class="btn btn-outline" onclick="render('admin')">Админ-панель</button>`:''}
   `;
 }
@@ -364,12 +437,13 @@ async function renderAdmin(main){
   try {
     const data = await api('/metrics');
     main.innerHTML = `
-      <div class="card"><div class="card-title">Метрики</div>
-        <p>Пользователей: <b>${data.users_total}</b></p>
-        <p>Активных подписок: <b>${data.subscriptions_active}</b></p>
-        <p>MRR: <b>${fmtMoney(data.mrr_rub)} ₽</b></p>
-        <p>Выручка: <b>${fmtMoney(data.revenue_total_rub)} ₽</b></p>
-        <p>Онлайн: <b>${data.online_now}</b></p>
+      <div class="card">
+        <div class="card-title">Метрики</div>
+        <div class="stat-row"><span>Пользователей</span><b>${data.users_total}</b></div>
+        <div class="stat-row"><span>Активных подписок</span><b>${data.subscriptions_active}</b></div>
+        <div class="stat-row"><span>MRR</span><b>${fmtMoney(data.mrr_rub)} ₽</b></div>
+        <div class="stat-row"><span>Выручка</span><b>${fmtMoney(data.revenue_total_rub)} ₽</b></div>
+        <div class="stat-row"><span>Онлайн</span><b>${data.online_now}</b></div>
       </div>
     `;
   } catch(e){ main.innerHTML = '<div class="empty">Нет доступа</div>'; }
