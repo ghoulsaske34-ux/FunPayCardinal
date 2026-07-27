@@ -242,12 +242,16 @@ function renderSubDetail(main){
       <p>Устройств: ${s.devices_count||0} / ${s.max_devices||'?'}</p>
     </div>
     <div class="card">
-      <div class="card-title">Подписка</div>
-      <p style="font-size:13px;color:var(--hint);margin:0 0 8px 0">Добавьте ссылку в приложение (v2rayNG, V2Box, Streisand, sing-box, Clash Meta).</p>
-      <input value="${s.sub_url||''}" readonly onclick="copy(this.value)">
+      <div class="card-title">🐸 Пепе ВПН</div>
+      <p style="font-size:13px;color:var(--hint);margin:0 0 8px 0">Добавьте ссылку в v2rayTun, V2Box, v2rayNG или Hiddify. Ссылка автоматически подтянет срок, трафик и поддержку.</p>
+      <input value="${s.json_url||s.sub_url||''}" readonly onclick="copy(this.value)">
       <div class="btn-group">
         <button class="btn btn-outline" onclick="copy('${s.singbox_url||''}')">sing-box</button>
         <button class="btn btn-outline" onclick="copy('${s.clash_url||''}')">Clash Meta</button>
+      </div>
+      <div class="btn-group" style="margin-top:8px">
+        <a class="btn btn-outline" href="https://t.me/kruzid" target="_blank">💬 Поддержка</a>
+        <a class="btn btn-outline" href="https://t.me/vpnpepe_robot" target="_blank">ℹ️ Бот</a>
       </div>
     </div>
     ${active?`<button class="btn" onclick="renewSubPrompt('${s.sub_id}')">Продлить</button>`:''}

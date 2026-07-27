@@ -2179,7 +2179,6 @@ class MiniAppAPI:
     def _subscription_dict(sub: Subscription) -> dict[str, Any]:
         plan = storage.plan(sub.plan_id)
         server = storage.get_host(sub.host_id) or storage.server()
-        vless_url = generate_vless_url(sub, server) if server else ""
         sub_url = generate_subscription_url(sub, server) if server else ""
         devices_count = len(sub.devices)
         return {
@@ -2193,8 +2192,8 @@ class MiniAppAPI:
             "expires_at": sub.expires_at,
             "active": sub.active,
             "devices_count": devices_count,
-            "vless_url": vless_url,
             "sub_url": sub_url,
+            "json_url": sub_url,
             "singbox_url": f"{sub_url}?format=singbox" if sub_url else "",
             "clash_url": f"{sub_url}?format=clash" if sub_url else "",
         }
@@ -2659,8 +2658,8 @@ class DeviceAuthServer:
 
 
         @app.get("/sub/{sub_id}")
-        async def subscription(sub_id: str, request: Request, format: str = "raw") -> Any:
-            """Универсальная подписка: raw (base64 vless), singbox, clash."""
+        async def subscription(sub_id: str, request: Request, format: str = "json") -> Any:
+            """Универсальная подписка: json (по умолчанию), raw, singbox, clash."""
             ip = request.client.host if request.client else "unknown"
             if not DeviceAuthServer._rate_limit(ip, max_req=60, window=60):
                 raise HTTPException(status_code=429)
@@ -2671,14 +2670,17 @@ class DeviceAuthServer:
             if not server or not server.address or not server.public_key:
                 raise HTTPException(status_code=503, detail="server not configured")
             vless_url = generate_vless_url(sub, server)
-            fmt = (format or "raw").lower()
+            headers = _subscription_headers(sub)
+            fmt = (format or "json").lower()
             if fmt == "raw":
                 body = base64.b64encode(vless_url.encode("utf-8")).decode("ascii")
-                return Response(content=body, media_type="text/plain; charset=utf-8")
+                return Response(content=body, headers=headers, media_type="text/plain; charset=utf-8")
+            if fmt == "json":
+                return JSONResponse(build_v2raytun_json(vless_url, server, sub), headers=headers)
             if fmt == "singbox":
-                return JSONResponse(build_singbox_config(vless_url, server, sub))
+                return JSONResponse(build_singbox_config(vless_url, server, sub), headers=headers)
             if fmt == "clash":
-                return Response(content=build_clash_config(vless_url, server, sub), media_type="text/yaml; charset=utf-8")
+                return Response(content=build_clash_config(vless_url, server, sub), headers=headers, media_type="text/yaml; charset=utf-8")
             raise HTTPException(status_code=400, detail="unsupported format")
 
         # ---- Telegram Mini App (Web App) endpoints ----
@@ -3693,6 +3695,61 @@ def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) 
         "  - MATCH,Proxy",
     ]
     return "\n".join(lines)
+
+
+def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
+    """Строит JSON-подписку для v2RayTun / V2RayBox / Hiddify."""
+    return {
+        "servers": [
+            {
+                "name": "🐸 Пепе ВПН",
+                "address": server.address,
+                "port": server.port,
+                "protocol": "vless",
+                "settings": {
+                    "id": sub.client_uuid,
+                    "encryption": "none",
+                    "flow": server.flow or "xtls-rprx-vision",
+                },
+                "streamSettings": {
+                    "network": server.network or "tcp",
+                    "security": server.security or "reality",
+                    "tcpSettings": {"header": {"type": "none"}},
+                    "realitySettings": {
+                        "show": False,
+                        "fingerprint": server.fingerprint or "chrome",
+                        "publicKey": server.public_key,
+                        "serverName": server.server_name or server.address,
+                        "shortId": server.short_id,
+                        "spiderX": server.spider_x or "/",
+                    },
+                },
+            }
+        ]
+    }
+
+
+def _subscription_headers(sub: Subscription) -> dict[str, str]:
+    """HTTP-заголовки с мета-информацией подписки для клиентов."""
+    title = storage.config.get("profile_title", "🐸 Пепе ВПН")
+    title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+    support = storage.config.get("support_id", "@support").lstrip("@")
+    support_url = f"https://t.me/{support}" if support else ""
+    bot_username = storage.config.get("bot_username", "vpnpepe_robot").lstrip("@")
+    bot_url = f"https://t.me/{bot_username}" if bot_username else ""
+    expire = int(sub.expires_at) if sub.expires_at else 0
+    # total=0 означает безлимит для большинства клиентов
+    userinfo = f"upload=0; download=0; total=0; expire={expire}"
+    headers = {
+        "profile-title": title_b64,
+        "subscription-userinfo": userinfo,
+        "profile-update-interval": "1",
+    }
+    if support_url:
+        headers["support-url"] = support_url
+    if bot_url:
+        headers["profile-web-page-url"] = bot_url
+    return headers
 
 
 def _generate_qr_code(url: str) -> bytes | None:
@@ -4752,13 +4809,17 @@ class UserBot:
         sub_url = generate_subscription_url(sub, server)
         singbox_url = f"{sub_url}?format=singbox"
         clash_url = f"{sub_url}?format=clash"
+        expires = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y %H:%M")
         text = (
-            f"<b>Подключение к VPN</b>\n\n"
-            f"1. Установите приложение (v2rayNG, V2Box, Streisand, sing-box, Clash Meta)\n"
+            f"<b>🐸 Пепе ВПН</b>\n\n"
+            f"📅 Действует до: <code>{expires}</code>\n"
+            f"📊 Трафик: 0 / ∞ (безлимит)\n\n"
+            f"1. Установите приложение (v2rayTun, V2Box, v2rayNG, Streisand, sing-box, Clash Meta)\n"
             f"2. Скопируйте ссылку и добавьте как подписку.\n\n"
-            f"<b>Подписка:</b>\n<code>{_escape(sub_url)}</code>\n\n"
+            f"<b>Подписка (JSON):</b>\n<code>{_escape(sub_url)}</code>\n\n"
             f"<b>sing-box:</b>\n<code>{_escape(singbox_url)}</code>\n\n"
-            f"<b>Clash Meta:</b>\n<code>{_escape(clash_url)}</code>"
+            f"<b>Clash Meta:</b>\n<code>{_escape(clash_url)}</code>\n\n"
+            f"<b>Поддержка:</b> <a href='https://t.me/kruzid'>@kruzid</a>"
         )
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
         self.bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
