@@ -189,6 +189,7 @@ class ServerConfig:
     panel_path: str = "/panel"
     panel_username: str = "admin"
     panel_password: str = "admin"
+    panel_api_token: str = ""
     inbound_id: int = 1
     verify_ssl: bool = True
     sub_port: int = 2096
@@ -953,6 +954,7 @@ class VPNStorage:
             "panel_path": server.panel_path,
             "panel_username": server.panel_username,
             "panel_password": server.panel_password,
+            "panel_api_token": server.panel_api_token,
             "inbound_id": server.inbound_id,
             "verify_ssl": server.verify_ssl,
             "sub_port": server.sub_port,
@@ -3160,26 +3162,33 @@ class XrayAPI:
         return base
 
     @staticmethod
+    def _as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            return json.loads(value or "{}")
+        return {}
+
+    @staticmethod
     def _login(session: requests.Session, server: ServerConfig) -> bool:
         if not server.panel_url:
             return False
-        url = f"{server.panel_url.rstrip('/')}/login"
+        # Современные 3X-UI требуют токен вместо cookie+CSRF
+        if not server.panel_api_token:
+            logger.error("3X-UI api token not set")
+            return False
+        session.headers.update({"Authorization": f"Bearer {server.panel_api_token}"})
+        url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/list"
         try:
-            r = session.post(
-                url,
-                data={"username": server.panel_username, "password": server.panel_password},
-                verify=server.verify_ssl,
-                timeout=15,
-            )
+            r = session.get(url, verify=server.verify_ssl, timeout=15)
             if r.status_code != 200:
                 logger.error("3X-UI login failed: %s", r.status_code)
                 return False
             try:
                 data = r.json()
-                if data.get("success"):
-                    return True
+                return bool(data.get("success"))
             except Exception:
-                return "success" in r.text.lower()
+                return False
         except Exception:
             logger.exception("3X-UI login error")
         return False
@@ -3233,11 +3242,11 @@ class XrayAPI:
     @staticmethod
     def _get_flow_from_inbound(inbound: dict[str, Any]) -> str:
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             clients = settings.get("clients", [])
             if clients and clients[0].get("flow"):
                 return clients[0]["flow"]
-            stream = json.loads(inbound.get("streamSettings", "{}"))
+            stream = XrayAPI._as_dict(inbound.get("streamSettings", "{}"))
             return stream.get("realitySettings", {}).get("flow", "")
         except Exception:
             return ""
@@ -3281,7 +3290,7 @@ class XrayAPI:
             "totalGB": 0,
             "expiryTime": expiry_ms,
             "enable": enable,
-            "tgId": "",
+            "tgId": 0,
             "subId": xray_sub_id,
             "reset": 0,
             "fingerprint": server.fingerprint,
@@ -3299,7 +3308,7 @@ class XrayAPI:
         clients: list[dict[str, Any]],
     ) -> bool:
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             settings["clients"] = clients
             update_data = {
                 "up": inbound.get("up", 0),
@@ -3311,7 +3320,7 @@ class XrayAPI:
                 "listen": inbound.get("listen", ""),
                 "port": inbound.get("port", 0),
                 "protocol": inbound.get("protocol", "vless"),
-                "settings": json.dumps(settings, indent=2),
+                "settings": settings,
                 "streamSettings": inbound.get("streamSettings", "{}"),
                 "sniffing": inbound.get("sniffing", "{}"),
                 "allocate": inbound.get("allocate", ""),
@@ -3342,7 +3351,7 @@ class XrayAPI:
         if not inbound:
             return []
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             return settings.get("clients", [])
         except Exception:
             logger.exception("3X-UI get_clients error")
@@ -3370,7 +3379,7 @@ class XrayAPI:
         if not inbound:
             return False
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             clients = settings.get("clients", [])
             flow = XrayAPI._get_flow_from_inbound(inbound)
             client_data = XrayAPI._build_client_data(
@@ -3403,7 +3412,7 @@ class XrayAPI:
         if not inbound:
             return False
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             clients = settings.get("clients", [])
             new_clients = [c for c in clients if c.get("email") != email]
             if len(new_clients) == len(clients):
@@ -3426,7 +3435,7 @@ class XrayAPI:
         if not inbound:
             return 0
         try:
-            settings = json.loads(inbound.get("settings", "{}"))
+            settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             clients = settings.get("clients", [])
             new_clients = [c for c in clients if not str(c.get("email", "")).startswith("temp_")]
             removed = len(clients) - len(new_clients)
@@ -6189,6 +6198,8 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
                 server.sub_port = int(parts[11])
             if len(parts) >= 13:
                 server.subscription_url_base = parts[12]
+            if len(parts) >= 14:
+                server.panel_api_token = parts[13]
             return server
         except (ValueError, TypeError):
             return None
@@ -6203,7 +6214,7 @@ def init_plugin(cardinal: Cardinal, *args) -> None:
             return
         tg.set_state(m.chat.id, m.message_id, m.from_user.id, f"{CB_PREFIX}admin_host_data", {"host_id": host_id})
         bot.send_message(m.chat.id, "Отправьте полные данные сервера:\n"
-                         "<code>name address port public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base]</code>")
+                         "<code>name address port public_key short_id server_name [panel_url username password inbound_id verify_ssl sub_port subscription_url_base api_token]</code>")
 
     def state_admin_host_data(m: Message):
         state = tg.get_state(m.chat.id, m.from_user.id)
