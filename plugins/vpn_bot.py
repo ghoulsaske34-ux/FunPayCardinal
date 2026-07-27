@@ -2808,6 +2808,12 @@ class DeviceAuthServer:
             if fetching_device:
                 try:
                     XrayAPI.add_or_update_device_client(sub, fetching_device)
+                    # Убираем fallback-клиент, созданный при покупке, — теперь управляем per-device
+                    if sub.email and sub.devices:
+                        try:
+                            XrayAPI.remove_client_by_email(sub.email)
+                        except Exception:
+                            pass
                 except Exception:
                     logger.exception("Device client sync error in subscription endpoint")
             client_uuid = fetching_device.get("client_uuid") if fetching_device else None
