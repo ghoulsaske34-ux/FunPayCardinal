@@ -3481,15 +3481,13 @@ class XrayAPI:
         session = requests.Session()
         if not XrayAPI._login(session, server):
             return {"upload": 0, "download": 0}
-        url = f"{XrayAPI._panel_api_base(server)}/api/inbounds/getClientTraffics/{sub.email}"
+        inbound = XrayAPI._get_inbound(session, server, server.inbound_id)
+        if not inbound:
+            return {"upload": 0, "download": 0}
         try:
-            r = session.get(url, verify=server.verify_ssl, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("success"):
-                    obj = data.get("obj") or {}
-                    if isinstance(obj, dict):
-                        return {"upload": int(obj.get("up", 0)), "download": int(obj.get("down", 0))}
+            for stat in inbound.get("clientStats", []) or []:
+                if stat.get("email") == sub.email or stat.get("subId") == sub.xray_sub_id:
+                    return {"upload": int(stat.get("up", 0)), "download": int(stat.get("down", 0))}
         except Exception:
             logger.exception("3X-UI get_client_stats error for sub #%s", sub.sub_id)
         return {"upload": 0, "download": 0}
@@ -3761,8 +3759,11 @@ def _subscription_headers(sub: Subscription) -> dict[str, str]:
     bot_username = storage.config.get("bot_username", "vpnpepe_robot").lstrip("@")
     bot_url = f"https://t.me/{bot_username}" if bot_username else ""
     expire = int(sub.expires_at) if sub.expires_at else 0
+    stats = XrayAPI.get_client_stats(sub)
+    upload = int(stats.get("upload", 0))
+    download = int(stats.get("download", 0))
     # total=0 означает безлимит для большинства клиентов
-    userinfo = f"upload=0; download=0; total=0; expire={expire}"
+    userinfo = f"upload={upload}; download={download}; total=0; expire={expire}"
     headers = {
         "profile-title": title_b64,
         "subscription-userinfo": userinfo,
