@@ -69,6 +69,7 @@ main { flex: 1; overflow-y: auto; padding: 16px 16px 100px; }
   font-size: 16px; font-weight: 600;
   cursor: pointer; margin-top: 12px; text-align: center;
   transition: opacity .15s, transform .1s;
+  text-decoration: none;
 }
 .btn:active { transform: scale(0.98); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
@@ -130,14 +131,15 @@ label { display: block; color: var(--hint); font-size: 13px; margin: 12px 0 6px;
   background: var(--bg); border-radius: var(--radius-sm); padding: 14px;
   font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   word-break: break-all; font-size: 13px; margin: 10px 0; color: var(--text);
+  cursor: pointer;
 }
 .qr-wrap { text-align: center; margin: 14px 0; }
 .qr-wrap img { max-width: 220px; border-radius: 18px; background: #fff; padding: 10px; }
 .copy-row { display: flex; gap: 10px; align-items: center; }
 .copy-row input { flex: 1; margin: 0; }
-.copy-row button { padding: 12px 16px; border: none; border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-text); }
+.copy-row button { padding: 12px 16px; border: none; border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-text); cursor: pointer; }
 .empty { text-align: center; color: var(--hint); padding: 50px 20px; }
-.link { color: var(--link); text-decoration: none; }
+.link { color: var(--link); text-decoration: none; cursor: pointer; }
 .toast {
   position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
   background: rgba(0,0,0,.82); color: #fff; padding: 12px 22px; border-radius: 24px;
@@ -151,6 +153,8 @@ label { display: block; color: var(--hint); font-size: 13px; margin: 12px 0 6px;
 .section-label { font-size: 13px; font-weight: 600; color: var(--hint); margin: 24px 0 10px; padding-left: 6px; }
 .stat-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(128,128,128,0.08); }
 .stat-row:last-child { border-bottom: none; }
+.support-row { display: flex; gap: 12px; margin-top: 12px; }
+.support-row a { flex: 1; }
 </style>
 </head>
 <body>
@@ -191,17 +195,16 @@ label { display: block; color: var(--hint); font-size: 13px; margin: 12px 0 6px;
 const tg = window.Telegram.WebApp;
 tg.ready(); tg.expand();
 const API_BASE = '/mini-app/api';
-let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {}, isAdmin: false, page: 'home', stack: [] };
+let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {}, isAdmin: false, page: 'home', stack: [], selectedSub: null };
 
 function $(id){ return document.getElementById(id); }
 function showToast(text){ const t=$('toast'); t.textContent=text; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000); }
 function copy(text){ navigator.clipboard.writeText(text).then(()=>showToast('Скопировано')).catch(()=>showToast('Не удалось скопировать')); }
-
 function initData(){ return encodeURIComponent(tg.initData || ''); }
 
 async function api(path, method='GET', body){
   const sep = path.includes('?') ? '&' : '?';
-  const url = `${API_BASE}${path}${sep}init_data=${initData()}`;
+  const url = API_BASE + path + sep + 'init_data=' + initData();
   const opts = { method, headers: { 'Accept': 'application/json' } };
   if (body) { opts.headers['Content-Type']='application/json'; opts.body = JSON.stringify(body); }
   const r = await fetch(url, opts);
@@ -213,6 +216,7 @@ async function api(path, method='GET', body){
 function fmtMoney(n){ return Number(n).toFixed(2); }
 function fmtDate(ts){ if(!ts) return '-'; const d=new Date(ts*1000); return d.toLocaleDateString('ru-RU'); }
 function daysLeft(ts){ const d=Math.ceil((ts*1000-Date.now())/86400000); return d>0?d+' дн.':'истекла'; }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function render(pageId, push=true){
   if (push && state.page !== pageId) state.stack.push(state.page);
@@ -235,7 +239,7 @@ function updateNav(){
   document.querySelectorAll('.bottom-nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===state.page));
 }
 
-function icon(name, cls='icon-inline'){
+function icon(name, cls){
   const svgs = {
     copy: '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     support: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5a8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
@@ -249,50 +253,50 @@ function icon(name, cls='icon-inline'){
     people: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
     user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
   };
-  return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${svgs[name]||''}</svg>`;
+  return '<svg class="' + (cls||'icon-inline') + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (svgs[name]||'') + '</svg>';
 }
 
 function renderHome(main){
   $('pageTitle').textContent = 'Pepe VPN';
   const active = state.subscriptions.filter(s=>s.active && s.expires_at*1000>Date.now()).length;
   const u = state.user || {};
-  main.innerHTML = `
-    <div class="hero">
-      <h1>Привет${u.username?', '+u.username:''}</h1>
-      <p>Твой персональный VPN</p>
-    </div>
-    <div class="card" style="text-align:center;">
-      <div class="card-title">Баланс</div>
-      <div class="big-value">${fmtMoney(u.balance||0)} ₽</div>
-      <div class="btn-group">
-        <button class="btn" onclick="render('deposit')">${icon('wallet','icon-btn')}Пополнить</button>
-        <button class="btn btn-outline" onclick="render('store')">${icon('bag','icon-btn')}Купить VPN</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Активные подписки</div>
-      <div class="big-value" style="font-size:28px;">${active}</div>
-      ${active?`<button class="btn btn-outline" onclick="render('subs')">Управлять</button>`:'<p style="color:var(--hint)">Нет активных подписок. <a class="link" onclick="render('store')">Купить</a></p>'}
-    </div>
-    <div class="quick-actions">
-      <button class="btn btn-outline" onclick="render('refs')">Рефералы</button>
-      <button class="btn btn-outline" onclick="openSupport()">Поддержка</button>
-    </div>
-  `;
+  const username = u.username ? ', ' + esc(u.username) : '';
+  main.innerHTML = '' +
+    '<div class="hero"><h1>Привет' + username + '</h1><p>Твой персональный VPN</p></div>' +
+    '<div class="card" style="text-align:center;">' +
+      '<div class="card-title">Баланс</div>' +
+      '<div class="big-value">' + fmtMoney(u.balance||0) + ' ₽</div>' +
+      '<div class="btn-group">' +
+        '<button class="btn" data-page="deposit">' + icon('wallet','icon-btn') + 'Пополнить</button>' +
+        '<button class="btn btn-outline" data-page="store">' + icon('bag','icon-btn') + 'Купить VPN</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="card">' +
+      '<div class="card-title">Активные подписки</div>' +
+      '<div class="big-value" style="font-size:28px;">' + active + '</div>' +
+      (active ? '<button class="btn btn-outline" data-page="subs">Управлять</button>' : '<p style="color:var(--hint)">Нет активных подписок. <a class="link" data-page="store">Купить</a></p>') +
+    '</div>' +
+    '<div class="quick-actions">' +
+      '<button class="btn btn-outline" data-page="refs">Рефералы</button>' +
+      '<button class="btn btn-outline" data-action="support">Поддержка</button>' +
+    '</div>';
 }
 
 function renderSubs(main){
   $('pageTitle').textContent = 'Мои подписки';
-  if (!state.subscriptions.length) { main.innerHTML = '<div class="empty">У вас нет подписок. <a class="link" onclick="render(\'store\')">Купить</a></div>'; return; }
+  if (!state.subscriptions.length) {
+    main.innerHTML = '<div class="empty">У вас нет подписок. <a class="link" data-page="store">Купить</a></div>';
+    return;
+  }
   main.innerHTML = state.subscriptions.map(s=>{
     const active = s.active && s.expires_at*1000>Date.now();
-    return `<div class="list-item" onclick="showSub('${s.sub_id}')">
-      <div class="info">
-        <div class="title">${s.plan_name||s.plan_id} <span class="status-badge ${active?'status-active':'status-expired'}">${active?'Активна':'Истекла'}</span></div>
-        <div class="subtitle">До ${fmtDate(s.expires_at)} · ${daysLeft(s.expires_at)} · ${s.devices_count||0} устр.</div>
-      </div>
-      <div class="arrow">›</div>
-    </div>`;
+    return '<div class="list-item" data-sub="' + esc(s.sub_id) + '">' +
+      '<div class="info">' +
+        '<div class="title">' + esc(s.plan_name||s.plan_id) + ' <span class="status-badge ' + (active?'status-active':'status-expired') + '">' + (active?'Активна':'Истекла') + '</span></div>' +
+        '<div class="subtitle">До ' + fmtDate(s.expires_at) + ' · ' + daysLeft(s.expires_at) + ' · ' + (s.devices_count||0) + ' устр.</div>' +
+      '</div>' +
+      '<div class="arrow">›</div>' +
+    '</div>';
   }).join('');
 }
 
@@ -302,30 +306,30 @@ function renderSubDetail(main){
   $('pageTitle').textContent = 'Подписка';
   const s = state.selectedSub; if(!s){ render('subs'); return; }
   const active = s.active && s.expires_at*1000>Date.now();
-  const devicesText = `${s.devices_count||0} / ${s.max_devices||'?'}`;
-  main.innerHTML = `
-    <div class="card">
-      <div class="card-title">${s.plan_name||s.plan_id}</div>
-      <div class="stat-row"><span>Статус</span><span class="status-badge ${active?'status-active':'status-expired'}">${active?'Активна':'Истекла'}</span></div>
-      <div class="stat-row"><span>Действует до</span><b>${fmtDate(s.expires_at)}</b></div>
-      <div class="stat-row"><span>Осталось</span><b>${daysLeft(s.expires_at)}</b></div>
-      <div class="stat-row"><span>Устройств</span><b>${devicesText}</b></div>
-    </div>
-    <div class="card">
-      <div class="card-title">Pepe VPN</div>
-      <p style="font-size:13px;color:var(--hint);margin:0 0 12px 0">Добавьте ссылку в v2rayNG, v2rayTun, Hiddify или V2Box. Ссылка подтянет срок, трафик и поддержку.</p>
-      <div class="copy-row">
-        <input value="${s.sub_url||''}" readonly onclick="copy(this.value)">
-        <button onclick="copy('${s.sub_url||'')}')">${icon('copy')}</button>
-      </div>
-      ${s.qr_url?`<div class="qr-wrap"><img src="${s.qr_url}" alt="QR"></div>`:''}
-      <div class="btn-group" style="margin-top:12px">
-        <a class="btn btn-outline" href="https://t.me/kruzid" target="_blank">${icon('support','icon-btn')}Поддержка</a>
-        <a class="btn btn-outline" href="https://t.me/vpnpepe_robot" target="_blank">${icon('bot','icon-btn')}Бот</a>
-      </div>
-    </div>
-    ${active?`<button class="btn" onclick="renewSubPrompt('${s.sub_id}')">${icon('renew','icon-btn')}Продлить</button>`:''}
-  `;
+  const devicesText = (s.devices_count||0) + ' / ' + (s.max_devices||'?');
+  const subUrl = esc(s.sub_url||'');
+  main.innerHTML = '' +
+    '<div class="card">' +
+      '<div class="card-title">' + esc(s.plan_name||s.plan_id) + '</div>' +
+      '<div class="stat-row"><span>Статус</span><span class="status-badge ' + (active?'status-active':'status-expired') + '">' + (active?'Активна':'Истекла') + '</span></div>' +
+      '<div class="stat-row"><span>Действует до</span><b>' + fmtDate(s.expires_at) + '</b></div>' +
+      '<div class="stat-row"><span>Осталось</span><b>' + daysLeft(s.expires_at) + '</b></div>' +
+      '<div class="stat-row"><span>Устройств</span><b>' + devicesText + '</b></div>' +
+    '</div>' +
+    '<div class="card">' +
+      '<div class="card-title">Pepe VPN</div>' +
+      '<p style="font-size:13px;color:var(--hint);margin:0 0 12px 0">Добавьте ссылку в v2rayNG, v2rayTun, Hiddify или V2Box. Ссылка подтянет срок, трафик и поддержку.</p>' +
+      '<div class="copy-row">' +
+        '<input value="' + subUrl + '" readonly>' +
+        '<button class="copy-btn" data-copy="' + subUrl + '">' + icon('copy') + '</button>' +
+      '</div>' +
+      (s.qr_url ? '<div class="qr-wrap"><img src="' + esc(s.qr_url) + '" alt="QR"></div>' : '') +
+      '<div class="support-row">' +
+        '<a class="btn btn-outline" href="https://t.me/kruzid" target="_blank">' + icon('support','icon-btn') + 'Поддержка</a>' +
+        '<a class="btn btn-outline" href="https://t.me/vpnpepe_robot" target="_blank">' + icon('bot','icon-btn') + 'Бот</a>' +
+      '</div>' +
+    '</div>' +
+    (active ? '<button class="btn" data-renew="' + esc(s.sub_id) + '">' + icon('renew','icon-btn') + 'Продлить</button>' : '');
 }
 
 async function renewSubPrompt(id){
@@ -339,21 +343,23 @@ async function renewSubPrompt(id){
 function renderStore(main){
   $('pageTitle').textContent = 'Магазин';
   if (!state.plans.length) { main.innerHTML = '<div class="empty">Тарифы не настроены.</div>'; return; }
-  main.innerHTML = state.plans.map(p=>`
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div style="font-size:18px;font-weight:700;">${p.name}</div>
-        <div style="color:var(--hint);font-size:13px;">${p.device_text}</div>
-      </div>
-      <label>Срок</label>
-      <select id="dur-${p.id}">${Object.entries(p.prices).map(([m,price])=>`<option value="${m}">${m} мес. — ${price} ₽</option>`).join('')}</select>
-      <button class="btn" onclick="buy('${p.id}')">Купить</button>
-    </div>
-  `).join('');
+  main.innerHTML = state.plans.map(p=>{
+    const opts = Object.entries(p.prices).map(([m,price])=>'<option value="' + esc(m) + '">' + esc(m) + ' мес. — ' + esc(price) + ' ₽</option>').join('');
+    return '<div class="card">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+        '<div style="font-size:18px;font-weight:700;">' + esc(p.name) + '</div>' +
+        '<div style="color:var(--hint);font-size:13px;">' + esc(p.device_text) + '</div>' +
+      '</div>' +
+      '<label>Срок</label>' +
+      '<select id="dur-' + esc(p.id) + '">' + opts + '</select>' +
+      '<button class="btn" data-plan="' + esc(p.id) + '">Купить</button>' +
+    '</div>';
+  }).join('');
 }
 
-async function buy(planId){
-  const months = parseInt($('dur-'+planId).value);
+async function buyPlan(planId){
+  const select = $('dur-' + planId); if(!select){ showToast('Не выбран срок'); return; }
+  const months = parseInt(select.value);
   try {
     const res = await api('/purchase', 'POST', { plan_id: planId, months });
     if (res.ok) { showToast('Подписка оформлена'); await loadMe(); render('subs'); }
@@ -363,26 +369,25 @@ async function buy(planId){
 
 function renderDeposit(main){
   $('pageTitle').textContent = 'Пополнение';
-  main.innerHTML = `
-    <div class="card">
-      <div class="card-title">Сумма пополнения</div>
-      <input type="number" id="depAmount" placeholder="100" value="200">
-      <div class="btn-group">
-        <button class="btn btn-outline" onclick="setDep(100)">100 ₽</button>
-        <button class="btn btn-outline" onclick="setDep(500)">500 ₽</button>
-        <button class="btn btn-outline" onclick="setDep(1000)">1000 ₽</button>
-        <button class="btn btn-outline" onclick="setDep(2000)">2000 ₽</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Способ оплаты</div>
-      <button class="btn" onclick="doDeposit('cryptobot','USDT')">CryptoBot USDT</button>
-      <button class="btn" onclick="doDeposit('cryptobot','TON')">CryptoBot TON</button>
-      <button class="btn" onclick="doDeposit('stars')">Telegram Stars</button>
-    </div>
-  `;
+  main.innerHTML = '' +
+    '<div class="card">' +
+      '<div class="card-title">Сумма пополнения</div>' +
+      '<input type="number" id="depAmount" placeholder="100" value="200">' +
+      '<div class="btn-group">' +
+        '<button class="btn btn-outline" data-amount="100">100 ₽</button>' +
+        '<button class="btn btn-outline" data-amount="500">500 ₽</button>' +
+        '<button class="btn btn-outline" data-amount="1000">1000 ₽</button>' +
+        '<button class="btn btn-outline" data-amount="2000">2000 ₽</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="card">' +
+      '<div class="card-title">Способ оплаты</div>' +
+      '<button class="btn" data-method="cryptobot" data-asset="USDT">CryptoBot USDT</button>' +
+      '<button class="btn" data-method="cryptobot" data-asset="TON">CryptoBot TON</button>' +
+      '<button class="btn" data-method="stars">Telegram Stars</button>' +
+    '</div>';
 }
-function setDep(v){ $('depAmount').value=v; }
+
 async function doDeposit(method, asset){
   const amount = parseInt($('depAmount').value); if(!amount||amount<10){ showToast('Введите сумму от 10 ₽'); return; }
   try {
@@ -399,53 +404,49 @@ function renderRefs(main){
   $('pageTitle').textContent = 'Рефералы';
   const u = state.user || {};
   const bot = state.config.bot_username || 'your_bot';
-  const link = `https://t.me/${bot}?start=${u.referral_code||''}`;
-  main.innerHTML = `
-    <div class="card" style="text-align:center;">
-      <div class="card-title">Реферальная ссылка</div>
-      <div class="code-block" onclick="copy('${link}')">${link}</div>
-      <button class="btn" onclick="copy('${link}')">${icon('copy','icon-btn')}Копировать ссылку</button>
-    </div>
-    <div class="card">
-      <div class="card-title">Статистика</div>
-      <div class="stat-row"><span>Рефералов 1 уровня</span><b>${state.referrals.level1_count||0}</b></div>
-      <div class="stat-row"><span>Рефералов 2 уровня</span><b>${state.referrals.level2_count||0}</b></div>
-      <div class="stat-row"><span>Заработано</span><b>${fmtMoney(state.referrals.earnings||0)} ₽</b></div>
-    </div>
-  `;
+  const link = 'https://t.me/' + bot + '?start=' + esc(u.referral_code||'');
+  main.innerHTML = '' +
+    '<div class="card" style="text-align:center;">' +
+      '<div class="card-title">Реферальная ссылка</div>' +
+      '<div class="code-block copy-btn" data-copy="' + link + '">' + link + '</div>' +
+      '<button class="btn copy-btn" data-copy="' + link + '">' + icon('copy','icon-btn') + 'Копировать ссылку</button>' +
+    '</div>' +
+    '<div class="card">' +
+      '<div class="card-title">Статистика</div>' +
+      '<div class="stat-row"><span>Рефералов 1 уровня</span><b>' + (state.referrals.level1_count||0) + '</b></div>' +
+      '<div class="stat-row"><span>Рефералов 2 уровня</span><b>' + (state.referrals.level2_count||0) + '</b></div>' +
+      '<div class="stat-row"><span>Заработано</span><b>' + fmtMoney(state.referrals.earnings||0) + ' ₽</b></div>' +
+    '</div>';
 }
 
 function renderProfile(main){
   $('pageTitle').textContent = 'Профиль';
   const u = state.user || {};
-  main.innerHTML = `
-    <div class="card">
-      <div class="card-title">Пользователь</div>
-      <div class="stat-row"><span>ID</span><code>${u.user_id||''}</code></div>
-      <div class="stat-row"><span>Баланс</span><b>${fmtMoney(u.balance||0)} ₽</b></div>
-      <div class="stat-row"><span>Всего потрачено</span><b>${fmtMoney(u.total_spent||0)} ₽</b></div>
-      <div class="stat-row"><span>Куплено месяцев</span><b>${u.total_months||0}</b></div>
-      <div class="stat-row"><span>Пробный период</span><b>${u.trial_used?'использован':'не использован'}</b></div>
-    </div>
-    <button class="btn" onclick="openSupport()">${icon('support','icon-btn')}Написать в поддержку</button>
-    ${state.isAdmin?`<button class="btn btn-outline" onclick="render('admin')">Админ-панель</button>`:''}
-  `;
+  main.innerHTML = '' +
+    '<div class="card">' +
+      '<div class="card-title">Пользователь</div>' +
+      '<div class="stat-row"><span>ID</span><code>' + esc(u.user_id||'') + '</code></div>' +
+      '<div class="stat-row"><span>Баланс</span><b>' + fmtMoney(u.balance||0) + ' ₽</b></div>' +
+      '<div class="stat-row"><span>Всего потрачено</span><b>' + fmtMoney(u.total_spent||0) + ' ₽</b></div>' +
+      '<div class="stat-row"><span>Куплено месяцев</span><b>' + (u.total_months||0) + '</b></div>' +
+      '<div class="stat-row"><span>Пробный период</span><b>' + (u.trial_used?'использован':'не использован') + '</b></div>' +
+    '</div>' +
+    '<button class="btn" data-action="support">' + icon('support','icon-btn') + 'Написать в поддержку</button>' +
+    (state.isAdmin ? '<button class="btn btn-outline" data-page="admin">Админ-панель</button>' : '');
 }
 
 async function renderAdmin(main){
   $('pageTitle').textContent = 'Админ';
   try {
     const data = await api('/metrics');
-    main.innerHTML = `
-      <div class="card">
-        <div class="card-title">Метрики</div>
-        <div class="stat-row"><span>Пользователей</span><b>${data.users_total}</b></div>
-        <div class="stat-row"><span>Активных подписок</span><b>${data.subscriptions_active}</b></div>
-        <div class="stat-row"><span>MRR</span><b>${fmtMoney(data.mrr_rub)} ₽</b></div>
-        <div class="stat-row"><span>Выручка</span><b>${fmtMoney(data.revenue_total_rub)} ₽</b></div>
-        <div class="stat-row"><span>Онлайн</span><b>${data.online_now}</b></div>
-      </div>
-    `;
+    main.innerHTML = '' +
+      '<div class="card"><div class="card-title">Метрики</div>' +
+        '<div class="stat-row"><span>Пользователей</span><b>' + data.users_total + '</b></div>' +
+        '<div class="stat-row"><span>Активных подписок</span><b>' + data.subscriptions_active + '</b></div>' +
+        '<div class="stat-row"><span>MRR</span><b>' + fmtMoney(data.mrr_rub) + ' ₽</b></div>' +
+        '<div class="stat-row"><span>Выручка</span><b>' + fmtMoney(data.revenue_total_rub) + ' ₽</b></div>' +
+        '<div class="stat-row"><span>Онлайн</span><b>' + data.online_now + '</b></div>' +
+      '</div>';
   } catch(e){ main.innerHTML = '<div class="empty">Нет доступа</div>'; }
 }
 
@@ -456,6 +457,26 @@ function openSupport(){
   else if (s.startsWith('@')) tg.openTelegramLink('https://t.me/' + s.slice(1));
   else if (s.startsWith('http://') || s.startsWith('https://')) tg.openTelegramLink(s);
   else tg.openTelegramLink('https://t.me/' + s);
+}
+
+function handleMainClick(e){
+  const target = e.target;
+  const page = target.closest('[data-page]');
+  if (page) { const p = page.dataset.page; if (p==='home'){ state.stack=[]; render('home', false); } else { state.stack=[]; render(p, false); } return; }
+  const sub = target.closest('[data-sub]');
+  if (sub) { showSub(sub.dataset.sub); return; }
+  const copyBtn = target.closest('.copy-btn, [data-copy]');
+  if (copyBtn) { const text = copyBtn.dataset.copy || ''; if(text) copy(text); else showToast('Нечего копировать'); return; }
+  const planBtn = target.closest('[data-plan]');
+  if (planBtn) { buyPlan(planBtn.dataset.plan); return; }
+  const renewBtn = target.closest('[data-renew]');
+  if (renewBtn) { state.selectedSub = state.subscriptions.find(s=>s.sub_id===renewBtn.dataset.renew); renewSubPrompt(renewBtn.dataset.renew); return; }
+  const amountBtn = target.closest('[data-amount]');
+  if (amountBtn) { $('depAmount').value = amountBtn.dataset.amount; return; }
+  const payBtn = target.closest('[data-method]');
+  if (payBtn) { doDeposit(payBtn.dataset.method, payBtn.dataset.asset||''); return; }
+  const supportBtn = target.closest('[data-action="support"]');
+  if (supportBtn) { openSupport(); return; }
 }
 
 async function loadMe(){
@@ -478,9 +499,10 @@ async function init(){
   await loadMe();
   render('home', false);
   $('backBtn').onclick = ()=>{ state.stack.pop(); const prev = state.stack.pop() || 'home'; render(prev, false); };
-  document.querySelectorAll('.bottom-nav button').forEach(b=>{
-    b.onclick = ()=>{ state.stack=[]; render(b.dataset.page, false); };
-  });
+  document.getElementById('main').onclick = handleMainClick;
+  document.getElementById('nav').onclick = (e)=>{
+    const b = e.target.closest('button'); if(!b) return; state.stack=[]; render(b.dataset.page, false);
+  };
 }
 
 init().catch(()=>{ $('main').innerHTML = '<div class="empty">Ошибка загрузки. Попробуйте позже.</div>'; });
