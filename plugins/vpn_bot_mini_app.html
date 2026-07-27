@@ -242,12 +242,8 @@ function renderSubDetail(main){
       <p>Устройств: ${s.devices_count||0} / ${s.max_devices||'?'}</p>
     </div>
     <div class="card">
-      <div class="card-title">VLESS ссылка</div>
-      <div class="copy-row"><input id="vlessInput" value="${s.vless_url||''}" readonly><button onclick="copy($('vlessInput').value)">Коп</button></div>
-      <div class="qr-wrap"><img id="qrImg" src="${API_BASE}/qr?data=${encodeURIComponent(s.vless_url||'')}&init_data=${initData()}" alt="QR"></div>
-    </div>
-    <div class="card">
-      <div class="card-title">Универсальная подписка</div>
+      <div class="card-title">Подписка</div>
+      <p style="font-size:13px;color:var(--hint);margin:0 0 8px 0">Добавьте ссылку в приложение (v2rayNG, V2Box, Streisand, sing-box, Clash Meta).</p>
       <input value="${s.sub_url||''}" readonly onclick="copy(this.value)">
       <div class="btn-group">
         <button class="btn btn-outline" onclick="copy('${s.singbox_url||''}')">sing-box</button>

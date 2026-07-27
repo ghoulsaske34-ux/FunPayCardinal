@@ -2913,16 +2913,13 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
 
     def _render_page(self, session: dict[str, Any]) -> str:
         server = storage.server()
-        vless_url_raw = generate_vless_url_raw(
-            session["client_uuid"], session["email"], session["xray_sub_id"], server
-        )
         sub_url_raw = generate_subscription_url_raw(session["xray_sub_id"], server)
-        vless_url = html.escape(vless_url_raw, quote=True)
+        singbox_url_raw = f"{sub_url_raw}?format=singbox"
+        clash_url_raw = f"{sub_url_raw}?format=clash"
         sub_url = html.escape(sub_url_raw, quote=True)
+        singbox_url = html.escape(singbox_url_raw, quote=True)
+        clash_url = html.escape(clash_url_raw, quote=True)
         expires = datetime.fromtimestamp(session["expires_at"]).strftime("%H:%M:%S")
-        qr_bytes = _generate_qr_code(vless_url_raw)
-        qr_b64 = base64.b64encode(qr_bytes).decode("ascii") if qr_bytes else ""
-        qr_img = f'<img src="data:image/png;base64,{qr_b64}" alt="QR" style="max-width:280px;">' if qr_b64 else ""
         return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -2933,21 +2930,21 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
 <style>
 body {{ font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f5f5f5; }}
 .box {{ background: #fff; border-radius: 12px; padding: 20px; max-width: 420px; margin: auto; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-a.button {{ display: inline-block; margin: 8px 4px; padding: 12px 18px; background: #28a745; color: #fff; text-decoration: none; border-radius: 8px; }}
-a.link {{ display: block; margin: 10px 0; word-break: break-all; color: #007bff; }}
+input {{ width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }}
+p {{ word-break: break-all; color: #007bff; }}
 </style>
 </head>
 <body>
 <div class="box">
 <h1>Бесплатный VPN 30 минут</h1>
 <p>Действует до: <b>{expires}</b></p>
-{qr_img}
-<br>
-<a class="button" href="{vless_url}">Подключиться (VLESS)</a>
-<a class="button" href="{sub_url}">Подписка</a>
-<br>
-<a class="link" href="{vless_url}">{vless_url}</a>
-<p>1. Установите v2rayNG / V2Box / Streisand.<br>2. Отсканируйте QR или нажмите кнопку.</p>
+<p>1. Установите v2rayNG / V2Box / Streisand / sing-box / Clash Meta.<br>2. Скопируйте ссылку и добавьте как подписку.</p>
+<b>Подписка</b>
+<input value="{sub_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
+<b>sing-box</b>
+<input value="{singbox_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
+<b>Clash Meta</b>
+<input value="{clash_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
 </div>
 </body>
 </html>"""
@@ -4752,28 +4749,19 @@ class UserBot:
         if server.panel_url and not sub.xray_synced:
             XrayAPI.add_or_update_client(sub)
             sub = storage.get_subscription(sub_id)
-        vless_url = generate_vless_url(sub, server)
         sub_url = generate_subscription_url(sub, server)
         singbox_url = f"{sub_url}?format=singbox"
         clash_url = f"{sub_url}?format=clash"
         text = (
             f"<b>Подключение к VPN</b>\n\n"
             f"1. Установите приложение (v2rayNG, V2Box, Streisand, sing-box, Clash Meta)\n"
-            f"2. Отсканируйте QR-код или добавьте ссылку/подписку.\n\n"
-            f"<b>VLESS ссылка:</b>\n<code>{_escape(vless_url)}</code>\n\n"
-            f"<b>Универсальная подписка:</b>\n<code>{_escape(sub_url)}</code>\n\n"
+            f"2. Скопируйте ссылку и добавьте как подписку.\n\n"
+            f"<b>Подписка:</b>\n<code>{_escape(sub_url)}</code>\n\n"
             f"<b>sing-box:</b>\n<code>{_escape(singbox_url)}</code>\n\n"
             f"<b>Clash Meta:</b>\n<code>{_escape(clash_url)}</code>"
         )
-        qr = _generate_qr_code(vless_url)
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
-        try:
-            if qr:
-                self.bot.send_photo(chat_id, qr, caption=text, reply_markup=kb)
-            else:
-                self.bot.send_message(chat_id, text, reply_markup=kb)
-        except Exception:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+        self.bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
 
     def _sub_stats(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
