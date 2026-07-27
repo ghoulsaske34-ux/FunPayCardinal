@@ -1382,10 +1382,10 @@ class VPNStorage:
         md = plan.max_devices
         return 9999 if md < 0 else max(1, md)
 
-    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0) -> dict[str, Any]:
+    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0, force: bool = False, log: bool = True) -> dict[str, Any]:
         sub = self.get_subscription(sub_id)
         result = {"allowed": False, "reason": "unknown"}
-        log = {"sub_id": sub_id, "ip": ip, "user_agent": user_agent, "timestamp": now, "allowed": False, "reason": "unknown", "traffic_bytes": traffic_bytes}
+        conn_log = {"sub_id": sub_id, "ip": ip, "user_agent": user_agent, "timestamp": now, "allowed": False, "reason": "unknown", "traffic_bytes": traffic_bytes}
         if not sub or not sub.active or sub.is_expired:
             result = {"allowed": False, "reason": "subscription_inactive"}
         else:
@@ -1400,11 +1400,13 @@ class VPNStorage:
                     dev["traffic"] = dev.get("traffic", 0) + traffic_bytes
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "ok", "device": dev}
-            elif len(sub.devices) < max_devices:
+            elif force or len(sub.devices) < max_devices:
                 dev = {"ip": ip, "user_agent": user_agent, "first_seen": now, "last_seen": now, "traffic": traffic_bytes, "blocked": False}
                 sub.devices.append(dev)
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "registered", "device": dev}
+                if not force and len(sub.devices) > max_devices:
+                    result["warning"] = "device_limit_exceeded"
             else:
                 result = {"allowed": False, "reason": "device_limit"}
 
@@ -1426,9 +1428,10 @@ class VPNStorage:
                 if total_traffic > traffic_limit_gb * 1024 * 1024 * 1024:
                     result = {"allowed": False, "reason": "traffic_limit"}
 
-        log["allowed"] = result["allowed"]
-        log["reason"] = result["reason"]
-        self._append_connection_log(log)
+        conn_log["allowed"] = result["allowed"]
+        conn_log["reason"] = result["reason"]
+        if log:
+            self._append_connection_log(conn_log)
         return result
 
     def _add_suspicious_event(self, user_id: int, sub_id: str, ip: str, reason: str) -> None:
@@ -2545,6 +2548,36 @@ def _handle_crypto_invoice_paid(invoice: dict[str, Any]) -> None:
 
 
 
+class DeviceSyncPoller:
+    """Фоновый поток синхронизации устройств с 3X-UI."""
+
+    CHECK_INTERVAL = 60  # сек
+
+    def __init__(self, bot: "UserBot") -> None:
+        self.bot = bot
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                XrayAPI.sync_all_devices()
+            except Exception:
+                logger.exception("DeviceSyncPoller error")
+            self._stop.wait(self.CHECK_INTERVAL)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+
 class DeviceAuthServer:
     """FastAPI-сервер авторизации устройств и вебхуков CryptoBot."""
 
@@ -2666,6 +2699,11 @@ class DeviceAuthServer:
             server = storage.get_host(sub.host_id) or storage.server()
             if not server or not server.address or not server.public_key:
                 raise HTTPException(status_code=503, detail="server not configured")
+            # Синхронизируем устройства подписки с активными IP из 3X-UI
+            try:
+                XrayAPI.sync_client_devices(sub, force=True, log=False)
+            except Exception:
+                logger.exception("Device sync error in subscription endpoint")
             vless_url = generate_vless_url(sub, server)
             headers = _subscription_headers(sub)
             fmt = (format or "json").lower()
@@ -3493,6 +3531,110 @@ class XrayAPI:
         return {"upload": 0, "download": 0}
 
     @staticmethod
+    def get_client_ips(server: Server, email: str, session: Any | None = None) -> list[dict[str, Any]]:
+        """Возвращает список IP адресов, с которых клиент подключался к Xray."""
+        if not server or not server.panel_url or not email:
+            return []
+        created_session = session is None
+        if created_session:
+            session = requests.Session()
+            if not XrayAPI._login(session, server):
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                return []
+        try:
+            url = f"{XrayAPI._panel_api_base(server)}/api/clients/ips/{email}"
+            r = session.post(url, verify=server.verify_ssl, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success"):
+                    obj = data.get("obj") or []
+                    if isinstance(obj, list):
+                        return obj
+        except Exception:
+            logger.exception("3X-UI get_client_ips error for email %s", email)
+        finally:
+            if created_session and session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        return []
+
+    @staticmethod
+    def sync_client_devices(sub: Subscription, session: Any | None = None, force: bool = True, log: bool = False) -> int:
+        """Синхронизирует устройства подписки с IP-адресами из 3X-UI."""
+        server = XrayAPI._get_host(sub.host_id)
+        if not server or not server.panel_url or not sub.email:
+            return 0
+        created_session = False
+        if session is None:
+            session = requests.Session()
+            created_session = True
+        try:
+            if created_session and not XrayAPI._login(session, server):
+                return 0
+            ips = XrayAPI.get_client_ips(server, sub.email, session=session)
+            now = time.time()
+            added = 0
+            for item in ips:
+                ip = str(item.get("ip", "")).strip()
+                if not ip:
+                    continue
+                if not any(d.get("ip") == ip for d in sub.devices):
+                    storage.record_connection(sub.sub_id, ip, "Xray client", now, 0, force=force, log=log)
+                    added += 1
+            return added
+        finally:
+            if created_session and session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def sync_all_devices() -> int:
+        """Синхронизирует устройства всех активных подписок с 3X-UI."""
+        subs = storage.active_subscriptions_all()
+        if not subs:
+            return 0
+        servers: dict[str, Any] = {}
+        logins: dict[str, bool] = {}
+        total = 0
+        for sub in subs:
+            server = XrayAPI._get_host(sub.host_id)
+            if not server or not server.panel_url or not sub.email:
+                continue
+            sid = sub.host_id or "main"
+            session = servers.get(sid)
+            if session is None:
+                session = requests.Session()
+                if XrayAPI._login(session, server):
+                    logins[sid] = True
+                    servers[sid] = session
+                else:
+                    logins[sid] = False
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    continue
+            elif not logins.get(sid):
+                continue
+            try:
+                total += XrayAPI.sync_client_devices(sub, session=session, force=True, log=False)
+            except Exception:
+                logger.exception("sync_all_devices error for sub #%s", sub.sub_id)
+        for sid, session in servers.items():
+            try:
+                session.close()
+            except Exception:
+                pass
+        return total
+
+    @staticmethod
     def get_global_stats() -> dict[str, int]:
         server = storage.server()  # default host
         if not server.panel_url:
@@ -3824,6 +3966,7 @@ class UserBot:
         self._rates_fetcher: RatesFetcher | None = None
         self._health_checker: HealthChecker | None = None
         self._backup_scheduler: BackupScheduler | None = None
+        self._device_sync_poller: DeviceSyncPoller | None = None
         self._device_auth_server: DeviceAuthServer | None = None
         self._temp_profile_server: TempProfileServer | None = None
         self._sticker_queue: queue.Queue[tuple[int, int]] | None = None
@@ -5444,6 +5587,8 @@ class UserBot:
         self._health_checker.start()
         self._backup_scheduler = BackupScheduler(self)
         self._backup_scheduler.start()
+        self._device_sync_poller = DeviceSyncPoller(self)
+        self._device_sync_poller.start()
         self._device_auth_server = DeviceAuthServer(storage.config.get("device_auth_port", 8080))
         self._device_auth_server.start()
         server_cfg = storage.server()
@@ -5482,6 +5627,8 @@ class UserBot:
             self._health_checker.stop()
         if self._backup_scheduler:
             self._backup_scheduler.stop()
+        if self._device_sync_poller:
+            self._device_sync_poller.stop()
         if self._device_auth_server:
             self._device_auth_server.stop()
         if self._temp_profile_server:
