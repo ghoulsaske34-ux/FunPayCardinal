@@ -2193,9 +2193,6 @@ class MiniAppAPI:
             "active": sub.active,
             "devices_count": devices_count,
             "sub_url": sub_url,
-            "json_url": sub_url,
-            "singbox_url": f"{sub_url}?format=singbox" if sub_url else "",
-            "clash_url": f"{sub_url}?format=clash" if sub_url else "",
         }
 
     @staticmethod
@@ -2916,11 +2913,7 @@ class TempProfileHandler(http.server.BaseHTTPRequestHandler):
     def _render_page(self, session: dict[str, Any]) -> str:
         server = storage.server()
         sub_url_raw = generate_subscription_url_raw(session["xray_sub_id"], server)
-        singbox_url_raw = f"{sub_url_raw}?format=singbox"
-        clash_url_raw = f"{sub_url_raw}?format=clash"
         sub_url = html.escape(sub_url_raw, quote=True)
-        singbox_url = html.escape(singbox_url_raw, quote=True)
-        clash_url = html.escape(clash_url_raw, quote=True)
         expires = datetime.fromtimestamp(session["expires_at"]).strftime("%H:%M:%S")
         return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -2940,13 +2933,9 @@ p {{ word-break: break-all; color: #007bff; }}
 <div class="box">
 <h1>Бесплатный VPN 30 минут</h1>
 <p>Действует до: <b>{expires}</b></p>
-<p>1. Установите v2rayNG / V2Box / Streisand / sing-box / Clash Meta.<br>2. Скопируйте ссылку и добавьте как подписку.</p>
+<p>1. Установите v2rayNG / v2rayTun / V2Box / Streisand.<br>2. Скопируйте ссылку и добавьте как подписку.</p>
 <b>Подписка</b>
 <input value="{sub_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
-<b>sing-box</b>
-<input value="{singbox_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
-<b>Clash Meta</b>
-<input value="{clash_url}" readonly onclick="this.select();navigator.clipboard.writeText(this.value).catch(()=>{{}})">
 </div>
 </body>
 </html>"""
@@ -3698,18 +3687,39 @@ def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) 
 
 
 def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
-    """Строит JSON-подписку для v2RayTun / V2RayBox / Hiddify."""
+    """Строит JSON-подписку в формате v2rayNG/v2rayTun (полный Xray-конфиг с remarks)."""
     return {
-        "servers": [
+        "remarks": "🐸 Пепе ВПН",
+        "log": {"access": "", "error": "", "loglevel": "warning"},
+        "dns": {"queryStrategy": "UseIPv4", "servers": ["1.1.1.1", "8.8.8.8", "8.8.4.4"]},
+        "inbounds": [
             {
-                "name": "🐸 Пепе ВПН",
-                "address": server.address,
-                "port": server.port,
+                "tag": "socks",
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
+                "settings": {"auth": "noauth", "udp": True},
+            }
+        ],
+        "outbounds": [
+            {
+                "tag": "proxy",
                 "protocol": "vless",
                 "settings": {
-                    "id": sub.client_uuid,
-                    "encryption": "none",
-                    "flow": server.flow or "xtls-rprx-vision",
+                    "vnext": [
+                        {
+                            "address": server.address,
+                            "port": server.port,
+                            "users": [
+                                {
+                                    "id": sub.client_uuid,
+                                    "encryption": "none",
+                                    "flow": server.flow or "xtls-rprx-vision",
+                                }
+                            ],
+                        }
+                    ]
                 },
                 "streamSettings": {
                     "network": server.network or "tcp",
@@ -3717,15 +3727,23 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription)
                     "tcpSettings": {"header": {"type": "none"}},
                     "realitySettings": {
                         "show": False,
-                        "fingerprint": server.fingerprint or "chrome",
+                        "fingerprint": server.fingerprint or "qq",
                         "publicKey": server.public_key,
                         "serverName": server.server_name or server.address,
                         "shortId": server.short_id,
                         "spiderX": server.spider_x or "/",
                     },
                 },
-            }
-        ]
+            },
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "port": "0-65535", "outboundTag": "proxy", "enabled": True}
+            ],
+        },
     }
 
 
@@ -4807,18 +4825,14 @@ class UserBot:
             XrayAPI.add_or_update_client(sub)
             sub = storage.get_subscription(sub_id)
         sub_url = generate_subscription_url(sub, server)
-        singbox_url = f"{sub_url}?format=singbox"
-        clash_url = f"{sub_url}?format=clash"
         expires = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y %H:%M")
         text = (
             f"<b>🐸 Пепе ВПН</b>\n\n"
             f"📅 Действует до: <code>{expires}</code>\n"
             f"📊 Трафик: 0 / ∞ (безлимит)\n\n"
-            f"1. Установите приложение (v2rayTun, V2Box, v2rayNG, Streisand, sing-box, Clash Meta)\n"
+            f"1. Установите приложение (v2rayNG, v2rayTun, V2Box, Streisand)\n"
             f"2. Скопируйте ссылку и добавьте как подписку.\n\n"
-            f"<b>Подписка (JSON):</b>\n<code>{_escape(sub_url)}</code>\n\n"
-            f"<b>sing-box:</b>\n<code>{_escape(singbox_url)}</code>\n\n"
-            f"<b>Clash Meta:</b>\n<code>{_escape(clash_url)}</code>\n\n"
+            f"<b>Подписка:</b>\n<code>{_escape(sub_url)}</code>\n\n"
             f"<b>Поддержка:</b> <a href='https://t.me/kruzid'>@kruzid</a>"
         )
         kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
