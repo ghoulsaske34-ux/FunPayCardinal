@@ -3381,7 +3381,7 @@ class XrayAPI:
         try:
             settings = XrayAPI._as_dict(inbound.get("settings", "{}"))
             clients = settings.get("clients", [])
-            flow = XrayAPI._get_flow_from_inbound(inbound)
+            flow = XrayAPI._get_flow_from_inbound(inbound) or server.flow
             client_data = XrayAPI._build_client_data(
                 client_uuid, email, xray_sub_id, expiry_ms, enable, server, flow
             )
