@@ -1382,26 +1382,36 @@ class VPNStorage:
         md = plan.max_devices
         return 9999 if md < 0 else max(1, md)
 
-    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0, force: bool = False, log: bool = True) -> dict[str, Any]:
+    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0, force: bool = False, log: bool = True, client_app: str = "", match_by: str = "ip") -> dict[str, Any]:
         sub = self.get_subscription(sub_id)
         result = {"allowed": False, "reason": "unknown"}
-        conn_log = {"sub_id": sub_id, "ip": ip, "user_agent": user_agent, "timestamp": now, "allowed": False, "reason": "unknown", "traffic_bytes": traffic_bytes}
+        client_app = client_app or _client_app(user_agent)
+        conn_log = {"sub_id": sub_id, "ip": ip, "user_agent": user_agent, "client_app": client_app, "timestamp": now, "allowed": False, "reason": "unknown", "traffic_bytes": traffic_bytes}
         if not sub or not sub.active or sub.is_expired:
             result = {"allowed": False, "reason": "subscription_inactive"}
         else:
             max_devices = self.max_devices_for(sub)
             ip = ip.strip()
-            existing = [d for d in sub.devices if d.get("ip") == ip]
+            if match_by == "ip_client":
+                exact = [d for d in sub.devices if d.get("ip") == ip and (d.get("client_app") or _client_app(d.get("user_agent", ""))) == client_app]
+                if exact:
+                    existing = exact
+                else:
+                    # Если по IP есть запись с неизвестным клиентом, обновляем её вместо создания дубля
+                    existing = [d for d in sub.devices if d.get("ip") == ip and (d.get("client_app") or _client_app(d.get("user_agent", ""))).lower() in {"", "unknown", "xray client"}]
+            else:
+                existing = [d for d in sub.devices if d.get("ip") == ip]
             if existing:
                 dev = existing[0]
                 dev["user_agent"] = user_agent
+                dev["client_app"] = client_app
                 dev["last_seen"] = now
                 if traffic_bytes:
                     dev["traffic"] = dev.get("traffic", 0) + traffic_bytes
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "ok", "device": dev}
             elif force or len(sub.devices) < max_devices:
-                dev = {"ip": ip, "user_agent": user_agent, "first_seen": now, "last_seen": now, "traffic": traffic_bytes, "blocked": False}
+                dev = {"ip": ip, "user_agent": user_agent, "client_app": client_app, "first_seen": now, "last_seen": now, "traffic": traffic_bytes, "blocked": False}
                 sub.devices.append(dev)
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "registered", "device": dev}
@@ -1711,6 +1721,29 @@ def _json_default(obj: Any) -> Any:
 
 def _format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+
+def _client_app(user_agent: str) -> str:
+    """Определяет название VPN-клиента из User-Agent."""
+    ua = (user_agent or "").lower()
+    known = {
+        "v2raytun": "v2rayTun",
+        "v2rayng": "v2rayNG",
+        "hiddify": "Hiddify",
+        "streisand": "Streisand",
+        "v2box": "V2Box",
+        "happ": "Happ",
+        "shadowrocket": "Shadowrocket",
+        "sing-box": "sing-box",
+        "nekoray": "Nekoray",
+        "v2rayn": "v2rayN",
+    }
+    for key, name in known.items():
+        if key in ua:
+            return name
+    if ua:
+        return user_agent.split("/")[0].strip()[:20] or "Unknown"
+    return "Unknown"
 
 
 def _price_text(plan: Plan, months: str) -> str:
@@ -2699,14 +2732,39 @@ class DeviceAuthServer:
             server = storage.get_host(sub.host_id) or storage.server()
             if not server or not server.address or not server.public_key:
                 raise HTTPException(status_code=503, detail="server not configured")
-            # Синхронизируем устройства подписки с активными IP из 3X-UI
+            # Определяем устройство по IP + клиенту, регистрируем/обновляем
+            user_agent = request.headers.get("user-agent", "")
+            client_app = _client_app(user_agent)
+            storage.record_connection(sub.sub_id, ip, user_agent, time.time(), 0, force=True, log=False, client_app=client_app, match_by="ip_client")
+            # Перезагружаем подписку, чтобы получить актуальный список устройств
+            fresh_sub = storage.get_subscription(sub.sub_id)
+            if fresh_sub:
+                sub = fresh_sub
+            # Синхронизируем с активными IP из 3X-UI
             try:
                 XrayAPI.sync_client_devices(sub, force=True, log=False)
             except Exception:
                 logger.exception("Device sync error in subscription endpoint")
-            vless_url = generate_vless_url(sub, server)
+            # Ещё раз перезагружаем, так как sync_client_devices мог изменить список
+            fresh_sub = storage.get_subscription(sub.sub_id)
+            if fresh_sub:
+                sub = fresh_sub
+            # Проверяем лимит устройств после регистрации
+            max_devices = storage.max_devices_for(sub)
+            over_limit = len(sub.devices) > max_devices
             headers = _subscription_headers(sub)
             fmt = (format or "json").lower()
+            if over_limit:
+                # Вместо рабочей подписки отдаём два пустышечных сервера с предупреждениями
+                if fmt == "json":
+                    return JSONResponse(build_dummy_configs(), headers=headers)
+                if fmt == "raw":
+                    return Response(content="", headers=headers, media_type="text/plain; charset=utf-8")
+                if fmt == "singbox":
+                    return JSONResponse([], headers=headers)
+                if fmt == "clash":
+                    return Response(content="", headers=headers, media_type="text/yaml; charset=utf-8")
+            vless_url = generate_vless_url(sub, server)
             if fmt == "raw":
                 body = base64.b64encode(vless_url.encode("utf-8")).decode("ascii")
                 return Response(content=body, headers=headers, media_type="text/plain; charset=utf-8")
@@ -3307,12 +3365,13 @@ class XrayAPI:
         enable: bool,
         server: ServerConfig,
         flow: str,
+        limit_ip: int = 0,
     ) -> dict[str, Any]:
         return {
             "id": client_uuid,
             "flow": flow,
             "email": email,
-            "limitIp": 0,
+            "limitIp": limit_ip,
             "totalGB": 0,
             "expiryTime": expiry_ms,
             "enable": enable,
@@ -3392,6 +3451,7 @@ class XrayAPI:
         enable: bool = True,
         inbound_id: int | None = None,
         host_id: str | None = None,
+        limit_ip: int = 0,
     ) -> bool:
         server = XrayAPI._get_host(host_id)
         if not server or not server.panel_url:
@@ -3409,7 +3469,7 @@ class XrayAPI:
             clients = settings.get("clients", [])
             flow = XrayAPI._get_flow_from_inbound(inbound) or server.flow
             client_data = XrayAPI._build_client_data(
-                client_uuid, email, xray_sub_id, expiry_ms, enable, server, flow
+                client_uuid, email, xray_sub_id, expiry_ms, enable, server, flow, limit_ip
             )
             updated = False
             for c in clients:
@@ -3480,6 +3540,8 @@ class XrayAPI:
             return False
         XrayAPI._ensure_email_and_sub_id(sub)
         expiry_ms = XrayAPI._expiry_ms(sub) if enable else 0
+        max_dev = storage.max_devices_for(sub)
+        limit_ip = 0 if max_dev >= 9999 else max_dev
         if XrayAPI.add_or_update_client_raw(
             sub.client_uuid,
             sub.email,
@@ -3488,6 +3550,7 @@ class XrayAPI:
             enable,
             server.inbound_id,
             sub.host_id,
+            limit_ip=limit_ip,
         ):
             sub.xray_synced = True
             storage.update_subscription(sub)
@@ -3578,14 +3641,37 @@ class XrayAPI:
                 return 0
             ips = XrayAPI.get_client_ips(server, sub.email, session=session)
             now = time.time()
+            max_devices = storage.max_devices_for(sub)
             added = 0
+            modified = False
             for item in ips:
                 ip = str(item.get("ip", "")).strip()
                 if not ip:
                     continue
-                if not any(d.get("ip") == ip for d in sub.devices):
-                    storage.record_connection(sub.sub_id, ip, "Xray client", now, 0, force=force, log=log)
+                existing = [d for d in sub.devices if d.get("ip") == ip]
+                if existing:
+                    dev = existing[0]
+                    dev["last_seen"] = now
+                    if not dev.get("client_app"):
+                        dev["client_app"] = "Xray client"
+                    modified = True
+                elif force or len(sub.devices) < max_devices:
+                    sub.devices.append({
+                        "ip": ip,
+                        "user_agent": "Xray client",
+                        "client_app": "Xray client",
+                        "first_seen": now,
+                        "last_seen": now,
+                        "traffic": 0,
+                        "blocked": False,
+                    })
                     added += 1
+                    modified = True
+                else:
+                    # превышен лимит — новое IP не добавляем в фоновой синхронизации
+                    pass
+            if modified:
+                storage.update_subscription(sub)
             return added
         finally:
             if created_session and session is not None:
@@ -3824,6 +3910,39 @@ def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) 
         "  - MATCH,Proxy",
     ]
     return "\n".join(lines)
+
+
+def build_dummy_configs() -> list[dict[str, Any]]:
+    """Возвращает два пустышечных Xray-конфига с сообщениями о превышении лимита устройств."""
+    base = {
+        "log": {"access": "", "error": "", "loglevel": "warning"},
+        "dns": {"queryStrategy": "UseIPv4", "servers": ["1.1.1.1"]},
+        "inbounds": [
+            {
+                "tag": "socks",
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
+                "settings": {"auth": "noauth", "udp": True},
+            }
+        ],
+        "outbounds": [
+            {"tag": "proxy", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "port": "0-65535", "outboundTag": "proxy", "enabled": True}
+            ],
+        },
+    }
+    return [
+        {**base, "remarks": "❗️Лимит устройств!"},
+        {**base, "remarks": "‼️Зайдите в боте в управление устройствами"},
+    ]
 
 
 def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
@@ -5053,10 +5172,10 @@ class UserBot:
         lines = [f"<b>Устройства</b> ({len(sub.devices)} / {plan.device_text if plan else '?'})\n\nОтвязать устройство можно раз в {storage.security().get('unbind_cooldown', DEFAULT_UNBIND_COOLDOWN) // 86400} дней."]
         for i, d in enumerate(sub.devices, 1):
             ip = _escape(d.get('ip', ''))
-            ua = _escape(d.get('user_agent', ''))
+            app = _escape(d.get('client_app') or _client_app(d.get('user_agent', '')))
             seen = d.get('last_seen') or d.get('first_seen')
-            ua_text = f" — {ua[:20]}" if ua else ""
-            lines.append(f"{i}. {ip}{ua_text} (последнее: {datetime.fromtimestamp(seen).strftime('%d.%m.%Y %H:%M')})")
+            app_text = f" [{app}]" if app and app != "Unknown" else ""
+            lines.append(f"{i}. {ip}{app_text} (последнее: {datetime.fromtimestamp(seen).strftime('%d.%m.%Y %H:%M')})")
         if not sub.devices:
             lines.append("Устройств пока нет.")
         kb = K()
