@@ -1382,7 +1382,7 @@ class VPNStorage:
         md = plan.max_devices
         return 9999 if md < 0 else max(1, md)
 
-    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0, force: bool = False, log: bool = True, client_app: str = "", match_by: str = "ip") -> dict[str, Any]:
+    def record_connection(self, sub_id: str, ip: str, user_agent: str, now: float, traffic_bytes: int = 0, force: bool = False, log: bool = True, client_app: str = "", match_by: str = "ip", rotate_uuid: bool = False) -> dict[str, Any]:
         sub = self.get_subscription(sub_id)
         result = {"allowed": False, "reason": "unknown"}
         client_app = client_app or _client_app(user_agent)
@@ -1408,28 +1408,43 @@ class VPNStorage:
                 dev["last_seen"] = now
                 if traffic_bytes:
                     dev["traffic"] = dev.get("traffic", 0) + traffic_bytes
+                # При обновлении подписки генерируем новый UUID, чтобы старый JSON-ключ перестал работать
+                if rotate_uuid:
+                    old_email = dev.get("client_email")
+                    dev["client_uuid"] = _device_uuid()
+                    dev["client_email"] = _device_email(sub, ip, client_app)
+                    if old_email and old_email != dev["client_email"]:
+                        try:
+                            XrayAPI.remove_client_by_email(old_email)
+                        except Exception:
+                            pass
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "ok", "device": dev}
             elif force or len(sub.devices) < max_devices:
-                dev = {"ip": ip, "user_agent": user_agent, "client_app": client_app, "first_seen": now, "last_seen": now, "traffic": traffic_bytes, "blocked": False}
+                dev = {
+                    "ip": ip,
+                    "user_agent": user_agent,
+                    "client_app": client_app,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "traffic": traffic_bytes,
+                    "blocked": False,
+                    "client_uuid": _device_uuid(),
+                    "client_email": _device_email(sub, ip, client_app),
+                }
                 sub.devices.append(dev)
+                # Первое устройство заменяет fallback-клиент, созданный при покупке
+                if len(sub.devices) == 1 and sub.email:
+                    try:
+                        XrayAPI.remove_client_by_email(sub.email)
+                    except Exception:
+                        pass
                 self.update_subscription(sub)
                 result = {"allowed": True, "reason": "registered", "device": dev}
                 if not force and len(sub.devices) > max_devices:
                     result["warning"] = "device_limit_exceeded"
             else:
                 result = {"allowed": False, "reason": "device_limit"}
-
-            # анти-шаринг: одновременные подключения с разных IP
-            if result["allowed"]:
-                window = self.security().get("sharing_window", DEFAULT_SHARING_WINDOW)
-                recent_ips = set()
-                for d in sub.devices:
-                    if d.get("ip") and d.get("ip") != ip and d.get("last_seen") and now - d.get("last_seen", 0) < window:
-                        recent_ips.add(d["ip"])
-                if recent_ips:
-                    result["warning"] = "sharing_suspected"
-                    self._add_suspicious_event(sub.user_id, sub_id, ip, f"Одновременные подключения с IP: {', '.join(recent_ips)}")
 
             # лимит трафика
             traffic_limit_gb = self.security().get("traffic_limit_gb", 0.0)
@@ -1636,10 +1651,15 @@ class VPNStorage:
         if now - last_unbind < cooldown:
             remaining = int(cooldown - (now - last_unbind))
             return False, f"Отвязать устройство можно через {remaining // 86400}д {remaining % 86400 // 3600}ч."
-        del sub.devices[index]
+        removed_dev = sub.devices.pop(index)
         user["last_unbind_at"] = now
         self.update_subscription(sub)
         self.update_user(user)
+        if removed_dev.get("client_email"):
+            try:
+                XrayAPI.remove_client_by_email(removed_dev["client_email"])
+            except Exception:
+                pass
         return True, "Устройство отвязано."
 
     def add_referral_earnings(self, user_id: int, amount: Decimal, from_user_id: int, level: int) -> None:
@@ -1744,6 +1764,22 @@ def _client_app(user_agent: str) -> str:
     if ua:
         return user_agent.split("/")[0].strip()[:20] or "Unknown"
     return "Unknown"
+
+
+def _device_fingerprint(ip: str, client_app: str) -> str:
+    return f"{ip.strip()}|{client_app}"
+
+
+def _device_email(sub: Subscription, ip: str, client_app: str) -> str:
+    """Стабильный email клиента в 3X-UI для конкретного устройства."""
+    if not sub.email:
+        return ""
+    h = hashlib.md5(_device_fingerprint(ip, client_app).encode()).hexdigest()[:8]
+    return f"{sub.email}_{h}"
+
+
+def _device_uuid() -> str:
+    return str(uuid4())
 
 
 def _price_text(plan: Plan, months: str) -> str:
@@ -2732,11 +2768,10 @@ class DeviceAuthServer:
             server = storage.get_host(sub.host_id) or storage.server()
             if not server or not server.address or not server.public_key:
                 raise HTTPException(status_code=503, detail="server not configured")
-            # Определяем устройство по IP + клиенту, регистрируем/обновляем
+            # Определяем устройство по IP + клиенту, регистрируем/обновляем и ротируем UUID
             user_agent = request.headers.get("user-agent", "")
             client_app = _client_app(user_agent)
-            storage.record_connection(sub.sub_id, ip, user_agent, time.time(), 0, force=True, log=False, client_app=client_app, match_by="ip_client")
-            # Перезагружаем подписку, чтобы получить актуальный список устройств
+            res = storage.record_connection(sub.sub_id, ip, user_agent, time.time(), 0, force=True, log=False, client_app=client_app, match_by="ip_client", rotate_uuid=True)
             fresh_sub = storage.get_subscription(sub.sub_id)
             if fresh_sub:
                 sub = fresh_sub
@@ -2745,17 +2780,22 @@ class DeviceAuthServer:
                 XrayAPI.sync_client_devices(sub, force=True, log=False)
             except Exception:
                 logger.exception("Device sync error in subscription endpoint")
-            # Ещё раз перезагружаем, так как sync_client_devices мог изменить список
             fresh_sub = storage.get_subscription(sub.sub_id)
             if fresh_sub:
                 sub = fresh_sub
-            # Проверяем лимит устройств после регистрации
+            # Ищем текущее устройство в свежем списке
+            fingerprint = _device_fingerprint(ip, client_app)
+            fetching_device = None
+            for d in sub.devices:
+                if _device_fingerprint(d.get("ip", ""), d.get("client_app") or _client_app(d.get("user_agent", ""))) == fingerprint:
+                    fetching_device = d
+                    break
+            # Проверяем лимит устройств
             max_devices = storage.max_devices_for(sub)
             over_limit = len(sub.devices) > max_devices
             headers = _subscription_headers(sub)
             fmt = (format or "json").lower()
             if over_limit:
-                # Вместо рабочей подписки отдаём два пустышечных сервера с предупреждениями
                 if fmt == "json":
                     return JSONResponse(build_dummy_configs(), headers=headers)
                 if fmt == "raw":
@@ -2764,16 +2804,23 @@ class DeviceAuthServer:
                     return JSONResponse([], headers=headers)
                 if fmt == "clash":
                     return Response(content="", headers=headers, media_type="text/yaml; charset=utf-8")
-            vless_url = generate_vless_url(sub, server)
+            # Пушим UUID устройства в 3X-UI, чтобы старые JSON-ключи перестали работать
+            if fetching_device:
+                try:
+                    XrayAPI.add_or_update_device_client(sub, fetching_device)
+                except Exception:
+                    logger.exception("Device client sync error in subscription endpoint")
+            client_uuid = fetching_device.get("client_uuid") if fetching_device else None
+            vless_url = generate_vless_url(sub, server, client_uuid=client_uuid)
             if fmt == "raw":
                 body = base64.b64encode(vless_url.encode("utf-8")).decode("ascii")
                 return Response(content=body, headers=headers, media_type="text/plain; charset=utf-8")
             if fmt == "json":
-                return JSONResponse(build_v2raytun_json(vless_url, server, sub), headers=headers)
+                return JSONResponse(build_v2raytun_json(vless_url, server, sub, client_uuid=client_uuid), headers=headers)
             if fmt == "singbox":
-                return JSONResponse(build_singbox_config(vless_url, server, sub), headers=headers)
+                return JSONResponse(build_singbox_config(vless_url, server, sub, client_uuid=client_uuid), headers=headers)
             if fmt == "clash":
-                return Response(content=build_clash_config(vless_url, server, sub), headers=headers, media_type="text/yaml; charset=utf-8")
+                return Response(content=build_clash_config(vless_url, server, sub, client_uuid=client_uuid), headers=headers, media_type="text/yaml; charset=utf-8")
             raise HTTPException(status_code=400, detail="unsupported format")
 
         # ---- Telegram Mini App (Web App) endpoints ----
@@ -3563,16 +3610,45 @@ class XrayAPI:
         server = XrayAPI._get_host(sub.host_id)
         if not server or not server.panel_url or not sub.email:
             return False
-        if XrayAPI.remove_client_by_email(sub.email, server.inbound_id, sub.host_id):
+        removed = False
+        for email in {sub.email} | {d.get("client_email") for d in sub.devices}:
+            if email and XrayAPI.remove_client_by_email(email, server.inbound_id, sub.host_id):
+                removed = True
+        if removed:
             sub.xray_synced = False
             storage.update_subscription(sub)
-            logger.info("3X-UI client removed for sub #%s host=%s", sub.sub_id, sub.host_id)
+            logger.info("3X-UI clients removed for sub #%s host=%s", sub.sub_id, sub.host_id)
             return True
         return False
 
     @staticmethod
     def update_expiry(sub: Subscription, enable: bool = True) -> bool:
         return XrayAPI.add_or_update_client(sub, enable=enable)
+
+    @staticmethod
+    def add_or_update_device_client(sub: Subscription, device: dict[str, Any], enable: bool = True) -> bool:
+        """Добавляет/обновляет клиента в 3X-UI под конкретное устройство."""
+        server = XrayAPI._get_host(sub.host_id)
+        if not server or not server.panel_url or not sub.email:
+            return False
+        if not device.get("client_uuid") or not device.get("client_email"):
+            return False
+        expiry_ms = XrayAPI._expiry_ms(sub) if enable else 0
+        max_dev = storage.max_devices_for(sub)
+        limit_ip = 0 if max_dev >= 9999 else 1
+        ok = XrayAPI.add_or_update_client_raw(
+            device["client_uuid"],
+            device["client_email"],
+            sub.xray_sub_id,
+            expiry_ms,
+            enable,
+            server.inbound_id,
+            sub.host_id,
+            limit_ip=limit_ip,
+        )
+        if ok:
+            logger.info("3X-UI device client synced for sub #%s email=%s", sub.sub_id, device["client_email"])
+        return ok
 
     @staticmethod
     def get_client_stats(sub: Subscription) -> dict[str, int]:
@@ -3586,9 +3662,14 @@ class XrayAPI:
         if not inbound:
             return {"upload": 0, "download": 0}
         try:
+            total_up = 0
+            total_down = 0
+            allowed_emails = {sub.email} | {d.get("client_email") for d in sub.devices}
             for stat in inbound.get("clientStats", []) or []:
-                if stat.get("email") == sub.email or stat.get("subId") == sub.xray_sub_id:
-                    return {"upload": int(stat.get("up", 0)), "download": int(stat.get("down", 0))}
+                if stat.get("email") in allowed_emails or stat.get("subId") == sub.xray_sub_id:
+                    total_up += int(stat.get("up", 0))
+                    total_down += int(stat.get("down", 0))
+            return {"upload": total_up, "download": total_down}
         except Exception:
             logger.exception("3X-UI get_client_stats error for sub #%s", sub.sub_id)
         return {"upload": 0, "download": 0}
@@ -3639,12 +3720,21 @@ class XrayAPI:
         try:
             if created_session and not XrayAPI._login(session, server):
                 return 0
-            ips = XrayAPI.get_client_ips(server, sub.email, session=session)
+            # Опрашиваем все email клиентов этой подписки (fallback + per-device)
+            seen_emails = set()
+            all_ips: list[dict[str, Any]] = []
+            for email in [sub.email] + [d.get("client_email") for d in sub.devices]:
+                if email and email not in seen_emails:
+                    seen_emails.add(email)
+                    try:
+                        all_ips.extend(XrayAPI.get_client_ips(server, email, session=session))
+                    except Exception:
+                        logger.exception("3X-UI get_client_ips error for %s", email)
             now = time.time()
             max_devices = storage.max_devices_for(sub)
             added = 0
             modified = False
-            for item in ips:
+            for item in all_ips:
                 ip = str(item.get("ip", "")).strip()
                 if not ip:
                     continue
@@ -3664,6 +3754,8 @@ class XrayAPI:
                         "last_seen": now,
                         "traffic": 0,
                         "blocked": False,
+                        "client_uuid": _device_uuid(),
+                        "client_email": _device_email(sub, ip, "Xray client"),
                     })
                     added += 1
                     modified = True
@@ -3789,10 +3881,10 @@ class XrayAPI:
         return result
 
 
-def generate_vless_url(sub: Subscription, server: ServerConfig) -> str:
+def generate_vless_url(sub: Subscription, server: ServerConfig, client_uuid: str | None = None) -> str:
     """Собирает vless:// ссылку по данным подписки и сервера."""
     return generate_vless_url_raw(
-        client_uuid=sub.client_uuid,
+        client_uuid=client_uuid or sub.client_uuid,
         email=sub.email,
         xray_sub_id=sub.xray_sub_id,
         server=server,
@@ -3843,8 +3935,9 @@ def _subscription_vless_url(sub: Subscription, server: ServerConfig) -> str:
     return generate_vless_url(sub, server)
 
 
-def build_singbox_config(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
+def build_singbox_config(vless_url: str, server: ServerConfig, sub: Subscription, client_uuid: str | None = None) -> dict[str, Any]:
     """Строит sing-box outbound для VLESS Reality."""
+    uuid = client_uuid or sub.client_uuid
     return {
         "log": {"level": "info"},
         "dns": {"servers": [{"address": "tls://1.1.1.1"}]},
@@ -3857,7 +3950,7 @@ def build_singbox_config(vless_url: str, server: ServerConfig, sub: Subscription
                 "tag": "proxy",
                 "server": server.address,
                 "server_port": server.port,
-                "uuid": sub.client_uuid,
+                "uuid": uuid,
                 "flow": server.flow or "xtls-rprx-vision",
                 "network": "tcp",
                 "tls": {
@@ -3881,8 +3974,9 @@ def build_singbox_config(vless_url: str, server: ServerConfig, sub: Subscription
     }
 
 
-def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) -> str:
+def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription, client_uuid: str | None = None) -> str:
     """Строит минимальный Clash Meta YAML для VLESS Reality."""
+    uuid = client_uuid or sub.client_uuid
     name = f"{server.server_name or 'VPN'}-{sub.email or sub.sub_id}"
     lines = [
         "proxies:",
@@ -3890,7 +3984,7 @@ def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) 
         f"    type: vless",
         f"    server: {server.address}",
         f"    port: {server.port}",
-        f"    uuid: {sub.client_uuid}",
+        f"    uuid: {uuid}",
         f"    flow: {server.flow or 'xtls-rprx-vision'}",
         "    network: tcp",
         "    tls: true",
@@ -3945,8 +4039,9 @@ def build_dummy_configs() -> list[dict[str, Any]]:
     ]
 
 
-def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
+def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription, client_uuid: str | None = None) -> dict[str, Any]:
     """Строит JSON-подписку в формате v2rayNG/v2rayTun (полный Xray-конфиг с remarks)."""
+    uuid = client_uuid or sub.client_uuid
     return {
         "remarks": "🇪🇸Барселона ⚡️",
         "log": {"access": "", "error": "", "loglevel": "warning"},
@@ -3972,7 +4067,7 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription)
                             "port": server.port,
                             "users": [
                                 {
-                                    "id": sub.client_uuid,
+                                    "id": uuid,
                                     "encryption": "none",
                                     "flow": server.flow or "xtls-rprx-vision",
                                 }
@@ -4793,6 +4888,12 @@ class UserBot:
             sub_id = args[0]
             sub = storage.get_subscription(sub_id)
             if sub and sub.user_id == user_id:
+                for dev in sub.devices:
+                    if dev.get("client_email"):
+                        try:
+                            XrayAPI.remove_client_by_email(dev["client_email"])
+                        except Exception:
+                            pass
                 sub.devices = []
                 storage.update_subscription(sub)
                 self.bot.answer_callback_query(c.id, "Все устройства удалены.")
@@ -5213,8 +5314,25 @@ class UserBot:
         if any(d["ip"] == ip for d in sub.devices):
             self.bot.send_message(m.chat.id, "Это устройство уже добавлено.", reply_markup=self._keyboard_main())
             return
-        sub.devices.append({"ip": ip, "first_seen": time.time(), "last_seen": time.time()})
+        now = time.time()
+        client_app = "manual"
+        dev = {
+            "ip": ip,
+            "user_agent": "manual",
+            "client_app": client_app,
+            "first_seen": now,
+            "last_seen": now,
+            "traffic": 0,
+            "blocked": False,
+            "client_uuid": _device_uuid(),
+            "client_email": _device_email(sub, ip, client_app),
+        }
+        sub.devices.append(dev)
         storage.update_subscription(sub)
+        try:
+            XrayAPI.add_or_update_device_client(sub, dev)
+        except Exception:
+            logger.exception("Manual add device client sync error")
         self.bot.send_message(m.chat.id, f"Устройство {ip} добавлено.", reply_markup=self._keyboard_main())
 
     def _on_del_device_ip(self, m: Message) -> None:
@@ -5236,8 +5354,15 @@ class UserBot:
             self.bot.send_message(m.chat.id, "Подписка не найдена.", reply_markup=self._keyboard_main())
             return
         before = len(sub.devices)
+        removed = [d for d in sub.devices if d["ip"] == ip]
         sub.devices = [d for d in sub.devices if d["ip"] != ip]
         storage.update_subscription(sub)
+        for dev in removed:
+            if dev.get("client_email"):
+                try:
+                    XrayAPI.remove_client_by_email(dev["client_email"])
+                except Exception:
+                    pass
         if len(sub.devices) < before:
             self.bot.send_message(m.chat.id, f"Устройство {ip} удалено.", reply_markup=self._keyboard_main())
         else:
