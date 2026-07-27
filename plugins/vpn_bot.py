@@ -3689,7 +3689,7 @@ def build_clash_config(vless_url: str, server: ServerConfig, sub: Subscription) 
 def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription) -> dict[str, Any]:
     """Строит JSON-подписку в формате v2rayNG/v2rayTun (полный Xray-конфиг с remarks)."""
     return {
-        "remarks": "🐸 Пепе ВПН",
+        "remarks": "🇪🇸Барселона ⚡️",
         "log": {"access": "", "error": "", "loglevel": "warning"},
         "dns": {"queryStrategy": "UseIPv4", "servers": ["1.1.1.1", "8.8.8.8", "8.8.4.4"]},
         "inbounds": [
@@ -3749,7 +3749,10 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription)
 
 def _subscription_headers(sub: Subscription) -> dict[str, str]:
     """HTTP-заголовки с мета-информацией подписки для клиентов."""
-    title = storage.config.get("profile_title", "🐸 Пепе ВПН")
+    title = storage.config.get(
+        "profile_title",
+        "🐸 Защита лягушки Пепе\n🔰Наш бот: @vpnpepe_robot\n❗️Если что-то не работает обновите подписку 🔄",
+    )
     title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
     support = storage.config.get("support_id", "@support").lstrip("@")
     support_url = f"https://t.me/{support}" if support else ""
