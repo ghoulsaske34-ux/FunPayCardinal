@@ -2789,10 +2789,13 @@ class DeviceAuthServer:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 raise HTTPException(status_code=500, detail="invalid subscription file")
-            title = "special for makcum"
+            title = "🐸 Пепе ВПН"
+            announce = "special for makcum"
             title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+            announce_b64 = "base64:" + base64.b64encode(announce.encode("utf-8")).decode("ascii")
             headers = {
                 "profile-title": title_b64,
+                "announce": announce_b64,
                 "subscription-userinfo": "upload=0; download=0; total=0; expire=0",
                 "profile-update-interval": "1",
             }
