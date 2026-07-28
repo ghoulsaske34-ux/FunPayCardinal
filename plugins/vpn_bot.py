@@ -2202,13 +2202,33 @@ def _verify_telegram_init_data(init_data: str) -> dict[str, Any] | None:
             return None
         secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
         expected = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(received_hash, expected):
+        if hmac.compare_digest(received_hash, expected):
+            user_raw = params.get("user")
+            if user_raw:
+                user = json.loads(user_raw)
+                if isinstance(user, dict):
+                    return user
             return None
-        user_raw = params.get("user")
-        if user_raw:
-            user = json.loads(user_raw)
-            if isinstance(user, dict):
-                return user
+        # Fallback: Ed25519 third-party validation (Bot API 7.2+)
+        try:
+            from telegram_webapp_auth.auth import TelegramAuthenticator
+            bot_id = int(bot_token.split(":", 1)[0])
+            auth = TelegramAuthenticator(b"")
+            data = auth.validate_third_party(init_data, bot_id=bot_id)
+            user = data.user
+            if user:
+                return {
+                    "id": user.id,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name or "",
+                    "username": user.username or "",
+                    "language_code": user.language_code or "",
+                    "is_premium": user.is_premium or False,
+                    "allows_write_to_pm": user.allows_write_to_pm or False,
+                    "photo_url": user.photo_url or "",
+                }
+        except Exception:
+            pass
     except Exception:
         logger.exception("Mini App initData verification failed")
     return None
