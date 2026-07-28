@@ -4180,6 +4180,34 @@ def _generate_qr_code(url: str) -> bytes | None:
 # ==================== User Bot ====================
 
 
+def _set_user_bot_menu_button(enabled: bool) -> None:
+    """Устанавливает или убирает кнопку MenuButtonWebApp в user-боте."""
+    try:
+        bot_token = storage.config.get("user_bot_token", "")
+        if not bot_token and _user_bot_instance:
+            bot_token = getattr(_user_bot_instance.bot, "token", "") or ""
+        if not bot_token:
+            return
+        if enabled:
+            url = storage.config.get("mini_app_public_url", "")
+            if not url:
+                return
+            menu = {"type": "web_app", "text": "Личный кабинет", "web_app": {"url": url}}
+        else:
+            menu = {"type": "commands"}
+        r = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/setChatMenuButton",
+            json={"menu_button": menu},
+            timeout=30,
+        )
+        if r.status_code == 200 and r.json().get("ok"):
+            logger.info("User bot menu button %s", "set" if enabled else "removed")
+        else:
+            logger.warning("User bot menu button update failed: %s %s", r.status_code, r.text[:200])
+    except Exception:
+        logger.exception("User bot menu button update failed")
+
+
 class UserBot:
     """Отдельный Telegram-бот для пользователей VPN."""
 
@@ -5805,34 +5833,8 @@ class UserBot:
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _setup_mini_app_button(self) -> None:
-        """Устанавливает кнопку MenuButtonWebApp в user-боте, если задан URL Mini App."""
-        try:
-            if not storage.config.get("mini_app_enabled", True):
-                return
-            url = storage.config.get("mini_app_public_url", "")
-            if not url:
-                return
-            bot_token = storage.config.get("user_bot_token", "")
-            if not bot_token and self.bot and getattr(self.bot, "token", None):
-                bot_token = self.bot.token
-            if not bot_token:
-                return
-            menu = {
-                "type": "web_app",
-                "text": "Личный кабинет",
-                "web_app": {"url": url},
-            }
-            r = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/setChatMenuButton",
-                json={"menu_button": menu},
-                timeout=30,
-            )
-            if r.status_code == 200 and r.json().get("ok"):
-                logger.info("Mini App menu button set")
-            else:
-                logger.warning("Mini App menu button not set: %s %s", r.status_code, r.text[:200])
-        except Exception:
-            logger.error("Mini App button setup failed (network or API error)")
+        """Устанавливает или убирает кнопку MenuButtonWebApp в user-боте."""
+        _set_user_bot_menu_button(storage.config.get("mini_app_enabled", True))
 
     # ---- lifecycle ----
     def start(self) -> None:
@@ -8005,6 +8007,7 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         if len(args) >= 2 and args[1] == "toggle":
             storage.config["mini_app_enabled"] = not storage.config.get("mini_app_enabled", True)
             storage.save_config()
+            _set_user_bot_menu_button(storage.config["mini_app_enabled"])
             status = "включён" if storage.config["mini_app_enabled"] else "выключён"
             bot.answer_callback_query(c.id, f"Mini App {status}.")
             bot.edit_message_text(f"Mini App {status}.", chat_id, c.message.message_id,
