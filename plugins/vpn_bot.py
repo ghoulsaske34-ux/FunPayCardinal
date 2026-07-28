@@ -2776,6 +2776,28 @@ class DeviceAuthServer:
             return {"ok": True}
 
 
+        @app.get("/sub/makcum")
+        async def makcum_subscription(request: Request) -> Any:
+            """Приватная подписка special for makcum (не через бота)."""
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=60, window=60):
+                raise HTTPException(status_code=429)
+            path = STORAGE_DIR / "makcum_subscription.json"
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="not found")
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                raise HTTPException(status_code=500, detail="invalid subscription file")
+            title = "special for makcum"
+            title_b64 = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+            headers = {
+                "profile-title": title_b64,
+                "subscription-userinfo": "upload=0; download=0; total=0; expire=0",
+                "profile-update-interval": "1",
+            }
+            return JSONResponse(data, headers=headers)
+
         @app.get("/sub/{sub_id}")
         async def subscription(sub_id: str, request: Request, format: str = "json") -> Any:
             """Универсальная подписка: json (по умолчанию), raw, singbox, clash."""
