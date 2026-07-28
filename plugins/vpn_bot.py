@@ -5803,12 +5803,14 @@ class UserBot:
                 "web_app": {"url": url},
             }
             r = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/setMyDefaultMenuButton",
+                f"https://api.telegram.org/bot{bot_token}/setChatMenuButton",
                 json={"menu_button": menu},
                 timeout=30,
             )
             if r.status_code == 200 and r.json().get("ok"):
                 logger.info("Mini App menu button set")
+            else:
+                logger.warning("Mini App menu button not set: %s %s", r.status_code, r.text[:200])
         except Exception:
             logger.error("Mini App button setup failed (network or API error)")
 
