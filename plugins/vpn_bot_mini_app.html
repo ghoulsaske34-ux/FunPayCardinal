@@ -192,15 +192,24 @@ label { display: block; color: var(--hint); font-size: 13px; margin: 12px 0 6px;
 <div class="toast" id="toast"></div>
 
 <script>
-const tg = window.Telegram.WebApp;
-tg.ready(); tg.expand();
+const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : {};
+if (tg.ready) tg.ready();
+if (tg.expand) tg.expand();
 const API_BASE = '/mini-app/api';
 let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {}, isAdmin: false, page: 'home', stack: [], selectedSub: null };
 
 function $(id){ return document.getElementById(id); }
 function showToast(text){ const t=$('toast'); t.textContent=text; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000); }
 function copy(text){ navigator.clipboard.writeText(text).then(()=>showToast('Скопировано')).catch(()=>showToast('Не удалось скопировать')); }
-function initData(){ return encodeURIComponent(tg.initData || ''); }
+function initDataRaw(){
+  if (tg.initData) return tg.initData;
+  const qs = new URLSearchParams(window.location.search).get('tgWebAppData');
+  if (qs) return qs;
+  const hash = new URLSearchParams(window.location.hash.slice(1)).get('tgWebAppData');
+  if (hash) return hash;
+  return '';
+}
+function initData(){ return encodeURIComponent(initDataRaw()); }
 
 async function api(path, method='GET', body){
   const sep = path.includes('?') ? '&' : '?';
@@ -495,6 +504,7 @@ async function loadConfig(){
 }
 
 async function init(){
+  if (!initDataRaw()) { render('auth-error', false); return; }
   await loadConfig();
   await loadMe();
   render('home', false);
@@ -505,7 +515,11 @@ async function init(){
   };
 }
 
-init().catch(()=>{ $('main').innerHTML = '<div class="empty">Ошибка загрузки. Попробуйте позже.</div>'; });
+init().catch((e)=>{
+  console.error(e);
+  if (!initDataRaw() || (e && e.message === 'auth')) render('auth-error', false);
+  else $('main').innerHTML = '<div class="empty">Ошибка загрузки. Попробуйте позже.</div>';
+});
 </script>
 </body>
 </html>
