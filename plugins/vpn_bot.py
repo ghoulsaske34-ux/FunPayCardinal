@@ -2200,7 +2200,7 @@ def _verify_telegram_init_data(init_data: str) -> dict[str, Any] | None:
             bot_token = getattr(_user_bot_instance.bot, "token", "") or ""
         if not bot_token:
             return None
-        secret_key = hmac.new(hashlib.sha256(bot_token.encode()).digest(), b"WebAppData", hashlib.sha256).digest()
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
         expected = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(received_hash, expected):
             return None
