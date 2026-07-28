@@ -4183,9 +4183,23 @@ def _generate_qr_code(url: str) -> bytes | None:
 def _set_user_bot_menu_button(enabled: bool) -> None:
     """Устанавливает или убирает кнопку MenuButtonWebApp в user-боте."""
     try:
+        if _user_bot_instance and _user_bot_instance.bot:
+            bot = _user_bot_instance.bot
+            if enabled:
+                url = storage.config.get("mini_app_public_url", "")
+                if not url:
+                    return
+                menu = telebot.types.MenuButtonWebApp(
+                    type="web_app",
+                    text="Личный кабинет",
+                    web_app=telebot.types.WebAppInfo(url=url),
+                )
+            else:
+                menu = telebot.types.MenuButtonCommands(type="commands")
+            bot.set_chat_menu_button(menu_button=menu)
+            logger.info("User bot menu button %s", "set" if enabled else "removed")
+            return
         bot_token = storage.config.get("user_bot_token", "")
-        if not bot_token and _user_bot_instance:
-            bot_token = getattr(_user_bot_instance.bot, "token", "") or ""
         if not bot_token:
             return
         if enabled:
@@ -4201,7 +4215,7 @@ def _set_user_bot_menu_button(enabled: bool) -> None:
             timeout=30,
         )
         if r.status_code == 200 and r.json().get("ok"):
-            logger.info("User bot menu button %s", "set" if enabled else "removed")
+            logger.info("User bot menu button %s (HTTP)", "set" if enabled else "removed")
         else:
             logger.warning("User bot menu button update failed: %s %s", r.status_code, r.text[:200])
     except Exception:
@@ -8007,11 +8021,12 @@ def _handle_admin_callback(cardinal: Cardinal, c: CallbackQuery) -> None:
         if len(args) >= 2 and args[1] == "toggle":
             storage.config["mini_app_enabled"] = not storage.config.get("mini_app_enabled", True)
             storage.save_config()
-            _set_user_bot_menu_button(storage.config["mini_app_enabled"])
             status = "включён" if storage.config["mini_app_enabled"] else "выключён"
             bot.answer_callback_query(c.id, f"Mini App {status}.")
             bot.edit_message_text(f"Mini App {status}.", chat_id, c.message.message_id,
                                   reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}admin:mini_app")))
+            threading.Thread(target=_set_user_bot_menu_button,
+                             args=(storage.config["mini_app_enabled"],), daemon=True).start()
             return
         if len(args) >= 2 and args[1] == "reload":
             global MINI_APP_HTML
