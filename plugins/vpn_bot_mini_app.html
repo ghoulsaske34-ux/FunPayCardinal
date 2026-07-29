@@ -391,15 +391,21 @@ function renderDeposit(main){
     '</div>' +
     '<div class="card">' +
       '<div class="card-title">Способ оплаты</div>' +
-      '<button class="btn" data-method="platega">Platega (СБП / карта)</button>' +
-      '<button class="btn" data-method="cryptobot" data-asset="USDT">CryptoBot USDT</button>' +
-      '<button class="btn" data-method="cryptobot" data-asset="TON">CryptoBot TON</button>' +
+      '<button class="btn" data-method="platega" data-asset="sbp">Platega СБП</button>' +
+      '<button class="btn" data-method="platega" data-asset="card">Platega Карта</button>' +
+      '<button class="btn" data-method="crypto" id="cryptoToggle">Криптовалюта</button>' +
+      '<div id="cryptoOpts" style="display:none;margin-top:8px;">' +
+        '<button class="btn btn-outline" data-method="cryptobot" data-asset="USDT">CryptoBot USDT</button>' +
+        '<button class="btn btn-outline" data-method="cryptobot" data-asset="TON">CryptoBot TON</button>' +
+        '<button class="btn btn-outline" data-method="platega" data-asset="crypto">Platega (крипта)</button>' +
+      '</div>' +
       '<button class="btn" data-method="stars">Telegram Stars</button>' +
     '</div>';
 }
 
 async function doDeposit(method, asset){
   const amount = parseInt($('depAmount').value); if(!amount||amount<10){ showToast('Введите сумму от 10 ₽'); return; }
+  if (method === 'crypto') { const el = $('cryptoOpts'); el.style.display = el.style.display === 'none' ? 'block' : 'none'; return; }
   try {
     const res = await api('/deposit', 'POST', { method, amount, asset });
     if (res.payment_url) {

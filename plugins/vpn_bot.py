@@ -1904,7 +1904,7 @@ class PlategaAPI:
         return base.rstrip("/") + "/payment/fail"
 
     @staticmethod
-    def create_payment_url(user_id: int, rub_amount: Any) -> dict[str, Any]:
+    def create_payment_url(user_id: int, rub_amount: Any, payment_method: int | None = None) -> dict[str, Any]:
         if not storage.config.get("platega_enabled", True):
             return {"ok": False, "error": "Platega отключен"}
         merchant_id = storage.config.get("platega_merchant_id", "")
@@ -1925,8 +1925,13 @@ class PlategaAPI:
             "payload": payload,
             "metadata": {"userId": str(user_id), "userName": username or str(user_id)},
         }
+        if payment_method is not None:
+            body["paymentMethod"] = payment_method
+            path = "transaction/process"
+        else:
+            path = "v2/transaction/process"
         try:
-            r = requests.post(PlategaAPI.BASE_URL + PlategaAPI.CREATE_PATH, headers=PlategaAPI._headers(), json=body, timeout=30)
+            r = requests.post(PlategaAPI.BASE_URL + path, headers=PlategaAPI._headers(), json=body, timeout=30)
             data = r.json()
             if not r.ok:
                 return {"ok": False, "error": data.get("message") or data.get("detail") or str(data)}
@@ -2527,7 +2532,8 @@ class MiniAppAPI:
                 return {"ok": True, "payment_url": pay_url}
             return {"ok": False, "error": result.get("error", "Не удалось создать счёт")}
         if method == "platega":
-            result = PlategaAPI.create_payment_url(user_id, rub_amount)
+            pm = {"sbp": 2, "card": 11, "crypto": 13}.get((asset or "").lower())
+            result = PlategaAPI.create_payment_url(user_id, rub_amount, payment_method=pm)
             if result.get("ok"):
                 return {"ok": True, "payment_url": result["payment_url"]}
             return result
@@ -5172,7 +5178,15 @@ class UserBot:
             return
 
         if action == "deposit_crypto":
-            asset = args[0] if args else "USDT"
+            if not args:
+                kb = K()
+                kb.add(B("💵 USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
+                kb.add(B("🌐 TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
+                kb.add(B("₿ Platega (крипта)", callback_data=f"{CB_PREFIX}deposit_platega_crypto"))
+                kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}deposit"))
+                self._edit_message("<b>Криптовалюта</b>\n\nВыберите валюту:", chat_id, c.message.message_id, reply_markup=kb)
+                return
+            asset = args[0]
             rate = RatesFetcher().get_rate(asset)
             if not rate:
                 self._edit_message(f"Курс для {asset} ещё не загружен. Попробуйте через минуту.", chat_id, c.message.message_id,
@@ -5180,7 +5194,7 @@ class UserBot:
                 return
             self.set_state(user_id, "deposit_crypto_rubles", {"asset": asset, "message_id": c.message.message_id})
             self._edit_message(f"Выберите сумму пополнения в рублях ({asset}):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_crypto_preset", f"{CB_PREFIX}deposit", asset))
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_crypto_preset", f"{CB_PREFIX}deposit_crypto", asset))
             return
 
         if action == "deposit_stars":
@@ -5189,10 +5203,16 @@ class UserBot:
                                        reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars_preset", f"{CB_PREFIX}deposit"))
             return
 
-        if action == "deposit_platega":
-            self.set_state(user_id, "deposit_platega_rubles", {"message_id": c.message.message_id})
-            self._edit_message("Выберите сумму пополнения в рублях (Platega):", chat_id, c.message.message_id,
-                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_platega_preset", f"{CB_PREFIX}deposit"))
+        if action == "deposit_platega_sbp":
+            self.set_state(user_id, "deposit_platega_rubles", {"method": 2, "message_id": c.message.message_id})
+            self._edit_message("Выберите сумму пополнения в рублях (Platega СБП):", chat_id, c.message.message_id,
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_platega_sbp_preset", f"{CB_PREFIX}deposit"))
+            return
+
+        if action == "deposit_platega_card":
+            self.set_state(user_id, "deposit_platega_rubles", {"method": 11, "message_id": c.message.message_id})
+            self._edit_message("Выберите сумму пополнения в рублях (Platega Карта):", chat_id, c.message.message_id,
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_platega_card_preset", f"{CB_PREFIX}deposit"))
             return
 
 
@@ -5224,10 +5244,17 @@ class UserBot:
             self._create_stars_invoice(user_id, chat_id, c.message.message_id, rub)
             return
 
-        if action == "deposit_platega_preset" and len(args) >= 1:
+        if action == "deposit_platega_crypto":
+            self.set_state(user_id, "deposit_platega_rubles", {"method": 13, "message_id": c.message.message_id})
+            self._edit_message("Выберите сумму пополнения в рублях (Platega Крипта):", chat_id, c.message.message_id,
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_platega_crypto_preset", f"{CB_PREFIX}deposit_crypto"))
+            return
+
+        if action == "deposit_platega_sbp_preset" and len(args) >= 1:
             rub_str = args[0]
+            method = 2
             if rub_str == "custom":
-                self.set_state(user_id, "deposit_platega_rubles", {"message_id": c.message.message_id})
+                self.set_state(user_id, "deposit_platega_rubles", {"method": method, "message_id": c.message.message_id})
                 self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
                                            reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
                 return
@@ -5235,7 +5262,37 @@ class UserBot:
                 rub = int(rub_str)
             except ValueError:
                 return
-            self._create_platega_invoice(user_id, chat_id, c.message.message_id, rub)
+            self._create_platega_invoice(user_id, chat_id, c.message.message_id, rub, payment_method=method)
+            return
+
+        if action == "deposit_platega_card_preset" and len(args) >= 1:
+            rub_str = args[0]
+            method = 11
+            if rub_str == "custom":
+                self.set_state(user_id, "deposit_platega_rubles", {"method": method, "message_id": c.message.message_id})
+                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
+                                           reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
+                return
+            try:
+                rub = int(rub_str)
+            except ValueError:
+                return
+            self._create_platega_invoice(user_id, chat_id, c.message.message_id, rub, payment_method=method)
+            return
+
+        if action == "deposit_platega_crypto_preset" and len(args) >= 1:
+            rub_str = args[0]
+            method = 13
+            if rub_str == "custom":
+                self.set_state(user_id, "deposit_platega_rubles", {"method": method, "message_id": c.message.message_id})
+                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
+                                           reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit_crypto")))
+                return
+            try:
+                rub = int(rub_str)
+            except ValueError:
+                return
+            self._create_platega_invoice(user_id, chat_id, c.message.message_id, rub, payment_method=method)
             return
 
 
@@ -5657,9 +5714,9 @@ class UserBot:
                 f"⭐ Telegram Stars: 1.3 Stars = 1₽\n\n"
                 f"Выберите способ:")
         kb = K()
-        kb.add(B("💳 Platega (СБП/карта)", callback_data=f"{CB_PREFIX}deposit_platega"))
-        kb.add(B("💵 Crypto Bot USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
-        kb.add(B("🌐 Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
+        kb.add(B("💳 Platega СБП", callback_data=f"{CB_PREFIX}deposit_platega_sbp"))
+        kb.add(B("💳 Platega Карта", callback_data=f"{CB_PREFIX}deposit_platega_card"))
+        kb.add(B("₿ Криптовалюта", callback_data=f"{CB_PREFIX}deposit_crypto"))
         kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
@@ -5756,16 +5813,17 @@ class UserBot:
         self.clear_state(user_id)
         self._create_stars_invoice(user_id, m.chat.id, message_id, rub_amount)
 
-    def _create_platega_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal) -> None:
+    def _create_platega_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal, payment_method: int | None = None) -> None:
         rub_amount = _money_round(rub_amount)
-        result = PlategaAPI.create_payment_url(user_id, rub_amount)
+        result = PlategaAPI.create_payment_url(user_id, rub_amount, payment_method=payment_method)
         pay_url = result.get("payment_url")
         tx_id = result.get("transaction_id")
+        method_name = {2: "СБП", 11: "Карта", 13: "Крипта"}.get(payment_method, "Platega")
         if pay_url and tx_id:
             kb = K()
             kb.add(B("Оплатить", url=pay_url))
             kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
-            self._edit_message(f"Счёт на {_money_str(rub_amount)}₽ через Platega создан. Оплатите по кнопке ниже.",
+            self._edit_message(f"Счёт на {_money_str(rub_amount)}₽ через Platega ({method_name}) создан. Оплатите по кнопке ниже.",
                                        chat_id, message_id, reply_markup=kb)
         else:
             error = result.get("error", "Не удалось создать счёт.")
@@ -5784,8 +5842,9 @@ class UserBot:
             self.bot.send_message(m.chat.id, "Введите положительную числовую сумму.")
             return
         message_id = state["data"].get("message_id")
+        payment_method = state["data"].get("method")
         self.clear_state(user_id)
-        self._create_platega_invoice(user_id, m.chat.id, message_id, rub_amount)
+        self._create_platega_invoice(user_id, m.chat.id, message_id, rub_amount, payment_method=payment_method)
 
     def _on_promo_code(self, m: Message) -> None:
         user_id = m.from_user.id
