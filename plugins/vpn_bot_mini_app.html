@@ -201,7 +201,7 @@ const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp 
 if (tg.ready) tg.ready();
 if (tg.expand) tg.expand();
 const API_BASE = '/mini-app/api';
-let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {}, isAdmin: false, page: 'home', stack: [], selectedSub: null, selectedDevice: null };
+let state = { user: null, subscriptions: [], plans: [], referrals: {}, config: {}, isAdmin: false, page: 'home', stack: [], selectedSub: null, selectedDevice: null, selectedMyDevice: null };
 
 function $(id){ return document.getElementById(id); }
 function showToast(text){ const t=$('toast'); t.textContent=text; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000); }
@@ -234,6 +234,7 @@ async function api(path, method='GET', body){
 function fmtMoney(n){ return Number(n).toFixed(2); }
 function fmtDate(ts){ if(!ts) return '-'; const d=new Date(ts*1000); return d.toLocaleDateString('ru-RU'); }
 function daysLeft(ts){ const d=Math.ceil((ts*1000-Date.now())/86400000); return d>0?d+' дн.':'истекла'; }
+function fmtDateTime(ts){ if(!ts) return '-'; const d=new Date(ts*1000); return d.toLocaleDateString('ru-RU')+' '+d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function shiftLines(){
@@ -260,6 +261,8 @@ function render(pageId, push=true){
   else if (pageId === 'store') renderStore(main);
   else if (pageId === 'devices') renderDevices(main);
   else if (pageId === 'device-detail') renderDeviceDetail(main);
+  else if (pageId === 'sub-devices') renderSubDevices(main);
+  else if (pageId === 'my-device-detail') renderMyDeviceDetail(main);
   else if (pageId === 'refs') renderRefs(main);
   else if (pageId === 'profile') renderProfile(main);
   else if (pageId === 'deposit') renderDeposit(main);
@@ -270,7 +273,9 @@ function render(pageId, push=true){
 }
 
 function updateNav(){
-  const active = state.page === 'device-detail' ? 'devices' : state.page;
+  let active = state.page;
+  if (active === 'device-detail' || active === 'sub-devices' || active === 'my-device-detail') active = 'subs';
+  if (active === 'device-detail') active = 'devices';
   document.querySelectorAll('.bottom-nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===active));
 }
 
@@ -387,7 +392,61 @@ function renderSubDetail(main){
         `<a class='btn btn-outline' href='https://t.me/vpnpepe_robot' target='_blank'>` + icon('bot','icon-btn') + `Бот</a>` +
       `</div>` +
     `</div>` +
-    (active ? `<button class='btn' data-renew='` + esc(s.sub_id) + `'>` + icon('renew','icon-btn') + `Продлить</button>` : ``);
+    (active ? `<div class='btn-group'>` +
+      `<button class='btn' data-renew='` + esc(s.sub_id) + `'>` + icon('renew','icon-btn') + `Продлить</button>` +
+      `<button class='btn btn-outline' data-sub-devices='` + esc(s.sub_id) + `'>` + icon('phone','icon-btn') + `Устройства</button>` +
+    `</div>` : ``);
+}
+
+
+
+function renderSubDevices(main){
+  $('pageTitle').textContent = '';
+  const s = state.selectedSub; if(!s){ render('subs'); return; }
+  if (!s.devices || !s.devices.length) {
+    main.innerHTML = `<div class='empty'>Устройств пока нет.</div>`;
+    return;
+  }
+  main.innerHTML = `<div class='hero'><h1>Устройства</h1><p>` + esc(s.plan_name||s.plan_id) + ` · ` + (s.devices_count||0) + ` / ` + (s.max_devices||'?') + `</p></div>` +
+    s.devices.map((d, i)=>{
+      const seen = d.last_seen ? fmtDateTime(d.last_seen) : '-';
+      return `<div class='list-item' data-my-device='` + i + `'>` +
+        `<div class='info'>` +
+          `<div class='title'>` + esc(d.device_name||'Устройство') + `</div>` +
+          `<div class='subtitle'>` + esc(d.client_app||'—') + ` · последнее: ` + seen + `</div>` +
+        `</div>` +
+        `<div class='arrow'>&rsaquo;</div>` +
+      `</div>`;
+    }).join('');
+}
+
+function renderMyDeviceDetail(main){
+  $('pageTitle').textContent = '';
+  const s = state.selectedSub;
+  const d = s && s.devices ? s.devices[state.selectedMyDevice] : null;
+  if (!d){ render('sub-devices'); return; }
+  const seen = d.last_seen ? fmtDateTime(d.last_seen) : '-';
+  const first = d.first_seen ? fmtDateTime(d.first_seen) : '-';
+  const traffic = ((d.traffic||0) / (1024*1024)).toFixed(2);
+  const subUrl = esc(d.sub_url||s.sub_url||'');
+  main.innerHTML = `` +
+    `<div class='card'>` +
+      `<div class='card-title'>` + esc(d.device_name||'Устройство') + `</div>` +
+      `<div class='stat-row'><span>Тип</span><b>` + esc(d.device_type||'—') + `</b></div>` +
+      `<div class='stat-row'><span>Клиент</span><b>` + esc(d.client_app||'—') + `</b></div>` +
+      `<div class='stat-row'><span>IP</span><b>` + esc(d.ip||'—') + `</b></div>` +
+      `<div class='stat-row'><span>Первое подключение</span><b>` + first + `</b></div>` +
+      `<div class='stat-row'><span>Последнее использование</span><b>` + seen + `</b></div>` +
+      `<div class='stat-row'><span>Трафик</span><b>` + traffic + ` MB</b></div>` +
+    `</div>` +
+    `<div class='card'>` +
+      `<div class='card-title'>Ссылка для этого устройства</div>` +
+      `<div class='copy-row'>` +
+        `<input value='` + subUrl + `' readonly>` +
+        `<button class='copy-btn' data-copy='` + subUrl + `'>` + icon('copy') + `</button>` +
+      `</div>` +
+    `</div>` +
+    `<button class='btn btn-outline' data-unbind='` + esc(s.sub_id) + `:` + d.index + `'>` + icon('phone','icon-btn') + `Отвязать устройство</button>`;
 }
 
 async function renewSubPrompt(id){
@@ -635,8 +694,23 @@ function handleMainClick(e){
   if (supportBtn) { openSupport(); return; }
   const deviceBtn = target.closest('[data-device]');
   if (deviceBtn) { state.selectedDevice = deviceBtn.dataset.device; render('device-detail'); return; }
+  const subDevicesBtn = target.closest('[data-sub-devices]');
+  if (subDevicesBtn) { state.selectedSub = state.subscriptions.find(s=>s.sub_id===subDevicesBtn.dataset.subDevices); render('sub-devices'); return; }
+  const myDeviceBtn = target.closest('[data-my-device]');
+  if (myDeviceBtn) { state.selectedMyDevice = parseInt(myDeviceBtn.dataset.myDevice); render('my-device-detail'); return; }
+  const unbindBtn = target.closest('[data-unbind]');
+  if (unbindBtn) { unbindDevice(unbindBtn.dataset.unbind); return; }
   const openLinkBtn = target.closest('[data-open-link]');
   if (openLinkBtn) { tg.openLink(openLinkBtn.dataset.openLink, {try_instant_view: false}); return; }
+}
+
+async function unbindDevice(key){
+  const [sub_id, index] = key.split(':');
+  try {
+    const res = await api('/unbind-device', 'POST', { sub_id, index: parseInt(index) });
+    if (res.ok){ showToast('Устройство отвязано'); await loadMe(); render('sub-devices'); }
+    else showToast(res.message||'Ошибка');
+  } catch(e){ showToast(e.message||'Ошибка'); }
 }
 
 async function loadMe(){
