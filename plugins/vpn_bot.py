@@ -248,6 +248,7 @@ class Subscription:
     xray_sub_id: str = ""  # subId для subscription URL
     xray_synced: bool = False  # успешно создан/обновлён в 3X-UI
     host_id: str = "main"
+    last_reissue_at: float = 0.0
 
     @property
     def is_expired(self) -> bool:
@@ -1129,6 +1130,8 @@ class VPNStorage:
                 self.users[key] = {
                     "user_id": user_id,
                     "username": username or "",
+                    "first_name": "",
+                    "last_name": "",
                     "source": source,
                     "settings": {"lang": "ru", "notifications": True, "auto_renew": True, "agreed_terms": False},
                     "balance": Decimal("0.00"),
@@ -4771,6 +4774,8 @@ class UserBot:
         if self._check_maintenance(user_id, chat_id):
             return
         username = m.from_user.username or ""
+        first_name = getattr(m.from_user, "first_name", "") or ""
+        last_name = getattr(m.from_user, "last_name", "") or ""
         source, referred_by = self._parse_start_param(m, user_id)
         is_new = str(user_id) not in storage.users
         user = storage.get_user(user_id, username, source=source)
@@ -4785,6 +4790,12 @@ class UserBot:
                 pass
         if username and not user.get("username"):
             user["username"] = username
+        if first_name and not user.get("first_name"):
+            user["first_name"] = first_name
+        if last_name and not user.get("last_name"):
+            user["last_name"] = last_name
+        if source in ("renew", "deposit"):
+            user["start_action"] = source
         storage.update_user(user)
         if is_new:
             storage._notify_admins(f"Новый пользователь: {user_id} (@{username}) из источника {source}.", "new_user")
@@ -4809,6 +4820,14 @@ class UserBot:
         if not self._channel_check(user_id, chat_id):
             return
         self._send_welcome(user_id, chat_id)
+        user = storage.get_user(user_id)
+        start_action = user.pop("start_action", None)
+        if start_action:
+            storage.update_user(user)
+        if start_action == "renew":
+            self._manage_subscription(user_id, chat_id)
+        elif start_action == "deposit":
+            self._deposit_menu(chat_id, None)
 
     def _sticker_worker(self) -> None:
         logger.info("[UserBot] Стикер-воркер запущен")
@@ -4891,13 +4910,7 @@ class UserBot:
 
     def _send_welcome(self, user_id: int, chat_id: int) -> None:
         """Отправляет приветственное меню."""
-        user = storage.get_user(user_id)
-        text = storage.config.get("welcome", "Добро пожаловать!")
-        if not user.get("trial_used"):
-            caption = f"{text}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
-        else:
-            caption = f"{text}\n\nВыберите раздел:"
-        self._send_menu_message(chat_id, caption, reply_markup=self._keyboard_main(user_id), prefer_welcome_media=True, media_key="welcome")
+        self._send_menu_message(chat_id, self._main_menu_text(user_id), reply_markup=self._keyboard_main(user_id), prefer_welcome_media=True, media_key="welcome")
 
     def _terms_agreed(self, user_id: int) -> bool:
         return bool(storage.get_user(user_id).get("settings", {}).get("agreed_terms", False))
@@ -5079,31 +5092,47 @@ class UserBot:
 
     def _keyboard_main(self, user_id: int | None = None) -> K:
         kb = K()
-        kb.row_width = 2
-        if user_id is not None and not storage.get_user(user_id).get("trial_used"):
-            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
+        kb.row_width = 1
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
-        kb.add(
-            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="primary"),
-            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
-            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs", style="primary"),
-            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit", style="success"),
-            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code", style="danger"),
-            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral", style="primary"),
-            B("❓ Помощь", callback_data=f"{CB_PREFIX}help"),
-        )
+            kb.add(B("Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
+        kb.add(B("Управление подпиской", callback_data=f"{CB_PREFIX}manage", style="primary"))
+        kb.add(B("Профиль", callback_data=f"{CB_PREFIX}profile", style="primary"))
+        kb.add(B("Пополнить Баланс", callback_data=f"{CB_PREFIX}deposit", style="success"))
+        kb.add(B("Помощь", callback_data=f"{CB_PREFIX}help"))
+        if user_id is not None and not storage.get_user(user_id).get("trial_used"):
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
         return kb
 
-    def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
-        """Отправляет главное меню с медиа и кнопкой пробного периода, если он не использован."""
+    def _main_menu_text(self, user_id: int) -> str:
         user = storage.get_user(user_id)
-        welcome = storage.config.get("welcome", "Добро пожаловать!")
-        if not user.get("trial_used"):
-            text = f"{welcome}\n\nУ вас есть {storage.config.get('trial_days', TRIAL_DAYS)}-дневный пробный период."
+        name = _escape(user.get("first_name") or user.get("username") or "друг")
+        bot_username = storage.config.get("bot_username", "").lstrip("@")
+        subs = storage.active_subscriptions(user_id)
+        lines = [f"Здравствуйте, {name}! ☻", "Ваша подписка:"]
+        if subs:
+            sub = subs[0]
+            plan = storage.plan(sub.plan_id)
+            created = datetime.fromtimestamp(sub.created_at).strftime("%d.%m.%Y") if sub.created_at else "-"
+            expires = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y") if sub.expires_at else "-"
+            lines.append(f"❶ Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
+            lines.append(f"❷ Дата начала: {created}")
+            lines.append(f"❸ Дата окончания: {expires}")
+            lines.append(f"❹ Лимит устройств: {_escape(plan.device_text if plan else '?')}")
         else:
-            text = f"{welcome}\n\nВыберите раздел:"
+            lines.append("❶ Текущий план: нет активной подписки")
+            lines.append("❷ Дата начала: -")
+            lines.append("❸ Дата окончания: -")
+            lines.append("❹ Лимит устройств: -")
+        if bot_username:
+            lines.append("")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'>Продлить подписку</a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'>Пополнить баланс</a>")
+        return "\n".join(lines)
+
+    def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        """Отправляет главное меню."""
+        text = self._main_menu_text(user_id)
         kb = self._keyboard_main(user_id)
         if message_id is not None:
             try:
@@ -5111,6 +5140,182 @@ class UserBot:
             except Exception:
                 pass
         self._send_menu_message(chat_id, text, reply_markup=kb, media_key="main")
+
+    def _manage_subscription(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        """Главный экран управления единой подпиской."""
+        subs = storage.active_subscriptions(user_id)
+        if not subs:
+            text = "У вас нет активной подписки."
+            kb = K()
+            kb.add(B("Оформить подписку", callback_data=f"{CB_PREFIX}buy"))
+            kb.add(B("Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
+            kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
+            if message_id:
+                self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            return
+        sub = subs[0]
+        plan = storage.plan(sub.plan_id)
+        text = format_subscription(sub) + f"\n\nБаланс: {_money_str(storage.get_user(user_id).get('balance', 0))}₽"
+        kb = K()
+        kb.row_width = 1
+        kb.add(B("➡️ Продлить подписку", callback_data=f"{CB_PREFIX}sub_renew:{sub.sub_id}", style="success"))
+        kb.add(B("🔄 Сменить план", callback_data=f"{CB_PREFIX}change_plan:{sub.sub_id}"))
+        kb.add(B("📱 Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub.sub_id}"))
+        kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub.sub_id}"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def _reissue_subscription(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str) -> None:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return
+        cooldown = storage.config.get("security", {}).get("reissue_cooldown", 259200)
+        now = time.time()
+        if now - sub.last_reissue_at < cooldown:
+            remaining = int(cooldown - (now - sub.last_reissue_at))
+            text = f"Перевыпуск доступен через {remaining // 86400}д {remaining % 86400 // 3600}ч."
+            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
+            if message_id:
+                self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            return
+        sub.client_uuid = _device_uuid()
+        sub.xray_sub_id = ""
+        XrayAPI._ensure_email_and_sub_id(sub)
+        sub.last_reissue_at = now
+        storage.update_subscription(sub)
+        XrayAPI.add_or_update_client(sub)
+        for dev in sub.devices:
+            if dev.get("client_email"):
+                XrayAPI.add_or_update_device_client(sub, dev)
+        text = "Подписка перевыпущена. Старые ссылки больше не работают."
+        kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def _change_plan_menu(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str) -> None:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return
+        kb = K()
+        kb.row_width = 1
+        for pid, plan in storage.plans().items():
+            if pid == "trial":
+                continue
+            kb.add(B(plan.name, callback_data=f"{CB_PREFIX}change_plan:{sub_id}:{pid}"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
+        text = "<b>Сменить план</b>\n\nВыберите новый тариф:"
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def _change_plan_duration(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str, plan_id: str) -> None:
+        sub = storage.get_subscription(sub_id)
+        plan = storage.plan(plan_id)
+        if not sub or sub.user_id != user_id or not plan:
+            return
+        kb = K()
+        for months in DURATIONS:
+            if plan.prices.get(months) is not None:
+                kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}change_plan_duration:{sub_id}:{plan_id}:{months}"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}change_plan:{sub_id}"))
+        text = f"<b>Сменить тариф</b>\n\nТекущий план: {_escape(plan.name)}\nУстройств: {plan.device_text}\n\nВыберите срок:"
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def _confirm_change_plan(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str, plan_id: str, months: str) -> None:
+        plan = storage.plan(plan_id)
+        base_price = storage.price(plan_id, int(months))
+        if base_price is None:
+            text = "Цена для выбранного срока не установлена."
+            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}change_plan:{sub_id}"))
+            if message_id:
+                self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            return
+        discount = Decimal("0.00")
+        state = self.get_state(user_id)
+        if state and state.get("state") == "confirm_change_plan" and state.get("data", {}).get("sub_id") == sub_id:
+            discount = _to_dec(state["data"].get("discount", 0))
+        price = _money_round(base_price - discount)
+        user = storage.get_user(user_id)
+        price_text = f"<s>{_money_str(base_price)}₽</s> {_money_str(price)}₽ (скидка {_money_str(discount)}₽)" if discount else f"{_money_str(price)}₽"
+        text = (f"<b>{_escape(plan.name)}</b>\n"
+                f"Срок: {months} мес.\n"
+                f"Цена: {price_text}\n"
+                f"Ваш баланс: {_money_str(user['balance'])}₽\n\n"
+                f"Текущая подписка будет заменена на новый тариф. Подтвердите:")
+        kb = K()
+        kb.add(B("Сменить", callback_data=f"{CB_PREFIX}change_plan_confirm:{sub_id}:{plan_id}:{months}"))
+        if user["balance"] < price:
+            kb.add(B("Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}change_plan_duration:{sub_id}:{plan_id}"))
+        self.set_state(user_id, "confirm_change_plan", {"sub_id": sub_id, "plan_id": plan_id, "months": months, "discount": discount, "message_id": message_id})
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def _process_change_plan(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str, plan_id: str, months: int) -> None:
+        sub = storage.get_subscription(sub_id)
+        plan = storage.plan(plan_id)
+        if not sub or sub.user_id != user_id or not plan:
+            return
+        base_price = storage.price(plan_id, months)
+        if base_price is None:
+            return
+        state = self.get_state(user_id)
+        discount = Decimal("0.00")
+        if state and state.get("state") == "confirm_change_plan" and state.get("data", {}).get("sub_id") == sub_id:
+            discount = _to_dec(state["data"].get("discount", 0))
+        price = _money_round(base_price - discount)
+        user = storage.get_user(user_id)
+        if user["balance"] < price:
+            text = "Недостаточно средств. Пополните баланс."
+            kb = K().add(B("Пополнить", callback_data=f"{CB_PREFIX}deposit")).add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
+            if message_id:
+                self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            return
+        if not storage.deduct_balance(user_id, price, "purchase", f"change_plan:{sub_id}:{plan_id}:{months}"):
+            text = "Ошибка списания средств. Попробуйте ещё раз."
+            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
+            if message_id:
+                self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            return
+        self.clear_state(user_id)
+        host = storage.get_host(plan.host_id) if plan and plan.host_id else storage.server()
+        sub.plan_id = plan_id
+        sub.months = months
+        sub.expires_at = time.time() + months * 30 * 86400
+        sub.host_id = plan.host_id if plan and plan.host_id else (host.host_id if host else sub.host_id)
+        storage.update_subscription(sub)
+        XrayAPI.add_or_update_client(sub)
+        for dev in sub.devices:
+            if dev.get("client_email"):
+                XrayAPI.add_or_update_device_client(sub, dev)
+        storage.process_referral_rewards(user_id, price)
+        storage.add_purchase_stats(user_id, price, months)
+        text = f"Тариф изменён!\n{format_subscription(sub)}"
+        if message_id:
+            self._edit_message(text, chat_id, message_id, reply_markup=self._keyboard_main())
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=self._keyboard_main(), parse_mode="HTML")
 
     # ---- callbacks ----
     def _handle_callback(self, c: CallbackQuery) -> None:
@@ -5200,53 +5405,28 @@ class UserBot:
             self._activate_trial(user_id, chat_id, c.message.message_id)
             return
 
-        if action == "buy":
-            self._buy_menu(chat_id, c.message.message_id)
+        if action in ("buy", "my_subs", "manage"):
+            self._manage_subscription(user_id, chat_id, c.message.message_id)
             return
 
-        if action == "host" and args:
-            self._plan_menu(chat_id, c.message.message_id, args[0])
+        if action == "reissue" and args:
+            sub_id = args[0]
+            self._reissue_subscription(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "plan":
-            plan_id = args[0]
-            self._duration_menu(chat_id, c.message.message_id, plan_id)
+        if action == "change_plan" and len(args) >= 2:
+            sub_id, plan_id = args[0], args[1]
+            self._change_plan_menu(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "duration":
-            plan_id, months = args[0], args[1]
-            self._confirm_purchase(user_id, chat_id, c.message.message_id, plan_id, months)
+        if action == "change_plan_duration" and len(args) >= 3:
+            sub_id, plan_id, months = args[0], args[1], args[2]
+            self._change_plan_duration(user_id, chat_id, c.message.message_id, sub_id, plan_id)
             return
 
-        if action == "purchase":
-            plan_id, months = args[0], int(args[1])
-            self._purchase(user_id, chat_id, c.message.message_id, plan_id, months)
-            return
-
-        if action == "purchase_stars_sub" and len(args) >= 2:
-            plan_id = args[0]
-            self._create_stars_subscription(user_id, chat_id, c.message.message_id, plan_id)
-            return
-
-        if action == "promo" and len(args) >= 2:
-            plan_id, months = args[0], args[1]
-            state_data = {"plan_id": plan_id, "months": months}
-            state = self.get_state(user_id)
-            if state and state.get("data", {}).get("message_id"):
-                state_data["message_id"] = state["data"]["message_id"]
-            self.set_state(user_id, "enter_promo", state_data)
-            self._edit_message("Отправьте промокод:", chat_id, c.message.message_id,
-                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}")))
-            return
-
-        if action == "activate_code":
-            self.set_state(user_id, "enter_activation_code", {})
-            self._edit_message("Отправьте код активации (подарочный или партнёрский):", chat_id, c.message.message_id,
-                                       reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}main")))
-            return
-
-        if action == "my_subs":
-            self._my_subscriptions(user_id, chat_id, c.message.message_id)
+        if action == "change_plan_confirm" and len(args) >= 3:
+            sub_id, plan_id, months = args[0], args[1], int(args[2])
+            self._process_change_plan(user_id, chat_id, c.message.message_id, sub_id, plan_id, months)
             return
 
         if action == "sub_detail":
@@ -5653,7 +5833,7 @@ class UserBot:
         kb.add(B("Статистика", callback_data=f"{CB_PREFIX}sub_stats:{sub_id}"))
         kb.add(B("Продлить", callback_data=f"{CB_PREFIX}sub_renew:{sub_id}"))
         kb.add(B("Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}my_subs"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
         self._edit_message(format_subscription(sub), chat_id, message_id, reply_markup=kb)
 
     def _connect(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
@@ -5711,7 +5891,7 @@ class UserBot:
         for months in DURATIONS:
             if plan.prices.get(months) is not None:
                 kb.add(B(f"+{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}renew_confirm:{sub_id}:{months}"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
         self._edit_message("Выберите срок продления:", chat_id, message_id, reply_markup=kb)
 
     def _renew(self, user_id: int, chat_id: int, message_id: int, sub_id: str, months: int) -> None:
@@ -5750,6 +5930,7 @@ class UserBot:
         plan = storage.plan(sub.plan_id)
         kb = K()
         kb.row_width = 1
+        kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub_id}"))
         for idx, d in enumerate(sub.devices):
             name = _escape(d.get('device_name') or _device_name(d.get('user_agent', ''), d.get('client_app') or _client_app(d.get('user_agent', ''))))
             seen = d.get('last_seen') or d.get('first_seen')
@@ -5757,13 +5938,13 @@ class UserBot:
             if seen:
                 label += f" · {datetime.fromtimestamp(seen).strftime('%d.%m %H:%M')}"
             kb.add(B(label, callback_data=f"{CB_PREFIX}device_detail:{sub_id}:{idx}"))
-        if not sub.devices:
-            self._edit_message("Устройств пока нет. Добавьте первое, чтобы получить ссылку для приложения.", chat_id, message_id,
-                               reply_markup=K().add(B("Добавить", callback_data=f"{CB_PREFIX}add_device:{sub_id}")).add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}")))
-            return
         kb.add(B("➕ Добавить устройство", callback_data=f"{CB_PREFIX}add_device:{sub_id}"))
         kb.add(B("❌ Удалить все", callback_data=f"{CB_PREFIX}del_all_devices:{sub_id}"))
-        kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_detail:{sub_id}"))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
+        if not sub.devices:
+            self._edit_message("Устройств пока нет. Добавьте первое, чтобы получить ссылку для приложения.", chat_id, message_id,
+                               reply_markup=K().add(B("Добавить", callback_data=f"{CB_PREFIX}add_device:{sub_id}")).add(B("Назад", callback_data=f"{CB_PREFIX}manage")))
+            return
         text = f"<b>Устройства</b> ({len(sub.devices)} / {plan.device_text if plan else '?'})\n\nНажмите на устройство, чтобы посмотреть подробности или отвязать его."
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
@@ -5849,7 +6030,7 @@ class UserBot:
 
 
     # ---- deposit ----
-    def _deposit_menu(self, chat_id: int, message_id: int) -> None:
+    def _deposit_menu(self, chat_id: int, message_id: int | None = None) -> None:
         user = storage.get_user(chat_id)  # chat_id == user_id in private
         rates = storage.config.get("rates", {})
         usd = rates.get("USD") or "н/д"
@@ -5867,7 +6048,10 @@ class UserBot:
         kb.add(B("₿ Криптовалюта", callback_data=f"{CB_PREFIX}deposit_crypto"))
         kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
-        self._edit_message(text, chat_id, message_id, reply_markup=kb)
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        else:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _amount_keyboard(self, callback_prefix: str, back_callback: str, asset: str | None = None) -> K:
         kb = K()
@@ -6161,15 +6345,16 @@ class UserBot:
     def _profile_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
         subs = storage.active_subscriptions(user_id)
-        lines = [
-            f"<b>🧑 Профиль</b>",
-            f"🆔 ID: <code>{user_id}</code>",
-            f"💰 Баланс: {_money_str(user.get('balance', 0))}₽",
-        ]
+        lines = ["<b>🧑 Профиль</b>"]
+        if user.get("first_name"):
+            lines.append(f"Имя: {_escape(user['first_name'])}")
+        lines.append(f"🆔 ID: <code>{user_id}</code>")
+        lines.append(f"💰 Баланс: {_money_str(user.get('balance', 0))}₽")
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
-            lines.append(f"📱 Активная подписка: {_escape(plan.name if plan else sub.plan_id)} (до {_format_time(sub.expires_at)})")
+            lines.append(f"📱 Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
+            lines.append(f"📅 Действует до: {_format_time(sub.expires_at)}")
             lines.append(f"📱 Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
         else:
             lines.append("📱 Активных подписок нет.")
@@ -6184,6 +6369,8 @@ class UserBot:
         if total_earn:
             lines.append(f"👥 Заработано с рефералов: {_money_str(total_earn)}₽")
         kb = K()
+        kb.add(B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
+        kb.add(B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral"))
         kb.add(B("📜 История операций", callback_data=f"{CB_PREFIX}history"))
         kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}settings"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
@@ -6289,7 +6476,7 @@ class UserBot:
                 f"Минимум для вывода: 3000₽")
         kb = K()
         kb.add(B("💸 Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
-        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _setup_mini_app_button(self) -> None:
