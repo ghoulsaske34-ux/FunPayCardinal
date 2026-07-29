@@ -5145,15 +5145,7 @@ class UserBot:
         """Главный экран управления единой подпиской."""
         subs = storage.active_subscriptions(user_id)
         if not subs:
-            text = "У вас нет активной подписки."
-            kb = K()
-            kb.add(B("Оформить подписку", callback_data=f"{CB_PREFIX}buy"))
-            kb.add(B("Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
-            kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-            if message_id:
-                self._edit_message(text, chat_id, message_id, reply_markup=kb)
-            else:
-                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            self._buy_menu(chat_id, message_id)
             return
         sub = subs[0]
         plan = storage.plan(sub.plan_id)
@@ -5663,38 +5655,50 @@ class UserBot:
         self._edit_message(f"Пробный период активирован!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main(user_id))
 
-    def _buy_menu(self, chat_id: int, message_id: int) -> None:
+    def _buy_menu(self, chat_id: int, message_id: int | None = None) -> None:
         hosts = storage.list_hosts()
+        text = "Выберите сервер:"
+        kb = K()
         if len(hosts) > 1:
-            kb = K()
             for host in hosts:
-                text = host.name or host.host_id
+                label = host.name or host.host_id
                 if host.host_id == storage.default_host_id():
-                    text = f"{text} (по умолч.)"
-                kb.add(B(text, callback_data=f"{CB_PREFIX}host:{host.host_id}"))
+                    label = f"{label} (по умолч.)"
+                kb.add(B(label, callback_data=f"{CB_PREFIX}host:{host.host_id}"))
             kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-            self._edit_message("Выберите сервер:", chat_id, message_id, reply_markup=kb)
         else:
-            self._plan_menu(chat_id, message_id)
+            return self._plan_menu(chat_id, message_id)
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        else:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
-    def _plan_menu(self, chat_id: int, message_id: int, host_id: str | None = None) -> None:
+    def _plan_menu(self, chat_id: int, message_id: int | None = None, host_id: str | None = None) -> None:
         kb = K()
         for pid, plan in storage.plans(host_id).items():
             if pid == "trial":
                 continue
             kb.add(B(plan.name, callback_data=f"{CB_PREFIX}plan:{pid}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}main"))
-        self._edit_message("Выберите тариф:", chat_id, message_id, reply_markup=kb)
+        text = "Выберите тариф:"
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        else:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
-    def _duration_menu(self, chat_id: int, message_id: int, plan_id: str) -> None:
+    def _duration_menu(self, chat_id: int, message_id: int | None, plan_id: str) -> None:
         plan = storage.plan(plan_id)
         kb = K()
         for months in DURATIONS:
             if plan.prices.get(months) is not None:
                 kb.add(B(f"{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}duration:{plan_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}buy"))
-        self._edit_message(f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:",
-                                   chat_id, message_id, reply_markup=kb)
+        text = f"Тариф: <b>{_escape(plan.name)}</b>\nУстройств: {plan.device_text}\n\nВыберите срок:"
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        else:
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+
 
     def _confirm_purchase(self, user_id: int, chat_id: int, message_id: int, plan_id: str, months: str, host_id: str | None = None) -> None:
         plan = storage.plan(plan_id)
