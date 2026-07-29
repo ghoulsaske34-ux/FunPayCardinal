@@ -5406,14 +5406,18 @@ class UserBot:
             self._reissue_subscription(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "change_plan" and len(args) >= 2:
-            sub_id, plan_id = args[0], args[1]
-            self._change_plan_menu(user_id, chat_id, c.message.message_id, sub_id)
+        if action == "change_plan" and args:
+            if len(args) == 1:
+                sub_id = args[0]
+                self._change_plan_menu(user_id, chat_id, c.message.message_id, sub_id)
+            elif len(args) >= 2:
+                sub_id, plan_id = args[0], args[1]
+                self._change_plan_duration(user_id, chat_id, c.message.message_id, sub_id, plan_id)
             return
 
         if action == "change_plan_duration" and len(args) >= 3:
             sub_id, plan_id, months = args[0], args[1], args[2]
-            self._change_plan_duration(user_id, chat_id, c.message.message_id, sub_id, plan_id)
+            self._confirm_change_plan(user_id, chat_id, c.message.message_id, sub_id, plan_id, months)
             return
 
         if action == "change_plan_confirm" and len(args) >= 3:
