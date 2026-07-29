@@ -1871,6 +1871,8 @@ def _device_type(user_agent: str) -> str:
         return "iPhone"
     if "ipad" in ua:
         return "iPad"
+    if "ios" in ua or ("cfnetwork" in ua and "darwin" in ua):
+        return "iPhone"
     if "android" in ua:
         return "Android"
     if "windows" in ua:
@@ -2640,9 +2642,9 @@ class MiniAppAPI:
             ua = d.get("user_agent", "")
             devices.append({
                 "index": idx,
-                "device_name": d.get("device_name") or _device_name(ua, d.get("client_app") or _client_app(ua)),
-                "device_model": _device_model(ua),
-                "device_type": d.get("device_type") or _device_type(ua),
+                "device_name": _device_name(ua, d.get("client_app") or _client_app(ua)),
+                "device_model": _device_model(ua) or _device_type(ua),
+                "device_type": _device_type(ua),
                 "client_app": d.get("client_app") or _client_app(ua),
                 "ip": d.get("ip", ""),
                 "first_seen": d.get("first_seen", 0),
@@ -6114,7 +6116,8 @@ class UserBot:
         kb.add(B("🔗 Ссылка для приложения", url=sub_url))
         kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub_id}"))
         for idx, d in enumerate(sub.devices):
-            name = _escape(d.get('device_name') or _device_name(d.get('user_agent', ''), d.get('client_app') or _client_app(d.get('user_agent', ''))))
+            ua = d.get('user_agent', '')
+            name = _escape(_device_name(ua, d.get('client_app') or _client_app(ua)))
             seen = d.get('last_seen') or d.get('first_seen')
             label = f"{idx + 1}. {name}"
             if seen:
@@ -6138,23 +6141,24 @@ class UserBot:
         except (ValueError, IndexError):
             self._edit_message("Устройство не найдено.", chat_id, message_id, reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}")))
             return
-        name = _escape(dev.get('device_name') or _device_name(dev.get('user_agent', ''), dev.get('client_app') or _client_app(dev.get('user_agent', ''))))
-        app = _escape(dev.get('client_app') or _client_app(dev.get('user_agent', '')))
-        dtype = _escape(dev.get('device_type') or _device_type(dev.get('user_agent', '')))
-        model = _escape(_device_model(dev.get('user_agent', '')) or dtype)
+        ua = dev.get('user_agent', '')
+        name = _escape(_device_name(ua, dev.get('client_app') or _client_app(ua)))
+        app = _escape(_client_app(ua))
+        dtype = _escape(_device_type(ua))
+        model = _escape(_device_model(ua) or dtype)
         ip = _escape(dev.get('ip', 'неизвестен'))
         first = datetime.fromtimestamp(dev.get('first_seen') or 0).strftime('%d.%m.%Y %H:%M') if dev.get('first_seen') else '-'
         seen = datetime.fromtimestamp(dev.get('last_seen') or 0).strftime('%d.%m.%Y %H:%M') if dev.get('last_seen') else '-'
         traffic = (dev.get('traffic') or 0) / (1024 * 1024)
         text = (
             f"<b>{name}</b>\n\n"
-            f"📱 Устройство: <code>{dtype}</code>\n"
-            f"📲 Модель: <code>{model}</code>\n"
-            f"💻 Клиент: <code>{app}</code>\n"
-            f"🌐 IP: <code>{ip}</code>\n"
-            f"🕐 Первое подключение: {first}\n"
-            f"🕓 Последнее использование: {seen}\n"
-            f"📊 Трафик: {traffic:.2f} MB"
+            f"<b>📱 Устройство:</b> <code>{dtype}</code>\n"
+            f"<b>📲 Модель:</b> <code>{model}</code>\n"
+            f"<b>💻 Клиент:</b> <code>{app}</code>\n"
+            f"<b>🌐 IP:</b> <code>{ip}</code>\n"
+            f"<b>🕐 Первое подключение:</b> {first}\n"
+            f"<b>🕓 Последнее использование:</b> {seen}\n"
+            f"<b>📊 Трафик:</b> {traffic:.2f} MB"
         )
         kb = K()
         kb.add(B("🗑 Отвязать", callback_data=f"{CB_PREFIX}unbind_device:{sub_id}:{index}"))
