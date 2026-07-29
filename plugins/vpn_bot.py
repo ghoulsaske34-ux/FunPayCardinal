@@ -4933,18 +4933,18 @@ class UserBot:
         kb = K()
         kb.row_width = 2
         if user_id is not None and not storage.get_user(user_id).get("trial_used"):
-            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
+            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url)))
         kb.add(
-            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="success"),
-            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
-            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs", style="danger"),
-            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit", style="danger"),
-            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code", style="success"),
-            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral", style="success"),
-            B("❓ Помощь", callback_data=f"{CB_PREFIX}help", style="success"),
+            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile"),
+            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy"),
+            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs"),
+            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"),
+            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"),
+            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral"),
+            B("❓ Помощь", callback_data=f"{CB_PREFIX}help"),
         )
         return kb
 
