@@ -1886,6 +1886,23 @@ def _device_type(user_agent: str) -> str:
     return "Устройство"
 
 
+def _ios_version(user_agent: str) -> str:
+    """Пытаемся извлечь версию iOS из Darwin/CFNetwork."""
+    ua = (user_agent or "").lower()
+    m = re.search(r"darwin/(\d+)\.?(\d+)?", ua)
+    if m:
+        major = int(m.group(1))
+        minor = m.group(2)
+        # Карта Darwin major -> маркетинговая версия iOS (по состоянию на 2025/2026)
+        ios_map = {
+            20: "14", 21: "15", 22: "16", 23: "17", 24: "18", 25: "26", 27: "27",
+        }
+        ver = ios_map.get(major)
+        if ver:
+            return f"iOS {ver}" + (f".{minor}" if minor and minor != "0" else "")
+    return ""
+
+
 def _device_model(user_agent: str) -> str:
     """Определяет модель телефона по User-Agent (iPhone 11, SM-G973F и т.д.)."""
     ua = (user_agent or "")
@@ -1918,6 +1935,11 @@ def _device_model(user_agent: str) -> str:
         model = m.group(1).strip()
         if model and model.lower() not in ("android", "mobile"):
             return model
+    # Для iOS-клиентов без модельного идентификатора хотя бы версия iOS
+    if _device_type(ua) in ("iPhone", "iPad"):
+        ios = _ios_version(ua)
+        if ios:
+            return f"iPhone ({ios})"
     return ""
 
 
@@ -5247,25 +5269,25 @@ class UserBot:
         name = _escape(user.get("first_name") or user.get("username") or "друг")
         bot_username = storage.config.get("bot_username", "").lstrip("@")
         subs = storage.active_subscriptions(user_id)
-        lines = [f"Здравствуйте, {name}! ☻", "Ваша подписка:"]
+        lines = [f"<b>Здравствуйте, {name}! ☻</b>", "<b>Ваша подписка:</b>"]
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
             created = datetime.fromtimestamp(sub.created_at).strftime("%d.%m.%Y") if sub.created_at else "-"
             expires = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y") if sub.expires_at else "-"
-            lines.append(f"❶ Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
-            lines.append(f"❷ Дата начала: {created}")
-            lines.append(f"❸ Дата окончания: {expires}")
-            lines.append(f"❹ Лимит устройств: {_escape(plan.device_text if plan else '?')}")
+            lines.append(f"<b>❶ Текущий план: {_escape(plan.name if plan else sub.plan_id)}</b>")
+            lines.append(f"<b>❷ Дата начала: {created}</b>")
+            lines.append(f"<b>❸ Дата окончания: {expires}</b>")
+            lines.append(f"<b>❹ Лимит устройств: {_escape(plan.device_text if plan else '?')}</b>")
         else:
-            lines.append("❶ Текущий план: нет активной подписки")
-            lines.append("❷ Дата начала: -")
-            lines.append("❸ Дата окончания: -")
-            lines.append("❹ Лимит устройств: -")
+            lines.append("<b>❶ Текущий план: нет активной подписки</b>")
+            lines.append("<b>❷ Дата начала: -</b>")
+            lines.append("<b>❸ Дата окончания: -</b>")
+            lines.append("<b>❹ Лимит устройств: -</b>")
         if bot_username:
             lines.append("")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'>Продлить подписку</a>")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'>Пополнить баланс</a>")
+            lines.append(f"<b><a href='https://t.me/{bot_username}?start=renew'>➡︎ Продлить подписку</a></b>")
+            lines.append(f"<b><a href='https://t.me/{bot_username}?start=deposit'>➡︎ Пополнить баланс</a></b>")
         return "\n".join(lines)
 
     def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
