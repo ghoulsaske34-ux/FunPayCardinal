@@ -349,6 +349,9 @@ class VPNStorage:
             "support_id": "",
             "crypto_bot_token": "",
             "crypto_bot_webhook_enabled": False,
+            "platega_merchant_id": "",
+            "platega_secret": "",
+            "platega_enabled": True,
             "subscription_public_url": "",
             "mini_app_public_url": "",
             "mini_app_enabled": True,
@@ -1861,6 +1864,130 @@ class CryptoBotAPI:
 
 
 
+class PlategaAPI:
+    """Интеграция с Platega для пополнения баланса рублями."""
+
+    BASE_URL = "https://app.platega.io/"
+    CREATE_PATH = "v2/transaction/process"
+    CALLBACK_PATH = "webhook/platega"
+
+    @staticmethod
+    def _headers() -> dict[str, str]:
+        merchant_id = storage.config.get("platega_merchant_id", "")
+        secret = storage.config.get("platega_secret", "")
+        return {
+            "X-MerchantId": merchant_id,
+            "X-Secret": secret,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    @staticmethod
+    def _public_callback_url() -> str:
+        base = storage.config.get("subscription_public_url", "")
+        if not base:
+            base = "https://pepevpn.site"
+        return base.rstrip("/") + "/" + PlategaAPI.CALLBACK_PATH
+
+    @staticmethod
+    def _return_url() -> str:
+        base = storage.config.get("subscription_public_url", "")
+        if not base:
+            base = "https://pepevpn.site"
+        return base.rstrip("/") + "/payment/success"
+
+    @staticmethod
+    def _failed_url() -> str:
+        base = storage.config.get("subscription_public_url", "")
+        if not base:
+            base = "https://pepevpn.site"
+        return base.rstrip("/") + "/payment/fail"
+
+    @staticmethod
+    def create_payment_url(user_id: int, rub_amount: Any) -> dict[str, Any]:
+        if not storage.config.get("platega_enabled", True):
+            return {"ok": False, "error": "Platega отключен"}
+        merchant_id = storage.config.get("platega_merchant_id", "")
+        secret = storage.config.get("platega_secret", "")
+        if not merchant_id or not secret:
+            return {"ok": False, "error": "Platega не настроен"}
+        rub_amount = _money_round(_to_dec(rub_amount))
+        if rub_amount < 10:
+            return {"ok": False, "error": "Минимальная сумма 10₽"}
+        user = storage.get_user(user_id)
+        username = user.get("username", "") if user else ""
+        payload = f"platega:{user_id}:{rub_amount}"
+        body = {
+            "paymentDetails": {"amount": int(rub_amount), "currency": "RUB"},
+            "description": "Пополнение баланса PepeVPN",
+            "return": PlategaAPI._return_url(),
+            "failedUrl": PlategaAPI._failed_url(),
+            "payload": payload,
+            "metadata": {"userId": str(user_id), "userName": username or str(user_id)},
+        }
+        try:
+            r = requests.post(PlategaAPI.BASE_URL + PlategaAPI.CREATE_PATH, headers=PlategaAPI._headers(), json=body, timeout=30)
+            data = r.json()
+            if not r.ok:
+                return {"ok": False, "error": data.get("message") or data.get("detail") or str(data)}
+            payment_url = data.get("url") or data.get("redirect")
+            tx_id = data.get("transactionId")
+            if not payment_url or not tx_id:
+                return {"ok": False, "error": "Не удалось получить ссылку на оплату"}
+            storage.add_pending_payment(str(tx_id), user_id, rub_amount, "platega", "pending")
+            return {"ok": True, "payment_url": payment_url, "transaction_id": str(tx_id)}
+        except Exception as e:
+            logger.exception("Platega create_payment_url failed")
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def process_callback(headers: dict[str, Any], body: dict[str, Any]) -> tuple[bool, str]:
+        merchant_id = storage.config.get("platega_merchant_id", "")
+        secret = storage.config.get("platega_secret", "")
+        if not merchant_id or not secret:
+            return False, "not configured"
+        if headers.get("X-MerchantId") != merchant_id or headers.get("X-Secret") != secret:
+            return False, "unauthorized"
+        status = body.get("status")
+        tx_id = body.get("id")
+        if not tx_id:
+            return False, "missing id"
+        if status != "CONFIRMED":
+            if tx_id:
+                storage.mark_pending_payment(str(tx_id), str(status).lower())
+            return True, f"status {status}"
+        pending = storage.get_pending_payment(str(tx_id))
+        if pending and pending.get("status") == "confirmed":
+            return True, "already processed"
+        if pending:
+            rub_amount = _to_dec(pending.get("rub_amount"))
+            user_id = int(pending.get("user_id", 0))
+        else:
+            payload = body.get("payload", "")
+            parts = payload.split(":")
+            if len(parts) >= 3:
+                try:
+                    user_id = int(parts[1])
+                    rub_amount = _to_dec(parts[2])
+                except (ValueError, TypeError):
+                    return False, "invalid payload"
+            else:
+                return False, "missing payload"
+        if user_id and rub_amount > 0:
+            if storage.add_balance(user_id, rub_amount, "Platega", "platega", str(tx_id)):
+                storage.mark_pending_payment(str(tx_id), "confirmed")
+                try:
+                    ub = getattr(_user_bot_instance, "bot", None)
+                    if ub:
+                        ub.send_message(user_id, f"Баланс пополнен на {_money_str(rub_amount)}₽ через Platega.")
+                except Exception:
+                    pass
+                return True, "credited"
+            else:
+                return True, "duplicate"
+        return False, "invalid user/amount"
+
+
 class CryptoBotPoller:
     """Фоновый поток опроса статуса инвойсов Crypto Bot."""
 
@@ -2399,6 +2526,11 @@ class MiniAppAPI:
                 storage.add_crypto_invoice(invoice_id, user_id, crypto_amount, asset, rub_amount)
                 return {"ok": True, "payment_url": pay_url}
             return {"ok": False, "error": result.get("error", "Не удалось создать счёт")}
+        if method == "platega":
+            result = PlategaAPI.create_payment_url(user_id, rub_amount)
+            if result.get("ok"):
+                return {"ok": True, "payment_url": result["payment_url"]}
+            return result
         return {"ok": False, "error": "Неизвестный способ оплаты"}
 
 
@@ -2697,6 +2829,14 @@ class DeviceAuthServer:
         async def health() -> dict:
             return {"ok": True}
 
+        @app.get("/payment/success")
+        async def payment_success() -> Response:
+            return Response(content="<html><body><h2>Оплата успешна</h2><p>Вы можете вернуться в Telegram.</p></body></html>", media_type="text/html; charset=utf-8")
+
+        @app.get("/payment/fail")
+        async def payment_fail() -> Response:
+            return Response(content="<html><body><h2>Оплата не завершена</h2><p>Попробуйте ещё раз в Telegram.</p></body></html>", media_type="text/html; charset=utf-8")
+
         @app.get("/metrics")
         async def metrics(request: Request) -> Any:
             ip = request.client.host if request.client else "unknown"
@@ -2775,6 +2915,20 @@ class DeviceAuthServer:
                 _handle_crypto_invoice_paid(data.get("payload", {}))
             return {"ok": True}
 
+        @app.post("/webhook/platega")
+        async def platega_webhook(request: Request) -> Any:
+            ip = request.client.host if request.client else "unknown"
+            if not DeviceAuthServer._rate_limit(ip, max_req=100, window=60):
+                raise HTTPException(status_code=429)
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            headers = dict(request.headers)
+            ok, detail = PlategaAPI.process_callback(headers, body)
+            if not ok:
+                raise HTTPException(status_code=401 if detail == "unauthorized" else 400, detail=detail)
+            return {"ok": True}
 
         @app.get("/sub/makcum")
         async def makcum_subscription(request: Request) -> Any:
@@ -2782,7 +2936,12 @@ class DeviceAuthServer:
             ip = request.client.host if request.client else "unknown"
             if not DeviceAuthServer._rate_limit(ip, max_req=60, window=60):
                 raise HTTPException(status_code=429)
-            path = STORAGE_DIR / "makcum_subscription.json"
+            server = request.query_params.get("server", "")
+            if server == "barcelona":
+                filename = "makcum_barcelona_subscription.json"
+            else:
+                filename = "makcum_subscription.json"
+            path = STORAGE_DIR / filename
             if not path.exists():
                 raise HTTPException(status_code=404, detail="not found")
             try:
@@ -4364,6 +4523,10 @@ class UserBot:
         def on_deposit_stars_amount(m: Message):
             self._on_deposit_stars_amount(m)
 
+        @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "deposit_platega_rubles"))
+        def on_deposit_platega_amount(m: Message):
+            self._on_deposit_platega_amount(m)
+
 
         @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "withdraw_amount"))
         def on_withdraw_amount(m: Message):
@@ -5027,6 +5190,12 @@ class UserBot:
                                        reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_stars_preset", f"{CB_PREFIX}deposit"))
             return
 
+        if action == "deposit_platega":
+            self.set_state(user_id, "deposit_platega_rubles", {"message_id": c.message.message_id})
+            self._edit_message("Выберите сумму пополнения в рублях (Platega):", chat_id, c.message.message_id,
+                                       reply_markup=self._amount_keyboard(f"{CB_PREFIX}deposit_platega_preset", f"{CB_PREFIX}deposit"))
+            return
+
 
         if action == "deposit_crypto_preset" and len(args) >= 2:
             asset, rub_str = args[0], args[1]
@@ -5054,6 +5223,20 @@ class UserBot:
             except ValueError:
                 return
             self._create_stars_invoice(user_id, chat_id, c.message.message_id, rub)
+            return
+
+        if action == "deposit_platega_preset" and len(args) >= 1:
+            rub_str = args[0]
+            if rub_str == "custom":
+                self.set_state(user_id, "deposit_platega_rubles", {"message_id": c.message.message_id})
+                self._edit_message("Введите сумму пополнения в рублях:", chat_id, c.message.message_id,
+                                           reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}deposit")))
+                return
+            try:
+                rub = int(rub_str)
+            except ValueError:
+                return
+            self._create_platega_invoice(user_id, chat_id, c.message.message_id, rub)
             return
 
 
@@ -5475,6 +5658,7 @@ class UserBot:
                 f"⭐ Telegram Stars: 1.3 Stars = 1₽\n\n"
                 f"Выберите способ:")
         kb = K()
+        kb.add(B("💳 Platega (СБП/карта)", callback_data=f"{CB_PREFIX}deposit_platega"))
         kb.add(B("💵 Crypto Bot USDT", callback_data=f"{CB_PREFIX}deposit_crypto:USDT"))
         kb.add(B("🌐 Crypto Bot TON", callback_data=f"{CB_PREFIX}deposit_crypto:TON"))
         kb.add(B("⭐ Telegram Stars", callback_data=f"{CB_PREFIX}deposit_stars"))
@@ -5572,6 +5756,37 @@ class UserBot:
         message_id = state["data"].get("message_id")
         self.clear_state(user_id)
         self._create_stars_invoice(user_id, m.chat.id, message_id, rub_amount)
+
+    def _create_platega_invoice(self, user_id: int, chat_id: int, message_id: int, rub_amount: Decimal) -> None:
+        rub_amount = _money_round(rub_amount)
+        result = PlategaAPI.create_payment_url(user_id, rub_amount)
+        pay_url = result.get("payment_url")
+        tx_id = result.get("transaction_id")
+        if pay_url and tx_id:
+            kb = K()
+            kb.add(B("Оплатить", url=pay_url))
+            kb.add(B("Главное меню", callback_data=f"{CB_PREFIX}main"))
+            self._edit_message(f"Счёт на {_money_str(rub_amount)}₽ через Platega создан. Оплатите по кнопке ниже.",
+                                       chat_id, message_id, reply_markup=kb)
+        else:
+            error = result.get("error", "Не удалось создать счёт.")
+            self._edit_message(f"Ошибка: {error}", chat_id, message_id,
+                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}deposit")))
+
+    def _on_deposit_platega_amount(self, m: Message) -> None:
+        user_id = m.from_user.id
+        if self._check_maintenance(user_id, m.chat.id):
+            return
+        state = self.get_state(user_id)
+        if not state:
+            return
+        rub_amount = self._is_valid_amount(m.text)
+        if rub_amount is None:
+            self.bot.send_message(m.chat.id, "Введите положительную числовую сумму.")
+            return
+        message_id = state["data"].get("message_id")
+        self.clear_state(user_id)
+        self._create_platega_invoice(user_id, m.chat.id, message_id, rub_amount)
 
     def _on_promo_code(self, m: Message) -> None:
         user_id = m.from_user.id
