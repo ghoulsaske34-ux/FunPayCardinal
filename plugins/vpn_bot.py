@@ -187,6 +187,29 @@ TRIAL_DAYS = 3
 _user_bot_instance: "UserBot | None" = None
 
 
+def _apply_renewal(user_id: int, sub_id: str, months: int, source: str = "payment") -> bool:
+    """Продлевает подписку после успешной оплаты (без списания с баланса)."""
+    sub = storage.get_subscription(sub_id)
+    if not sub or sub.user_id != user_id:
+        return False
+    price = storage.price(sub.plan_id, months)
+    if price is None:
+        return False
+    now = time.time()
+    base = max(now, sub.expires_at)
+    sub.expires_at = base + months * 30 * 86400
+    storage.update_subscription(sub)
+    XrayAPI.update_expiry(sub)
+    storage.process_referral_rewards(user_id, price)
+    storage.add_purchase_stats(user_id, price, months)
+    if _user_bot_instance and _user_bot_instance.bot:
+        try:
+            _user_bot_instance.bot.send_message(user_id, f"Подписка продлена на {months} мес. через {source}!\n{format_subscription(sub)}")
+        except Exception:
+            pass
+    return True
+
+
 @dataclass
 class ServerConfig:
     host_id: str = "main"
@@ -249,6 +272,10 @@ class Subscription:
     xray_synced: bool = False  # успешно создан/обновлён в 3X-UI
     host_id: str = "main"
     last_reissue_at: float = 0.0
+    pending_plan_id: str = ""
+    pending_plan_months: int = 0
+    pending_plan_price: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    pending_plan_change_at: float = 0.0
 
     @property
     def is_expired(self) -> bool:
@@ -1894,6 +1921,10 @@ def format_subscription(sub: Subscription) -> str:
         f"Действует до: {_format_time(sub.expires_at)}",
         f"Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}",
     ]
+    if sub.pending_plan_id and sub.pending_plan_change_at:
+        pending_plan = storage.plan(sub.pending_plan_id)
+        change_date = datetime.fromtimestamp(sub.pending_plan_change_at).strftime("%d.%m.%Y")
+        lines.append(f"\n📝 Запланирована смена тарифа: {_escape(pending_plan.name if pending_plan else sub.pending_plan_id)} {sub.pending_plan_months} мес. ({_money_str(sub.pending_plan_price)}₽) с {change_date}")
     return "\n".join(lines)
 
 
@@ -1994,7 +2025,7 @@ class PlategaAPI:
         return base.rstrip("/") + "/payment/fail"
 
     @staticmethod
-    def create_payment_url(user_id: int, rub_amount: Any, payment_method: int | None = None) -> dict[str, Any]:
+    def create_payment_url(user_id: int, rub_amount: Any, payment_method: int | None = None, method: str = "platega", payload: str | None = None) -> dict[str, Any]:
         if not storage.config.get("platega_enabled", True):
             return {"ok": False, "error": "Platega отключен"}
         merchant_id = storage.config.get("platega_merchant_id", "")
@@ -2006,10 +2037,11 @@ class PlategaAPI:
             return {"ok": False, "error": "Минимальная сумма 10₽"}
         user = storage.get_user(user_id)
         username = user.get("username", "") if user else ""
-        payload = f"platega:{user_id}:{rub_amount}"
+        if payload is None:
+            payload = f"platega:{user_id}:{rub_amount}"
         body = {
             "paymentDetails": {"amount": int(rub_amount), "currency": "RUB"},
-            "description": "Пополнение баланса PepeVPN",
+            "description": "Продление подписки PepeVPN" if method != "platega" else "Пополнение баланса PepeVPN",
             "return": PlategaAPI._return_url(),
             "failedUrl": PlategaAPI._failed_url(),
             "payload": payload,
@@ -2029,7 +2061,7 @@ class PlategaAPI:
             tx_id = data.get("transactionId")
             if not payment_url or not tx_id:
                 return {"ok": False, "error": "Не удалось получить ссылку на оплату"}
-            storage.add_pending_payment(str(tx_id), user_id, rub_amount, "platega", "pending")
+            storage.add_pending_payment(str(tx_id), user_id, rub_amount, method, "pending")
             return {"ok": True, "payment_url": payment_url, "transaction_id": str(tx_id)}
         except Exception as e:
             logger.exception("Platega create_payment_url failed")
@@ -2054,11 +2086,13 @@ class PlategaAPI:
         pending = storage.get_pending_payment(str(tx_id))
         if pending and pending.get("status") == "confirmed":
             return True, "already processed"
+        payload = body.get("payload", "")
+        method = ""
         if pending:
             rub_amount = _to_dec(pending.get("rub_amount"))
             user_id = int(pending.get("user_id", 0))
+            method = pending.get("method", "platega") or ""
         else:
-            payload = body.get("payload", "")
             parts = payload.split(":")
             if len(parts) >= 3:
                 try:
@@ -2068,19 +2102,34 @@ class PlategaAPI:
                     return False, "invalid payload"
             else:
                 return False, "missing payload"
-        if user_id and rub_amount > 0:
-            if storage.add_balance(user_id, rub_amount, "Platega", "platega", str(tx_id)):
-                storage.mark_pending_payment(str(tx_id), "confirmed")
+        if not user_id or rub_amount <= 0:
+            return False, "invalid user/amount"
+        if method == "platega_renew" or payload.startswith("renew:"):
+            parts = payload.split(":")
+            if len(parts) >= 4 and parts[0] == "renew":
                 try:
-                    ub = getattr(_user_bot_instance, "bot", None)
-                    if ub:
-                        ub.send_message(user_id, f"Баланс пополнен на {_money_str(rub_amount)}₽ через Platega.")
-                except Exception:
-                    pass
-                return True, "credited"
-            else:
-                return True, "duplicate"
-        return False, "invalid user/amount"
+                    target_uid = int(parts[1])
+                    sub_id = parts[2]
+                    months = int(parts[3])
+                    if target_uid != user_id:
+                        return False, "user mismatch"
+                    if _apply_renewal(user_id, sub_id, months, "Platega"):
+                        storage.mark_pending_payment(str(tx_id), "confirmed")
+                        return True, "renewed"
+                    return False, "renewal failed"
+                except (ValueError, TypeError):
+                    return False, "invalid renew payload"
+            return False, "invalid renew payload"
+        if storage.add_balance(user_id, rub_amount, "Platega", "platega", str(tx_id)):
+            storage.mark_pending_payment(str(tx_id), "confirmed")
+            try:
+                ub = getattr(_user_bot_instance, "bot", None)
+                if ub:
+                    ub.send_message(user_id, f"Баланс пополнен на {_money_str(rub_amount)}₽ через Platega.")
+            except Exception:
+                pass
+            return True, "credited"
+        return True, "duplicate"
 
 
 class CryptoBotPoller:
@@ -2195,6 +2244,44 @@ class SubscriptionScheduler:
                 del storage.subscriptions["subs"][sub_id]
                 storage.save_subscriptions()
                 continue
+        # apply scheduled plan changes at expiry
+        for sub_id, data in list(storage.subscriptions["subs"].items()):
+            sub = storage._sub_from_dict(data)
+            if not sub.active or not sub.pending_plan_id or not sub.pending_plan_change_at:
+                continue
+            if now >= sub.pending_plan_change_at:
+                plan = storage.plan(sub.pending_plan_id)
+                price = sub.pending_plan_price or storage.price(sub.pending_plan_id, sub.pending_plan_months) or Decimal("0")
+                user = storage.get_user(sub.user_id)
+                if plan and user and storage.deduct_balance(sub.user_id, price, "purchase", f"change_plan:{sub.sub_id}:{sub.pending_plan_id}:{sub.pending_plan_months}"):
+                    sub.plan_id = sub.pending_plan_id
+                    sub.months = sub.pending_plan_months
+                    sub.expires_at = sub.expires_at + sub.months * 30 * 86400
+                    sub.host_id = plan.host_id if plan.host_id else sub.host_id
+                    sub.pending_plan_id = ""
+                    sub.pending_plan_months = 0
+                    sub.pending_plan_price = Decimal("0.00")
+                    sub.pending_plan_change_at = 0.0
+                    storage.update_subscription(sub)
+                    XrayAPI.add_or_update_client(sub)
+                    for dev in sub.devices:
+                        if dev.get("client_email"):
+                            XrayAPI.add_or_update_device_client(sub, dev)
+                    storage.process_referral_rewards(sub.user_id, price)
+                    storage.add_purchase_stats(sub.user_id, price, sub.months)
+                    self._notify(sub.user_id, f"✅ Тариф изменён на {plan.name}!\n{format_subscription(sub)}")
+                else:
+                    sub.pending_plan_id = ""
+                    sub.pending_plan_months = 0
+                    sub.pending_plan_price = Decimal("0.00")
+                    sub.pending_plan_change_at = 0.0
+                    if now >= sub.expires_at:
+                        sub.active = False
+                        data["active"] = False
+                    storage.save_subscriptions()
+                    XrayAPI.remove_client(sub)
+                    if now >= sub.expires_at:
+                        self._notify(sub.user_id, f"❌ Недостаточно средств для смены тарифа. Подписка #{sub.sub_id} истекла.")
         renew_window = max(0, int(storage.config.get("autorenew_days_before", 1))) * 86400
         retry_interval = 6 * 3600
         for sub_id, data in list(storage.subscriptions["subs"].items()):
@@ -5095,13 +5182,13 @@ class UserBot:
         kb.row_width = 1
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
-        kb.add(B("Управление подпиской", callback_data=f"{CB_PREFIX}manage", style="primary"))
-        kb.add(B("Профиль", callback_data=f"{CB_PREFIX}profile", style="primary"))
-        kb.add(B("Пополнить Баланс", callback_data=f"{CB_PREFIX}deposit", style="success"))
-        kb.add(B("Помощь", callback_data=f"{CB_PREFIX}help"))
+            kb.add(B("🏠 Кабинет", web_app=WebAppInfo(url=mini_url), style="success"))
+        kb.add(B("🎛 Управление подпиской", callback_data=f"{CB_PREFIX}manage"))
+        kb.add(B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B("💳 Пополнить Баланс", callback_data=f"{CB_PREFIX}deposit"))
+        kb.add(B("❓ Помощь", callback_data=f"{CB_PREFIX}help", style="danger"))
         if user_id is not None and not storage.get_user(user_id).get("trial_used"):
-            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
         return kb
 
     def _main_menu_text(self, user_id: int) -> str:
@@ -5152,7 +5239,7 @@ class UserBot:
         text = format_subscription(sub) + f"\n\nБаланс: {_money_str(storage.get_user(user_id).get('balance', 0))}₽"
         kb = K()
         kb.row_width = 1
-        kb.add(B("➡️ Продлить подписку", callback_data=f"{CB_PREFIX}sub_renew:{sub.sub_id}", style="success"))
+        kb.add(B("➡️ Продлить подписку", callback_data=f"{CB_PREFIX}sub_renew:{sub.sub_id}"))
         kb.add(B("🔄 Сменить план", callback_data=f"{CB_PREFIX}change_plan:{sub.sub_id}"))
         kb.add(B("📱 Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub.sub_id}"))
         kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub.sub_id}"))
@@ -5227,9 +5314,10 @@ class UserBot:
             self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
     def _confirm_change_plan(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str, plan_id: str, months: str) -> None:
+        sub = storage.get_subscription(sub_id)
         plan = storage.plan(plan_id)
         base_price = storage.price(plan_id, int(months))
-        if base_price is None:
+        if not sub or sub.user_id != user_id or not plan or base_price is None:
             text = "Цена для выбранного срока не установлена."
             kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}change_plan:{sub_id}"))
             if message_id:
@@ -5244,15 +5332,15 @@ class UserBot:
         price = _money_round(base_price - discount)
         user = storage.get_user(user_id)
         price_text = f"<s>{_money_str(base_price)}₽</s> {_money_str(price)}₽ (скидка {_money_str(discount)}₽)" if discount else f"{_money_str(price)}₽"
+        change_date = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y")
         text = (f"<b>{_escape(plan.name)}</b>\n"
                 f"Срок: {months} мес.\n"
-                f"Цена: {price_text}\n"
-                f"Ваш баланс: {_money_str(user['balance'])}₽\n\n"
-                f"Текущая подписка будет заменена на новый тариф. Подтвердите:")
+                f"Цена: {price_text}\n\n"
+                f"🗓 Тариф сменится и деньги спишутся <b>{change_date}</b> — в день окончания текущей подписки.\n\n"
+                f"Ваш баланс: {_money_str(user['balance'])}₽\n"
+                f"Подтвердите:")
         kb = K()
-        kb.add(B("Сменить", callback_data=f"{CB_PREFIX}change_plan_confirm:{sub_id}:{plan_id}:{months}"))
-        if user["balance"] < price:
-            kb.add(B("Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
+        kb.add(B("📝 Запланировать смену", callback_data=f"{CB_PREFIX}change_plan_confirm:{sub_id}:{plan_id}:{months}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}change_plan_duration:{sub_id}:{plan_id}"))
         self.set_state(user_id, "confirm_change_plan", {"sub_id": sub_id, "plan_id": plan_id, "months": months, "discount": discount, "message_id": message_id})
         if message_id:
@@ -5261,6 +5349,7 @@ class UserBot:
             self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
     def _process_change_plan(self, user_id: int, chat_id: int, message_id: int | None, sub_id: str, plan_id: str, months: int) -> None:
+        """Планирует смену тарифа на дату окончания текущей подписки."""
         sub = storage.get_subscription(sub_id)
         plan = storage.plan(plan_id)
         if not sub or sub.user_id != user_id or not plan:
@@ -5273,37 +5362,18 @@ class UserBot:
         if state and state.get("state") == "confirm_change_plan" and state.get("data", {}).get("sub_id") == sub_id:
             discount = _to_dec(state["data"].get("discount", 0))
         price = _money_round(base_price - discount)
-        user = storage.get_user(user_id)
-        if user["balance"] < price:
-            text = "Недостаточно средств. Пополните баланс."
-            kb = K().add(B("Пополнить", callback_data=f"{CB_PREFIX}deposit")).add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
-            if message_id:
-                self._edit_message(text, chat_id, message_id, reply_markup=kb)
-            else:
-                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-            return
-        if not storage.deduct_balance(user_id, price, "purchase", f"change_plan:{sub_id}:{plan_id}:{months}"):
-            text = "Ошибка списания средств. Попробуйте ещё раз."
-            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
-            if message_id:
-                self._edit_message(text, chat_id, message_id, reply_markup=kb)
-            else:
-                self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-            return
         self.clear_state(user_id)
-        host = storage.get_host(plan.host_id) if plan and plan.host_id else storage.server()
-        sub.plan_id = plan_id
-        sub.months = months
-        sub.expires_at = time.time() + months * 30 * 86400
-        sub.host_id = plan.host_id if plan and plan.host_id else (host.host_id if host else sub.host_id)
+        sub.pending_plan_id = plan_id
+        sub.pending_plan_months = months
+        sub.pending_plan_price = price
+        sub.pending_plan_change_at = sub.expires_at
         storage.update_subscription(sub)
-        XrayAPI.add_or_update_client(sub)
-        for dev in sub.devices:
-            if dev.get("client_email"):
-                XrayAPI.add_or_update_device_client(sub, dev)
-        storage.process_referral_rewards(user_id, price)
-        storage.add_purchase_stats(user_id, price, months)
-        text = f"Тариф изменён!\n{format_subscription(sub)}"
+        change_date = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y")
+        text = (f"✅ Смена тарифа запланирована!\n\n"
+                f"Новый тариф: <b>{_escape(plan.name)}</b> ({months} мес.)\n"
+                f"Списание: {_money_str(price)}₽\n"
+                f"Дата смены и списания: <b>{change_date}</b>\n\n"
+                f"{format_subscription(sub)}")
         if message_id:
             self._edit_message(text, chat_id, message_id, reply_markup=self._keyboard_main())
         else:
@@ -5415,9 +5485,13 @@ class UserBot:
                 self._change_plan_duration(user_id, chat_id, c.message.message_id, sub_id, plan_id)
             return
 
-        if action == "change_plan_duration" and len(args) >= 3:
-            sub_id, plan_id, months = args[0], args[1], args[2]
-            self._confirm_change_plan(user_id, chat_id, c.message.message_id, sub_id, plan_id, months)
+        if action == "change_plan_duration":
+            if len(args) == 2:
+                sub_id, plan_id = args[0], args[1]
+                self._change_plan_duration(user_id, chat_id, c.message.message_id, sub_id, plan_id)
+            elif len(args) >= 3:
+                sub_id, plan_id, months = args[0], args[1], args[2]
+                self._confirm_change_plan(user_id, chat_id, c.message.message_id, sub_id, plan_id, months)
             return
 
         if action == "change_plan_confirm" and len(args) >= 3:
@@ -5440,14 +5514,26 @@ class UserBot:
             self._sub_stats(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "sub_renew":
+        if action in ("sub_renew", "renew_menu"):
             sub_id = args[0]
             self._renew_menu(user_id, chat_id, c.message.message_id, sub_id)
             return
 
-        if action == "renew_confirm":
-            sub_id, months = args[0], int(args[1])
-            self._renew(user_id, chat_id, c.message.message_id, sub_id, months)
+        if action == "renew_balance":
+            sub_id = args[0]
+            sub = storage.get_subscription(sub_id)
+            if sub and sub.user_id == user_id:
+                self._renew(user_id, chat_id, c.message.message_id, sub_id, sub.months or 1)
+            return
+
+        if action == "renew_platega_sbp":
+            sub_id = args[0]
+            self._renew_platega(user_id, chat_id, c.message.message_id, sub_id, payment_method=2)
+            return
+
+        if action == "renew_platega_card":
+            sub_id = args[0]
+            self._renew_platega(user_id, chat_id, c.message.message_id, sub_id, payment_method=11)
             return
 
         if action == "sub_devices":
@@ -5891,16 +5977,34 @@ class UserBot:
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _renew_menu(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
+        """Меню продления на текущий срок подписки."""
         sub = storage.get_subscription(sub_id)
         if not sub or sub.user_id != user_id:
             return
         plan = storage.plan(sub.plan_id)
+        months = sub.months or 1
+        price = storage.price(sub.plan_id, months)
+        if price is None:
+            text = "Цена для продления текущего тарифа не установлена."
+            kb = K().add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
+            self._edit_message(text, chat_id, message_id, reply_markup=kb)
+            return
+        user = storage.get_user(user_id)
+        balance_ok = user["balance"] >= price
+        text = (f"<b>➡️ Продление подписки</b>\n\n"
+                f"Тариф: {_escape(plan.name if plan else sub.plan_id)}\n"
+                f"Срок продления: {months} мес.\n"
+                f"Стоимость: {_money_str(price)}₽\n"
+                f"Баланс: {_money_str(user['balance'])}₽")
         kb = K()
-        for months in DURATIONS:
-            if plan.prices.get(months) is not None:
-                kb.add(B(f"+{months} мес. — {_price_text(plan, months)}", callback_data=f"{CB_PREFIX}renew_confirm:{sub_id}:{months}"))
+        if balance_ok:
+            kb.add(B("💰 С баланса", callback_data=f"{CB_PREFIX}renew_balance:{sub_id}"))
+        else:
+            text += f"\n\n⚠️ На балансе не хватает {_money_str(price - user['balance'])}₽."
+        kb.add(B("💳 Platega СБП", callback_data=f"{CB_PREFIX}renew_platega_sbp:{sub_id}"))
+        kb.add(B("💳 Platega Карта", callback_data=f"{CB_PREFIX}renew_platega_card:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
-        self._edit_message("Выберите срок продления:", chat_id, message_id, reply_markup=kb)
+        self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _renew(self, user_id: int, chat_id: int, message_id: int, sub_id: str, months: int) -> None:
         sub = storage.get_subscription(sub_id)
@@ -5930,6 +6034,27 @@ class UserBot:
         storage.add_purchase_stats(user_id, price, months)
         self._edit_message(f"Подписка продлена!\n{format_subscription(sub)}", chat_id, message_id,
                                    reply_markup=self._keyboard_main())
+
+    def _renew_platega(self, user_id: int, chat_id: int, message_id: int, sub_id: str, payment_method: int = 2) -> None:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return
+        months = sub.months or 1
+        price = storage.price(sub.plan_id, months)
+        if price is None:
+            self._edit_message("Цена для продления не установлена.", chat_id, message_id,
+                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}manage")))
+            return
+        payload = f"renew:{user_id}:{sub_id}:{months}:{_money_str(price)}"
+        result = PlategaAPI.create_payment_url(user_id, price, payment_method=payment_method, method="platega_renew", payload=payload)
+        if not result.get("ok"):
+            self._edit_message(f"Не удалось создать платёж: {result.get('error', 'unknown')}", chat_id, message_id,
+                                       reply_markup=K().add(B("Назад", callback_data=f"{CB_PREFIX}renew_menu:{sub_id}")))
+            return
+        kb = K()
+        kb.add(B("💳 Оплатить", url=result["payment_url"]))
+        kb.add(B("Назад", callback_data=f"{CB_PREFIX}renew_menu:{sub_id}"))
+        self._edit_message(f"Для продления на {months} мес. оплатите {_money_str(price)}₽", chat_id, message_id, reply_markup=kb)
 
     def _sub_devices(self, user_id: int, chat_id: int, message_id: int, sub_id: str) -> None:
         sub = storage.get_subscription(sub_id)
