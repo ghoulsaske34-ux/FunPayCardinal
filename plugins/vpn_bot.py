@@ -5182,11 +5182,11 @@ class UserBot:
         kb.row_width = 1
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("✜ Личный кабинет", web_app=WebAppInfo(url=mini_url), style="success"))
-        kb.add(B("⚙ Управление подпиской", callback_data=f"{CB_PREFIX}manage"))
-        kb.add(B("㊂ Профиль", callback_data=f"{CB_PREFIX}profile"))
-        kb.add(B("⛁ Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
-        kb.add(B("⛨ Помощь", callback_data=f"{CB_PREFIX}help", style="danger"))
+            kb.add(B("📲 Личный кабинет", web_app=WebAppInfo(url=mini_url), style="success"))
+        kb.add(B("⚙️ Управление подпиской", callback_data=f"{CB_PREFIX}manage"))
+        kb.add(B("🔗 Профиль", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B("💳 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
+        kb.add(B("❔ Помощь", callback_data=f"{CB_PREFIX}help", style="danger"))
         if user_id is not None and not storage.get_user(user_id).get("trial_used"):
             kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
         return kb
@@ -6478,48 +6478,48 @@ class UserBot:
     def _profile_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
         subs = storage.active_subscriptions(user_id)
-        lines = ["<b>◉ Профиль</b>"]
+        lines = ["<b>👤 Профиль</b>"]
         if user.get("first_name"):
-            lines.append(f"✜ Имя: {_escape(user['first_name'])}")
-        lines.append(f"◈ ID: <code>{user_id}</code>")
-        lines.append(f"⛁ Баланс: {_money_str(user.get('balance', 0))}₽")
+            lines.append(f"✏️ Имя: {_escape(user['first_name'])}")
+        lines.append(f"🆔 ID: <code>{user_id}</code>")
+        lines.append(f"💰 Баланс: {_money_str(user.get('balance', 0))}₽")
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
-            lines.append(f"⚙ Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
-            lines.append(f"◷ Действует до: {_format_time(sub.expires_at)}")
-            lines.append(f"◫ Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
+            lines.append(f"⚙️ Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
+            lines.append(f"📅 Действует до: {_format_time(sub.expires_at)}")
+            lines.append(f"📱 Устройств: {len(sub.devices)} / {_escape(plan.device_text if plan else '?')}")
         else:
-            lines.append("◫ Активных подписок нет.")
+            lines.append("📱 Активных подписок нет.")
         if user.get("trial_used"):
-            lines.append("✎ Пробный период использован.")
+            lines.append("🎁 Пробный период использован.")
         total_spent = _to_dec(user.get("total_spent", 0))
         total_months = user.get("total_months", 0)
         if total_spent or total_months:
-            lines.append(f"⛁ Всего потрачено: {_money_str(total_spent)}₽ (куплено {total_months} мес.)")
+            lines.append(f"💳 Всего потрачено: {_money_str(total_spent)}₽ (куплено {total_months} мес.)")
         earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
         total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
         if total_earn:
-            lines.append(f"✉ Заработано с рефералов: {_money_str(total_earn)}₽")
+            lines.append(f"🔗 Заработано с рефералов: {_money_str(total_earn)}₽")
         kb = K()
-        kb.add(B("✎ Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
-        kb.add(B("✉ Реферальная система", callback_data=f"{CB_PREFIX}referral"))
-        kb.add(B("◫ История операций", callback_data=f"{CB_PREFIX}history"))
-        kb.add(B("⚙ Настройки", callback_data=f"{CB_PREFIX}settings"))
-        kb.add(B("← Назад", callback_data=f"{CB_PREFIX}main"))
+        kb.add(B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"))
+        kb.add(B("🔗 Реферальная система", callback_data=f"{CB_PREFIX}referral"))
+        kb.add(B("📜 История операций", callback_data=f"{CB_PREFIX}history"))
+        kb.add(B("⚙️ Настройки", callback_data=f"{CB_PREFIX}settings"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
         self._edit_message("\n".join(lines), chat_id, message_id, reply_markup=kb)
 
     def _history_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         txs = storage.get_transactions(user_id)
         if not txs:
-            text = "◫ История операций пуста."
+            text = "📜 История операций пуста."
         else:
-            lines = ["<b>◫ История операций</b> (последние 20):"]
+            lines = ["<b>📜 История операций</b> (последние 20):"]
             type_names = {
-                "deposit": "⛁ Пополнение",
+                "deposit": "💳 Пополнение",
                 "purchase": "− Списание",
-                "referral": "✉ Реферал",
-                "trial": "✎ Пробный период",
+                "referral": "🔗 Реферал",
+                "trial": "🎁 Пробный период",
             }
             for tx in txs:
                 tname = type_names.get(tx.get("type"), tx.get("type", "?"))
@@ -6529,23 +6529,23 @@ class UserBot:
                 lines.append(f"{date} — {tname}: {amount:+.2f}₽ ({method})")
             text = "\n".join(lines)
         self._edit_message(text, chat_id, message_id,
-                                   reply_markup=K().add(B("← Назад", callback_data=f"{CB_PREFIX}profile")))
+                                   reply_markup=K().add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile")))
 
     def _settings_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
         user = storage.get_user(user_id)
         settings = user.get("settings", {"lang": "ru", "notifications": True, "auto_renew": True})
         lang = settings.get("lang", "ru")
-        notif = "● Вкл" if settings.get("notifications", True) else "○ Выкл"
-        renew = "● Вкл" if settings.get("auto_renew", True) else "○ Выкл"
-        text = (f"<b>⚙ Настройки</b>\n\n"
-                f"⌘ Язык: {lang.upper()}\n"
-                f"◉ Уведомления: {notif}\n"
-                f"↻ Автопродление: {renew}")
+        notif = "🟢 Вкл" if settings.get("notifications", True) else "🔴 Выкл"
+        renew = "🟢 Вкл" if settings.get("auto_renew", True) else "🔴 Выкл"
+        text = (f"<b>⚙️ Настройки</b>\n\n"
+                f"🌐 Язык: {lang.upper()}\n"
+                f"🔔 Уведомления: {notif}\n"
+                f"🔄 Автопродление: {renew}")
         kb = K()
-        kb.add(B(f"⌘ Язык: {lang.upper()}", callback_data=f"{CB_PREFIX}toggle:lang"))
-        kb.add(B(f"◉ Уведомления: {notif}", callback_data=f"{CB_PREFIX}toggle:notifications"))
-        kb.add(B(f"↻ Автопродление: {renew}", callback_data=f"{CB_PREFIX}toggle:auto_renew"))
-        kb.add(B("← Назад", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B(f"🌐 Язык: {lang.upper()}", callback_data=f"{CB_PREFIX}toggle:lang"))
+        kb.add(B(f"🔔 Уведомления: {notif}", callback_data=f"{CB_PREFIX}toggle:notifications"))
+        kb.add(B(f"🔄 Автопродление: {renew}", callback_data=f"{CB_PREFIX}toggle:auto_renew"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _help_menu(self, user_id: int, chat_id: int, message_id: int) -> None:
@@ -6598,18 +6598,18 @@ class UserBot:
         earnings = storage.referrals.get("earnings", {}).get(str(user_id), {"level1": Decimal("0.00"), "level2": Decimal("0.00")})
         ref_balance = _to_dec(user.get("referral_balance", 0))
         total_earn = _to_dec(earnings.get("level1", 0)) + _to_dec(earnings.get("level2", 0))
-        text = (f"<b>✉ Реферальная система</b>\n\n"
-                f"◈ Ваша ссылка: {link}\n\n"
-                f"◉ Рефералы 1 уровня: {len(level1)}\n"
-                f"◫ Рефералы 2 уровня: {len(level2)}\n"
-                f"⛁ Заработано: {_money_str(total_earn)}₽\n"
-                f"  Ⅰ уровень (10%): {_money_str(earnings.get('level1', 0))}₽\n"
-                f"  Ⅱ уровень (5%): {_money_str(earnings.get('level2', 0))}₽\n\n"
-                f"⛁ Реферальный баланс: {_money_str(ref_balance)}₽\n"
+        text = (f"<b>🔗 Реферальная система</b>\n\n"
+                f"🔗 Ваша ссылка: {link}\n\n"
+                f"👤 Рефералы 1 уровня: {len(level1)}\n"
+                f"👥 Рефералы 2 уровня: {len(level2)}\n"
+                f"💵 Заработано: {_money_str(total_earn)}₽\n"
+                f"  1️⃣ уровень (10%): {_money_str(earnings.get('level1', 0))}₽\n"
+                f"  2️⃣ уровень (5%): {_money_str(earnings.get('level2', 0))}₽\n\n"
+                f"💰 Реферальный баланс: {_money_str(ref_balance)}₽\n"
                 f"Минимум для вывода: 3000₽")
         kb = K()
-        kb.add(B("✜ Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
-        kb.add(B("← Назад", callback_data=f"{CB_PREFIX}profile"))
+        kb.add(B("💸 Вывести реферальные средства", callback_data=f"{CB_PREFIX}withdraw"))
+        kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}profile"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
 
     def _setup_mini_app_button(self) -> None:
