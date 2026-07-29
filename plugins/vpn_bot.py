@@ -103,6 +103,23 @@ DB_FILE = STORAGE_DIR / "vpn_bot.db"
 CB_PREFIX = "vpn:"
 
 
+def _telegram_proxies() -> dict[str, str] | None:
+    """Возвращает прокси для запросов к api.telegram.org (из telebot или _main.cfg)."""
+    proxies = getattr(telebot.apihelper, "proxy", None)
+    if proxies:
+        return proxies
+    try:
+        from configparser import ConfigParser
+        cfg = ConfigParser()
+        cfg.read("configs/_main.cfg")
+        proxy = cfg.get("Telegram", "proxy", fallback="").strip()
+        if proxy:
+            return {"http": proxy, "https": proxy}
+    except Exception:
+        pass
+    return None
+
+
 def _load_mini_app_html() -> str:
     """Загружает HTML Mini App из рядом лежащего файла."""
     plugin_dir = Path(__file__).parent
@@ -3423,7 +3440,7 @@ class StarsPayment:
     def _api_call(bot, method: str, params: dict[str, Any]) -> Any | None:
         url = f"https://api.telegram.org/bot{bot.token}/{method}"
         try:
-            r = requests.post(url, json=params, timeout=30)
+            r = requests.post(url, json=params, proxies=_telegram_proxies(), timeout=30)
             r.raise_for_status()
             data = r.json()
             if data.get("ok"):
@@ -4401,6 +4418,7 @@ def _set_user_bot_menu_button(enabled: bool) -> None:
         r = requests.post(
             f"https://api.telegram.org/bot{bot_token}/setChatMenuButton",
             json={"menu_button": menu},
+            proxies=_telegram_proxies(),
             timeout=30,
         )
         if r.status_code == 200 and r.json().get("ok"):
@@ -4933,17 +4951,17 @@ class UserBot:
         kb = K()
         kb.row_width = 2
         if user_id is not None and not storage.get_user(user_id).get("trial_used"):
-            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial", style="success"))
         mini_url = storage.config.get("mini_app_public_url", "")
         if mini_url and storage.config.get("mini_app_enabled", True):
-            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url)))
+            kb.add(B("🌐 Личный кабинет", web_app=WebAppInfo(url=mini_url), style="primary"))
         kb.add(
-            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile"),
-            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy"),
-            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs"),
-            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"),
-            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code"),
-            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral"),
+            B("🧑 Профиль", callback_data=f"{CB_PREFIX}profile", style="primary"),
+            B("🛒 Купить подписку", callback_data=f"{CB_PREFIX}buy", style="success"),
+            B("📱 Мои подписки", callback_data=f"{CB_PREFIX}my_subs", style="primary"),
+            B("💰 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit", style="success"),
+            B("🎁 Активировать код", callback_data=f"{CB_PREFIX}activate_code", style="danger"),
+            B("👥 Реферальная система", callback_data=f"{CB_PREFIX}referral", style="primary"),
             B("❓ Помощь", callback_data=f"{CB_PREFIX}help"),
         )
         return kb
