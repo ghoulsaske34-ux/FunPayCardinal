@@ -404,7 +404,7 @@ function renderSubDevices(main){
   $('pageTitle').textContent = '';
   const s = state.selectedSub; if(!s){ render('subs'); return; }
   if (!s.devices || !s.devices.length) {
-    main.innerHTML = `<div class='empty'>Устройств пока нет.</div>`;
+    main.innerHTML = `<div class='empty'>Устройства появятся автоматически после первого подключения по ссылке подписки.</div>`;
     return;
   }
   main.innerHTML = `<div class='hero'><h1>Устройства</h1><p>` + esc(s.plan_name||s.plan_id) + ` · ` + (s.devices_count||0) + ` / ` + (s.max_devices||'?') + `</p></div>` +
@@ -433,6 +433,7 @@ function renderMyDeviceDetail(main){
     `<div class='card'>` +
       `<div class='card-title'>` + esc(d.device_name||'Устройство') + `</div>` +
       `<div class='stat-row'><span>Тип</span><b>` + esc(d.device_type||'—') + `</b></div>` +
+      `<div class='stat-row'><span>Модель</span><b>` + esc(d.device_model||d.device_type||'—') + `</b></div>` +
       `<div class='stat-row'><span>Клиент</span><b>` + esc(d.client_app||'—') + `</b></div>` +
       `<div class='stat-row'><span>IP</span><b>` + esc(d.ip||'—') + `</b></div>` +
       `<div class='stat-row'><span>Первое подключение</span><b>` + first + `</b></div>` +

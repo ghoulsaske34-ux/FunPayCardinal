@@ -1850,6 +1850,20 @@ def _client_app(user_agent: str) -> str:
     return "Unknown"
 
 
+_IPHONE_MODELS: dict[str, str] = {
+    "iphone8,1": "iPhone 6s", "iphone8,2": "iPhone 6s Plus", "iphone8,4": "iPhone SE",
+    "iphone9,1": "iPhone 7", "iphone9,3": "iPhone 7", "iphone9,2": "iPhone 7 Plus", "iphone9,4": "iPhone 7 Plus",
+    "iphone10,1": "iPhone 8", "iphone10,4": "iPhone 8", "iphone10,2": "iPhone 8 Plus", "iphone10,5": "iPhone 8 Plus",
+    "iphone10,3": "iPhone X", "iphone10,6": "iPhone X",
+    "iphone11,2": "iPhone XS", "iphone11,4": "iPhone XS Max", "iphone11,6": "iPhone XS Max", "iphone11,8": "iPhone XR",
+    "iphone12,1": "iPhone 11", "iphone12,3": "iPhone 11 Pro", "iphone12,5": "iPhone 11 Pro Max", "iphone12,8": "iPhone SE 2",
+    "iphone13,1": "iPhone 12 mini", "iphone13,2": "iPhone 12", "iphone13,3": "iPhone 12 Pro", "iphone13,4": "iPhone 12 Pro Max",
+    "iphone14,4": "iPhone 13 mini", "iphone14,5": "iPhone 13", "iphone14,2": "iPhone 13 Pro", "iphone14,3": "iPhone 13 Pro Max", "iphone14,6": "iPhone SE 3",
+    "iphone15,2": "iPhone 14", "iphone15,3": "iPhone 14 Plus", "iphone15,4": "iPhone 14 Pro", "iphone15,5": "iPhone 14 Pro Max",
+    "iphone16,1": "iPhone 15 Pro", "iphone16,2": "iPhone 15 Pro Max",
+}
+
+
 def _device_type(user_agent: str) -> str:
     """Определяет тип устройства из User-Agent."""
     ua = (user_agent or "").lower()
@@ -1870,13 +1884,50 @@ def _device_type(user_agent: str) -> str:
     return "Устройство"
 
 
+def _device_model(user_agent: str) -> str:
+    """Определяет модель телефона по User-Agent (iPhone 11, SM-G973F и т.д.)."""
+    ua = (user_agent or "")
+    if not ua or ua == "manual":
+        return ""
+    # Сначала пытаемся найти идентификаторы вроде iPhone12,1 (включая поля Device/... и custom headers)
+    m = re.search(r"[;\s/](iPhone\d{1,2},\d)\b", ua, re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(iPhone\d{1,2},\d)\b", ua, re.IGNORECASE)
+    if m:
+        return _IPHONE_MODELS.get(m.group(1).lower(), m.group(1))
+    # Некоторые клиенты передают Device/Model
+    m = re.search(r"\bDevice/([^\s;]+)", ua, re.IGNORECASE)
+    if m:
+        model = m.group(1).strip()
+        mapped = _IPHONE_MODELS.get(model, "")
+        if mapped:
+            return mapped
+        if model.lower() not in ("unknown", "ios", "android"):
+            return model
+    # Android: ; SM-G973F Build/... или ; Pixel 6 Build/
+    m = re.search(r";\s*([^;]+?)\s*Build/", ua, re.IGNORECASE)
+    if m:
+        model = m.group(1).strip()
+        if model and model.lower() not in ("android", "windows", "linux", "darwin", "ios"):
+            return model
+    # Fallback Android model из скобок
+    m = re.search(r"Android\s+\d+(?:\.\d+)*;\s*([^;)]+)", ua, re.IGNORECASE)
+    if m:
+        model = m.group(1).strip()
+        if model and model.lower() not in ("android", "mobile"):
+            return model
+    return ""
+
+
 def _device_name(user_agent: str, client_app: str = "") -> str:
-    """Человекочитаемое название устройства: 'iPhone · v2rayTun'."""
+    """Человекочитаемое название устройства: 'iPhone 11 · v2rayTun'."""
+    model = _device_model(user_agent)
     dtype = _device_type(user_agent)
+    name = model or dtype
     app = client_app or _client_app(user_agent)
     if app and app != "Unknown":
-        return f"{dtype} · {app}"
-    return dtype
+        return f"{name} · {app}"
+    return name
 
 
 def _device_fingerprint(ip: str, client_app: str) -> str:
@@ -2586,11 +2637,13 @@ class MiniAppAPI:
         for idx, d in enumerate(sub.devices):
             dev_uuid = d.get("client_uuid")
             dev_url = generate_subscription_url(sub, server, client_uuid=dev_uuid) if server and dev_uuid else sub_url
+            ua = d.get("user_agent", "")
             devices.append({
                 "index": idx,
-                "device_name": d.get("device_name") or _device_name(d.get("user_agent", ""), d.get("client_app") or _client_app(d.get("user_agent", ""))),
-                "device_type": d.get("device_type") or _device_type(d.get("user_agent", "")),
-                "client_app": d.get("client_app") or _client_app(d.get("user_agent", "")),
+                "device_name": d.get("device_name") or _device_name(ua, d.get("client_app") or _client_app(ua)),
+                "device_model": _device_model(ua),
+                "device_type": d.get("device_type") or _device_type(ua),
+                "client_app": d.get("client_app") or _client_app(ua),
                 "ip": d.get("ip", ""),
                 "first_seen": d.get("first_seen", 0),
                 "last_seen": d.get("last_seen", 0),
@@ -4787,10 +4840,6 @@ class UserBot:
         def on_complaint_text(m: Message):
             self._on_complaint_text(m)
 
-        @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "add_device_name"))
-        def on_add_device_name(m: Message):
-            self._on_add_device_name(m)
-
         @bot.message_handler(func=lambda m: self.check_state(m.from_user.id, "enter_promo"))
         def on_promo_code(m: Message):
             self._on_promo_code(m)
@@ -5236,7 +5285,11 @@ class UserBot:
             return
         sub = subs[0]
         plan = storage.plan(sub.plan_id)
-        text = format_subscription(sub) + f"\n\nБаланс: {_money_str(storage.get_user(user_id).get('balance', 0))}₽"
+        server = storage.get_host(sub.host_id) or storage.server()
+        sub_url = generate_subscription_url(sub, server) if server else ""
+        text = (format_subscription(sub) + f"\n\n"
+                f"🔗 Ссылка для приложения:\n<code>{_escape(sub_url)}</code>\n\n"
+                f"Баланс: {_money_str(storage.get_user(user_id).get('balance', 0))}₽")
         kb = K()
         kb.row_width = 1
         kb.add(B("➡️ Продлить подписку", callback_data=f"{CB_PREFIX}sub_renew:{sub.sub_id}"))
@@ -5539,13 +5592,6 @@ class UserBot:
         if action == "sub_devices":
             sub_id = args[0]
             self._sub_devices(user_id, chat_id, c.message.message_id, sub_id)
-            return
-
-        if action == "add_device":
-            sub_id = args[0]
-            self.set_state(user_id, "add_device_name", {"sub_id": sub_id})
-            self._edit_message("Напишите название устройства (например, <b>iPhone Артём</b>):", chat_id, c.message.message_id,
-                                       reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}")))
             return
 
         if action == "device_detail" and len(args) >= 2:
@@ -6061,8 +6107,11 @@ class UserBot:
         if not sub or sub.user_id != user_id:
             return
         plan = storage.plan(sub.plan_id)
+        server = storage.get_host(sub.host_id) or storage.server()
+        sub_url = generate_subscription_url(sub, server) if server else ""
         kb = K()
         kb.row_width = 1
+        kb.add(B("🔗 Ссылка для приложения", url=sub_url))
         kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub_id}"))
         for idx, d in enumerate(sub.devices):
             name = _escape(d.get('device_name') or _device_name(d.get('user_agent', ''), d.get('client_app') or _client_app(d.get('user_agent', ''))))
@@ -6071,12 +6120,10 @@ class UserBot:
             if seen:
                 label += f" · {datetime.fromtimestamp(seen).strftime('%d.%m %H:%M')}"
             kb.add(B(label, callback_data=f"{CB_PREFIX}device_detail:{sub_id}:{idx}"))
-        kb.add(B("➕ Добавить устройство", callback_data=f"{CB_PREFIX}add_device:{sub_id}"))
         kb.add(B("❌ Удалить все", callback_data=f"{CB_PREFIX}del_all_devices:{sub_id}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}manage"))
         if not sub.devices:
-            self._edit_message("Устройств пока нет. Добавьте первое, чтобы получить ссылку для приложения.", chat_id, message_id,
-                               reply_markup=K().add(B("Добавить", callback_data=f"{CB_PREFIX}add_device:{sub_id}")).add(B("Назад", callback_data=f"{CB_PREFIX}manage")))
+            self._edit_message("Устройства появятся автоматически после первого подключения по ссылке ниже.", chat_id, message_id, reply_markup=kb)
             return
         text = f"<b>Устройства</b> ({len(sub.devices)} / {plan.device_text if plan else '?'})\n\nНажмите на устройство, чтобы посмотреть подробности или отвязать его."
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
@@ -6094,6 +6141,7 @@ class UserBot:
         name = _escape(dev.get('device_name') or _device_name(dev.get('user_agent', ''), dev.get('client_app') or _client_app(dev.get('user_agent', ''))))
         app = _escape(dev.get('client_app') or _client_app(dev.get('user_agent', '')))
         dtype = _escape(dev.get('device_type') or _device_type(dev.get('user_agent', '')))
+        model = _escape(_device_model(dev.get('user_agent', '')) or dtype)
         ip = _escape(dev.get('ip', 'неизвестен'))
         first = datetime.fromtimestamp(dev.get('first_seen') or 0).strftime('%d.%m.%Y %H:%M') if dev.get('first_seen') else '-'
         seen = datetime.fromtimestamp(dev.get('last_seen') or 0).strftime('%d.%m.%Y %H:%M') if dev.get('last_seen') else '-'
@@ -6101,6 +6149,7 @@ class UserBot:
         text = (
             f"<b>{name}</b>\n\n"
             f"📱 Устройство: <code>{dtype}</code>\n"
+            f"📲 Модель: <code>{model}</code>\n"
             f"💻 Клиент: <code>{app}</code>\n"
             f"🌐 IP: <code>{ip}</code>\n"
             f"🕐 Первое подключение: {first}\n"
@@ -6111,56 +6160,6 @@ class UserBot:
         kb.add(B("🗑 Отвязать", callback_data=f"{CB_PREFIX}unbind_device:{sub_id}:{index}"))
         kb.add(B("Назад", callback_data=f"{CB_PREFIX}sub_devices:{sub_id}"))
         self._edit_message(text, chat_id, message_id, reply_markup=kb)
-
-    def _on_add_device_name(self, m: Message) -> None:
-        user_id = m.from_user.id
-        if self._check_maintenance(user_id, m.chat.id):
-            return
-        state = self.get_state(user_id)
-        if not state:
-            return
-        sub_id = state["data"]["sub_id"]
-        name = m.text.strip() or "Доп. устройство"
-        self.clear_state(user_id)
-        sub = storage.get_subscription(sub_id)
-        if not sub or sub.user_id != user_id:
-            self.bot.send_message(m.chat.id, "Подписка не найдена.", reply_markup=self._keyboard_main())
-            return
-        plan = storage.plan(sub.plan_id)
-        if plan and plan.max_devices != -1 and len(sub.devices) >= plan.max_devices:
-            self.bot.send_message(m.chat.id, f"Лимит устройств ({plan.device_text}) достигнут.",
-                                  reply_markup=self._keyboard_main())
-            return
-        now = time.time()
-        dev = {
-            "ip": "",
-            "user_agent": "manual",
-            "client_app": "manual",
-            "device_type": "Устройство",
-            "device_name": name,
-            "first_seen": now,
-            "last_seen": now,
-            "traffic": 0,
-            "blocked": False,
-            "client_uuid": _device_uuid(),
-            "client_email": "",
-        }
-        dev["client_email"] = _device_email(sub, dev)
-        sub.devices.append(dev)
-        storage.update_subscription(sub)
-        try:
-            XrayAPI.add_or_update_device_client(sub, dev)
-        except Exception:
-            logger.exception("Manual add device client sync error")
-        server = storage.get_host(sub.host_id) or storage.server()
-        sub_url = generate_subscription_url(sub, server, client_uuid=dev["client_uuid"]) if server else ""
-        text = (
-            f"Устройство <b>{_escape(name)}</b> добавлено.\n\n"
-            f"Добавьте эту ссылку в приложение:\n<code>{_escape(sub_url)}</code>"
-        )
-        self.bot.send_message(m.chat.id, text, reply_markup=self._keyboard_main())
-
-
 
     # ---- deposit ----
     def _deposit_menu(self, chat_id: int, message_id: int | None = None) -> None:
