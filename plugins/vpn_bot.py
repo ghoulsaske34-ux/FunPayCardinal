@@ -2924,8 +2924,7 @@ class DeviceAuthServer:
                 body = await request.json()
             except Exception:
                 raise HTTPException(status_code=400, detail="invalid json")
-            headers = dict(request.headers)
-            ok, detail = PlategaAPI.process_callback(headers, body)
+            ok, detail = PlategaAPI.process_callback(request.headers, body)
             if not ok:
                 raise HTTPException(status_code=401 if detail == "unauthorized" else 400, detail=detail)
             return {"ok": True}
