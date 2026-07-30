@@ -5286,8 +5286,8 @@ class UserBot:
             lines.append("<b>❹ Лимит устройств: -</b>")
         if bot_username:
             lines.append("")
-            lines.append(f"<b><a href='https://t.me/{bot_username}?start=renew'>➡︎ Продлить подписку</a></b>")
-            lines.append(f"<b><a href='https://t.me/{bot_username}?start=deposit'>➡︎ Пополнить баланс</a></b>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'><b>Продлить подписку</b></a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'><b>Пополнить баланс</b></a>")
         return "\n".join(lines)
 
     def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
