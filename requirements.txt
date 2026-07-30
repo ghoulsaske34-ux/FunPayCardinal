@@ -9,3 +9,4 @@ lxml>=5.3.0
 bcrypt>=4.2.0
 pysocks>=1.7.1
 pyrogram>=2.3.0
+phonenumbers>=8.13.0

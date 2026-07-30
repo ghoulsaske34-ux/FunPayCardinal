@@ -5,23 +5,33 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
+import uuid
+import zipfile
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+import requests
 import telebot
 from pyrogram import Client, filters
+from pyrogram.errors import BadRequest, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, BotCommand
+
+try:
+    import phonenumbers
+except Exception:
+    phonenumbers = None
 
 # --- метаданные плагина ---
 NAME = "Telegram Account Shop"
-VERSION = "2.0.0"
-DESCRIPTION = "Telegram-магазин номеров с автовыдачей SMS/кодов через Pyrogram"
+VERSION = "2.1.0"
+DESCRIPTION = "Telegram-магазин аккаунтов с автовыдачей SMS/кодов через Pyrogram"
 CREDITS = "@ghoulsaske34"
 UUID = "85d48499-79da-462e-af82-9feb2c399d7c"
 SETTINGS_PAGE = False
@@ -30,6 +40,7 @@ BIND_TO_DELETE = None
 # --- константы ---
 CB = "tgshop:"
 STORAGE_DIR = Path("storage/cache/tg_account_shop")
+SESSIONS_DIR = STORAGE_DIR / "sessions"
 DB_FILE = STORAGE_DIR / "shop.db"
 CONFIG_FILE = STORAGE_DIR / "config.json"
 logger = logging.getLogger("telegram_account_shop")
@@ -38,6 +49,9 @@ LISTEN_MINUTES = 5
 STATUS_AVAILABLE = "available"
 STATUS_SOLD = "sold"
 STATUS_LISTENING = "listening"
+
+DEFAULT_STARS_TO_RUB = 1.5
+DEFAULT_USDT_TO_RUB = 90.0
 
 # --- утилиты ---
 def _to_dec(value: Any) -> Decimal:
@@ -67,6 +81,111 @@ def _extract_codes(text: str | None) -> list[str]:
         return []
     return re.findall(r"\b\d{4,6}\b", text)
 
+_COUNTRY_FALLBACK = {
+    "1": "США/Канада",
+    "44": "Великобритания",
+    "49": "Германия",
+    "7": "Россия",
+    "77": "Казахстан",
+    "374": "Армения",
+    "375": "Беларусь",
+    "380": "Украина",
+    "371": "Латвия",
+    "370": "Литва",
+    "372": "Эстония",
+    "48": "Польша",
+    "33": "Франция",
+    "39": "Италия",
+    "34": "Испания",
+    "90": "Турция",
+    "81": "Япония",
+    "82": "Южная Корея",
+    "86": "Китай",
+    "91": "Индия",
+    "62": "Индонезия",
+    "60": "Малайзия",
+    "65": "Сингапур",
+    "66": "Таиланд",
+    "84": "Вьетнам",
+    "63": "Филиппины",
+    "55": "Бразилия",
+    "52": "Мексика",
+    "54": "Аргентина",
+    "971": "ОАЭ",
+    "966": "Саудовская Аравия",
+    "20": "Египет",
+    "27": "ЮАР",
+    "31": "Нидерланды",
+    "41": "Швейцария",
+    "43": "Австрия",
+    "46": "Швеция",
+    "47": "Норвегия",
+    "45": "Дания",
+    "358": "Финляндия",
+    "30": "Греция",
+    "36": "Венгрия",
+    "40": "Румыния",
+    "385": "Хорватия",
+    "386": "Словения",
+    "420": "Чехия",
+    "421": "Словакия",
+}
+
+def _detect_country(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    if not digits:
+        return "Другое"
+    if phonenumbers:
+        try:
+            parsed = phonenumbers.parse("+" + digits, None)
+            name = phonenumbers.region_code_for_country_code(parsed.country_code)
+            # get country name if available
+            from phonenumbers.geocoder import description_for_number
+            desc = description_for_number(parsed, "ru")
+            if desc:
+                return desc
+        except Exception:
+            pass
+    for l in (5, 4, 3, 2, 1):
+        prefix = digits[:l]
+        if prefix in _COUNTRY_FALLBACK:
+            return _COUNTRY_FALLBACK[prefix]
+    return "Другое"
+
+def _parse_proxy(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    text = text.strip()
+    if text.lower() in ("нет", "не", "no", "none", "-", "пропустить"):
+        return None
+    # support t.me/proxy?server=...&port=...&secret=...
+    m = re.search(r"[?&]server=([^&]+).*?port=(\d+).*?secret=([A-Za-z0-9+/=]+)", text)
+    if m:
+        return {"scheme": "mtproto", "hostname": m.group(1), "port": int(m.group(2)), "secret": m.group(3)}
+    # mtproto://server:port/secret
+    m = re.match(r"mtproto://([^:/]+):(\d+)(?:/([A-Za-z0-9+/=]+))?", text, re.I)
+    if m:
+        return {"scheme": "mtproto", "hostname": m.group(1), "port": int(m.group(2)), "secret": m.group(3) or ""}
+    # socks5://user:pass@host:port, http://host:port, etc.
+    m = re.match(r"(socks4|socks5|http|https)://(?:(?:([^:@]+):([^:@]+))@)?([^:/\s]+):(\d+)", text, re.I)
+    if m:
+        return {
+            "scheme": m.group(1).lower().replace("https", "http"),
+            "username": m.group(2) or None,
+            "password": m.group(3) or None,
+            "hostname": m.group(4),
+            "port": int(m.group(5)),
+        }
+    # host:port scheme
+    m = re.match(r"(socks4|socks5|http)\s+([^:/\s]+):(\d+)", text, re.I)
+    if m:
+        return {"scheme": m.group(1).lower(), "hostname": m.group(2), "port": int(m.group(3)), "username": None, "password": None}
+    # IPv4 host:port without scheme -> assume socks5
+    m = re.match(r"([^:/\s]+):(\d+)", text)
+    if m:
+        return {"scheme": "socks5", "hostname": m.group(1), "port": int(m.group(2)), "username": None, "password": None}
+    return None
+
 # --- хранилище ---
 class AccountStorage:
     def __init__(self) -> None:
@@ -83,7 +202,7 @@ class AccountStorage:
         with self._lock, self._conn() as conn:
             conn.executescript(
                 """
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
@@ -106,6 +225,7 @@ class AccountStorage:
                     category_id INTEGER NOT NULL,
                     phone TEXT NOT NULL,
                     session_string TEXT NOT NULL,
+                    proxy TEXT,
                     status TEXT DEFAULT 'available',
                     buyer_id INTEGER,
                     purchased_at REAL,
@@ -123,37 +243,34 @@ class AccountStorage:
                     created_at REAL,
                     delivered_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS deposits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    method TEXT,
+                    amount_rub REAL NOT NULL,
+                    foreign_amount TEXT,
+                    status TEXT DEFAULT 'pending',
+                    payload TEXT,
+                    external_id TEXT,
+                    created_at REAL,
+                    paid_at REAL
+                );
                 CREATE TABLE IF NOT EXISTS config (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 );
                 """
             )
-            # очистить старые таблицы если они имеют устаревшую схему
-            try:
-                conn.execute("SELECT data FROM accounts LIMIT 1")
-                conn.execute("DROP TABLE accounts")
-                conn.execute("""
-                    CREATE TABLE accounts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        category_id INTEGER NOT NULL,
-                        phone TEXT NOT NULL,
-                        session_string TEXT NOT NULL,
-                        status TEXT DEFAULT 'available',
-                        buyer_id INTEGER,
-                        purchased_at REAL,
-                        expires_at REAL,
-                        last_code TEXT,
-                        last_code_at REAL,
-                        created_at REAL
-                    )
-                """)
-            except Exception:
-                pass
+            # удалить устаревшие столбцы/таблицы при необходимости
+            for col, sql in (("proxy", "ALTER TABLE accounts ADD COLUMN proxy TEXT"),):
+                try:
+                    conn.execute(f"SELECT {col} FROM accounts LIMIT 1")
+                except Exception:
+                    conn.execute(sql)
             try:
                 conn.execute("SELECT funpay_product FROM categories LIMIT 1")
                 conn.execute("DROP TABLE categories")
-                conn.execute("""
+                conn.executescript("""
                     CREATE TABLE categories (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         name TEXT NOT NULL UNIQUE,
@@ -162,7 +279,7 @@ class AccountStorage:
                         is_active INTEGER DEFAULT 1,
                         sort_order INTEGER DEFAULT 0,
                         created_at REAL
-                    )
+                    );
                 """)
             except Exception:
                 pass
@@ -269,18 +386,26 @@ class AccountStorage:
                 conn.execute("DELETE FROM categories WHERE id=?", (category_id,))
 
     # accounts
-    def add_account(self, category_id: int, phone: str, session_string: str) -> int:
+    def add_account(self, category_id: int, phone: str, session_string: str, proxy: dict[str, Any] | None = None) -> int:
+        proxy_json = json.dumps(proxy, ensure_ascii=False) if proxy else None
         with self._lock, self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO accounts(category_id, phone, session_string, status, created_at) VALUES(?, ?, ?, ?, ?)",
-                (category_id, phone, session_string, STATUS_AVAILABLE, _now())
+                "INSERT INTO accounts(category_id, phone, session_string, proxy, status, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (category_id, phone, session_string, proxy_json, STATUS_AVAILABLE, _now())
             )
             return cur.lastrowid
 
     def get_account(self, account_id: int) -> dict[str, Any] | None:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
-        return dict(row) if row else None
+        if row:
+            d = dict(row)
+            try:
+                d["proxy"] = json.loads(d["proxy"]) if d.get("proxy") else None
+            except Exception:
+                d["proxy"] = None
+            return d
+        return None
 
     def get_available_account(self, category_id: int) -> dict[str, Any] | None:
         with self._lock, self._conn() as conn:
@@ -354,6 +479,41 @@ class AccountStorage:
                 rows = conn.execute("SELECT * FROM purchases ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    # deposits
+    def add_deposit(self, user_id: int, method: str, amount_rub: float, payload: str | None = None,
+                    external_id: str | None = None, foreign_amount: str | None = None) -> int:
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO deposits(user_id, method, amount_rub, payload, external_id, foreign_amount, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (user_id, method, float(amount_rub), payload, external_id, foreign_amount, _now())
+            )
+            return cur.lastrowid
+
+    def get_deposit_by_payload(self, payload: str) -> dict[str, Any] | None:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM deposits WHERE payload=?", (payload,)).fetchone()
+        return dict(row) if row else None
+
+    def get_deposit_by_external(self, external_id: str) -> dict[str, Any] | None:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM deposits WHERE external_id=?", (external_id,)).fetchone()
+        return dict(row) if row else None
+
+    def confirm_deposit(self, deposit_id: int) -> None:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM deposits WHERE id=?", (deposit_id,)).fetchone()
+            if row and dict(row).get("status") != "paid":
+                conn.execute("UPDATE deposits SET status='paid', paid_at=? WHERE id=?", (_now(), deposit_id))
+                conn.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (float(dict(row)["amount_rub"]), dict(row)["user_id"]))
+
+    def get_user_deposits(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (user_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # stats
     def get_stats(self) -> dict[str, Any]:
         with self._lock, self._conn() as conn:
@@ -364,12 +524,14 @@ class AccountStorage:
             ).fetchone()[0]
             sold = conn.execute("SELECT COUNT(*) FROM accounts WHERE status!=?", (STATUS_AVAILABLE,)).fetchone()[0]
             revenue = conn.execute("SELECT COALESCE(SUM(price), 0) FROM purchases").fetchone()[0]
+            deposits = conn.execute("SELECT COALESCE(SUM(amount_rub), 0) FROM deposits WHERE status='paid'").fetchone()[0]
         return {
             "users": total_users,
             "accounts": total_accounts,
             "available": available,
             "sold": sold,
             "revenue": float(revenue),
+            "deposits": float(deposits),
         }
 
 _storage: AccountStorage | None = None
@@ -386,6 +548,22 @@ def _pyrogram_config() -> tuple[int, str]:
     if not api_id or not api_hash:
         return 0, ""
     return int(api_id), str(api_hash)
+
+def _proxy_for_pyrogram(proxy: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not proxy:
+        return None
+    scheme = (proxy.get("scheme") or "").upper()
+    if scheme == "MTProto":
+        logger.warning("MTProto-прокси не поддерживается Pyrogram, подключение будет без прокси")
+        return None
+    pyro_proxy = dict(proxy)
+    # pyrogram ожидает scheme в верхнем регистре
+    pyro_proxy["scheme"] = scheme
+    if pyro_proxy.get("username") is None:
+        pyro_proxy.pop("username", None)
+    if pyro_proxy.get("password") is None:
+        pyro_proxy.pop("password", None)
+    return pyro_proxy
 
 def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> Any:
     def handler(client: Client, message: Any) -> None:
@@ -446,6 +624,7 @@ def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
             api_id=api_id,
             api_hash=api_hash,
             session_string=account["session_string"],
+            proxy=_proxy_for_pyrogram(account.get("proxy")),
             in_memory=True,
             no_updates=False,
             skip_updates=True,
@@ -497,6 +676,7 @@ def get_latest_code(account_id: int) -> str | None:
             api_id=api_id,
             api_hash=api_hash,
             session_string=account["session_string"],
+            proxy=_proxy_for_pyrogram(account.get("proxy")),
             in_memory=True,
             no_updates=True,
         )
@@ -548,11 +728,12 @@ class AccountShopBot:
         self._setup_password: str | None = None
         self._ensure_setup_password()
         self._setup_handlers()
+        self._start_crypto_polling()
         try:
             self.bot.set_my_commands([
-                telebot.types.BotCommand("start", "Главное меню"),
-                telebot.types.BotCommand("balance", "Мой баланс"),
-                telebot.types.BotCommand("support", "Поддержка"),
+                BotCommand("start", "Главное меню"),
+                BotCommand("profile", "Мой профиль"),
+                BotCommand("support", "Поддержка"),
             ])
         except Exception:
             pass
@@ -597,30 +778,32 @@ class AccountShopBot:
 
     # keyboards
     def _main_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
-        kb = InlineKeyboardMarkup(row_width=2)
+        kb = InlineKeyboardMarkup(row_width=1)
         if self._is_admin(user_id):
             kb.add(
-                InlineKeyboardButton("🛒 Купить номер", callback_data=f"{CB}buy"),
-                InlineKeyboardButton("📱 Мои номера", callback_data=f"{CB}my_numbers"),
-                InlineKeyboardButton("💰 Баланс", callback_data=f"{CB}balance"),
-                InlineKeyboardButton("🛠 Админка", callback_data=f"{CB}admin"),
+                InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"),
+                InlineKeyboardButton("📱 Мои покупки", callback_data=f"{CB}my_purchases"),
+                InlineKeyboardButton("👤 Профиль", callback_data=f"{CB}profile"),
+                InlineKeyboardButton("🔴 Поддержка", callback_data=f"{CB}support"),
+                InlineKeyboardButton("🛠 Админ-меню", callback_data=f"{CB}admin"),
             )
         else:
             kb.add(
-                InlineKeyboardButton("🛒 Купить номер", callback_data=f"{CB}buy"),
-                InlineKeyboardButton("📱 Мои номера", callback_data=f"{CB}my_numbers"),
-                InlineKeyboardButton("💰 Баланс", callback_data=f"{CB}balance"),
-                InlineKeyboardButton("🆘 Поддержка", callback_data=f"{CB}support"),
+                InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"),
+                InlineKeyboardButton("📱 Мои покупки", callback_data=f"{CB}my_purchases"),
+                InlineKeyboardButton("👤 Профиль", callback_data=f"{CB}profile"),
+                InlineKeyboardButton("🔴 Поддержка", callback_data=f"{CB}support"),
             )
         return kb
 
     def _admin_keyboard(self) -> InlineKeyboardMarkup:
-        kb = InlineKeyboardMarkup(row_width=2)
+        kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
-            InlineKeyboardButton("➕ Добавить аккаунты", callback_data=f"{CB}admin_add"),
+            InlineKeyboardButton("➕ Добавить аккаунт", callback_data=f"{CB}admin_add"),
             InlineKeyboardButton("📋 Список аккаунтов", callback_data=f"{CB}admin_accounts"),
-            InlineKeyboardButton("🗂 Категории/цены", callback_data=f"{CB}admin_categories"),
-            InlineKeyboardButton("💳 Пополнить баланс", callback_data=f"{CB}admin_topup"),
+            InlineKeyboardButton("🗂 Категории и цены", callback_data=f"{CB}admin_categories"),
+            InlineKeyboardButton("✅ Подтвердить платёж", callback_data=f"{CB}admin_confirm_payment"),
+            InlineKeyboardButton("💳 Ручное пополнение", callback_data=f"{CB}admin_topup"),
             InlineKeyboardButton("📊 Статистика", callback_data=f"{CB}admin_stats"),
             InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"),
         )
@@ -646,6 +829,10 @@ class AccountShopBot:
             except Exception:
                 logger.exception("[TelegramAccountShop] Ошибка /start")
 
+        @self.bot.message_handler(commands=["profile"])
+        def on_profile(m: Message) -> None:
+            self._show_profile(m.from_user.id, m.chat.id)
+
         @self.bot.message_handler(commands=["setup"])
         def on_setup(m: Message) -> None:
             text = m.text or ""
@@ -660,86 +847,956 @@ class AccountShopBot:
         def on_state(m: Message) -> None:
             state = self.user_states.get(m.from_user.id, {})
             handler = state.get("state")
-            if handler == "admin_add":
-                self._handle_admin_add(m)
-            elif handler == "admin_price":
-                self._handle_admin_price(m)
-            elif handler == "admin_topup":
-                self._handle_admin_topup(m)
-            elif handler == "support":
-                self._handle_support(m)
+            dispatch = {
+                "admin_add": self._handle_admin_add,
+                "admin_add_phone": self._handle_admin_add_phone,
+                "admin_add_session_text": self._handle_admin_add_session_text,
+                "admin_add_custom": self._handle_admin_add_custom,
+                "admin_price": self._handle_admin_price,
+                "admin_topup": self._handle_admin_topup,
+                "admin_confirm_payment": self._handle_admin_confirm_payment,
+                "admin_create_category": self._handle_admin_create_category,
+                "support": self._handle_support,
+                "deposit_amount": self._handle_deposit_amount,
+                "deposit_crypto_asset": self._handle_deposit_crypto_asset,
+                "deposit_sbp": self._handle_deposit_sbp,
+                "deposit_confirm": self._handle_deposit_confirm,
+            }
+            fn = dispatch.get(handler)
+            if fn:
+                try:
+                    fn(m)
+                except Exception:
+                    logger.exception("[TelegramAccountShop] Ошибка state handler %s", handler)
+                    self.bot.send_message(m.chat.id, "❌ Произошла ошибка. Попробуйте снова.", reply_markup=self._main_keyboard(m.from_user.id))
+                    self.user_states.pop(m.from_user.id, None)
             else:
                 self.user_states.pop(m.from_user.id, None)
 
+        @self.bot.message_handler(content_types=["document"])
+        def on_document(m: Message) -> None:
+            state = self.user_states.get(m.from_user.id, {})
+            if state.get("state") == "admin_upload_session":
+                self._handle_upload_session(m)
+            else:
+                self.bot.send_message(m.chat.id, "📎 Файл не ожидался. Выберите действие в меню.", reply_markup=self._main_keyboard(m.from_user.id))
+
         @self.bot.callback_query_handler(func=lambda c: c.data.startswith(CB))
         def on_callback(c: CallbackQuery) -> None:
-            self._handle_callback(c)
+            try:
+                self._handle_callback(c)
+            except Exception:
+                logger.exception("[TelegramAccountShop] Ошибка callback")
+                try:
+                    self.bot.answer_callback_query(c.id, "Ошибка обработки")
+                except Exception:
+                    pass
 
-    # admin flows
-    def _handle_admin_add(self, m: Message) -> None:
-        state = self.user_states.get(m.from_user.id, {})
-        step = state.get("step")
+        @self.bot.pre_checkout_query_handler(func=lambda q: True)
+        def on_pre_checkout(q) -> None:
+            try:
+                self.bot.answer_pre_checkout_query(q.id, ok=True)
+            except Exception:
+                logger.exception("pre_checkout error")
 
-        if step == "category":
-            default_cat = (m.text or "").strip()
-            self.user_states[m.from_user.id] = {"state": "admin_add", "step": "accounts", "default_cat": default_cat}
-            self.bot.send_message(
-                m.chat.id,
-                "Введите аккаунты: по одному на строке.\n"
+        @self.bot.message_handler(content_types=["successful_payment"])
+        def on_successful_payment(m: Message) -> None:
+            try:
+                self._handle_successful_payment(m)
+            except Exception:
+                logger.exception("successful_payment error")
+
+    def _handle_support(self, m: Message) -> None:
+        self.user_states.pop(m.from_user.id, None)
+        self._notify_admins(f"🆘 Поддержка от @{m.from_user.username or m.from_user.id} (ID {m.from_user.id}):\n{m.text}")
+        self.bot.send_message(m.chat.id, "✅ Сообщение отправлено администратору.", reply_markup=self._main_keyboard(m.from_user.id))
+
+    # callback dispatcher
+    def _handle_callback(self, c: CallbackQuery) -> None:
+        data = c.data[len(CB):]
+        parts = data.split(":", 3)
+        action = parts[0]
+
+        if action == "main":
+            user = self.storage.get_user(c.from_user.id)
+            text = (
+                f"👋 Привет, {c.from_user.first_name}!\n"
+                f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
+                "Выберите действие:"
+            )
+            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._main_keyboard(c.from_user.id))
+
+        elif action == "buy":
+            self._show_categories(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "category":
+            self._show_category(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "purchase":
+            self._purchase(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "my_purchases":
+            self._show_my_purchases(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "get_code":
+            self._get_code(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "listen":
+            self._listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "stop_listen":
+            self._stop_listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+
+        elif action == "profile":
+            self._show_profile(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "support":
+            self.user_states[c.from_user.id] = {"state": "support"}
+            self.bot.edit_message_text("🆘 Опишите проблему. Мы ответим в ближайшее время.", c.message.chat.id, c.message.message_id)
+
+        elif action == "deposit":
+            self._show_deposit_menu(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "deposit_stars":
+            self._start_deposit_stars(c)
+        elif action == "deposit_crypto":
+            self._start_deposit_crypto(c)
+        elif action == "deposit_sbp":
+            self._start_deposit_sbp(c)
+        elif action == "deposit_confirm":
+            self._handle_deposit_confirm(c)
+        elif action == "noop":
+            self.bot.answer_callback_query(c.id, "Отправьте ответным сообщением")
+
+        elif action == "admin":
+            if not self._is_admin(c.from_user.id):
+                self.bot.answer_callback_query(c.id, "Нет доступа")
+                return
+            self.bot.edit_message_text("🛠 Админ-меню", c.message.chat.id, c.message.message_id, reply_markup=self._admin_keyboard())
+        elif action == "admin_add":
+            self._show_admin_add_menu(c.message.chat.id, c.message.message_id)
+        elif action == "admin_add_phone":
+            self.user_states[c.from_user.id] = {"state": "admin_add_phone", "step": "phone"}
+            self.bot.edit_message_text(
+                "📞 Введите номер телефона аккаунта (международный формат, например +79001234567):",
+                c.message.chat.id, c.message.message_id
+            )
+        elif action == "admin_add_session_text":
+            self.user_states[c.from_user.id] = {"state": "admin_add_session_text", "step": "input"}
+            self.bot.edit_message_text(
+                "📋 Введите аккаунты по одному на строке.\n"
                 "Формат: <code>phone|session_string</code>\n"
                 "Или с категорией: <code>Категория: phone|session_string</code>\n"
-                "Категории создадутся/удалятся автоматически.",
-                parse_mode="HTML",
+                "Категории создадутся автоматически по коду страны.",
+                c.message.chat.id, c.message.message_id, parse_mode="HTML"
+            )
+        elif action == "admin_upload_session":
+            self.user_states[c.from_user.id] = {"state": "admin_upload_session", "step": "file"}
+            self.bot.edit_message_text(
+                "📎 Отправьте .session файл или ZIP архив с .session файлами.",
+                c.message.chat.id, c.message.message_id
+            )
+        elif action == "admin_add_custom":
+            self.user_states[c.from_user.id] = {"state": "admin_add_custom", "step": "category"}
+            self.bot.edit_message_text(
+                "🗂 Введите название существующей или новой категории:",
+                c.message.chat.id, c.message.message_id
+            )
+        elif action == "admin_accounts":
+            self._admin_accounts(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "admin_accounts_cat":
+            self._admin_accounts_cat(int(parts[1]), c.message.chat.id, c.message.message_id)
+        elif action == "admin_delete_acc":
+            self._admin_delete_account(int(parts[1]), c.message.chat.id, c.message.message_id)
+        elif action == "admin_categories":
+            self._admin_categories(c.message.chat.id, c.message.message_id)
+        elif action == "admin_set_price":
+            self.user_states[c.from_user.id] = {"state": "admin_price", "category_id": int(parts[1])}
+            self.bot.edit_message_text("💰 Введите новую цену:", c.message.chat.id, c.message.message_id)
+        elif action == "admin_delete_cat":
+            self._admin_delete_category(int(parts[1]), c.message.chat.id, c.message.message_id)
+        elif action == "admin_create_category":
+            self.user_states[c.from_user.id] = {"state": "admin_create_category", "step": "name"}
+            self.bot.edit_message_text("🆕 Введите название новой категории:", c.message.chat.id, c.message.message_id)
+        elif action == "admin_add_to_cat":
+            self.user_states[c.from_user.id] = {"state": "admin_add_custom", "step": "account", "category_id": int(parts[1])}
+            self.bot.edit_message_text(
+                "📋 Введите аккаунт: <code>phone|session_string</code>\n"
+                "Или несколько — по одному на строке.",
+                c.message.chat.id, c.message.message_id, parse_mode="HTML"
+            )
+        elif action == "admin_topup":
+            self.user_states[c.from_user.id] = {"state": "admin_topup", "step": "user_id"}
+            self.bot.edit_message_text("Введите ID пользователя для пополнения:", c.message.chat.id, c.message.message_id)
+        elif action == "admin_confirm_payment":
+            self.user_states[c.from_user.id] = {"state": "admin_confirm_payment", "step": "id"}
+            self.bot.edit_message_text("Введите ID депозита для подтверждения:", c.message.chat.id, c.message.message_id)
+        elif action == "admin_stats":
+            stats = self.storage.get_stats()
+            text = (
+                f"📊 Статистика\n"
+                f"👥 Пользователей: {stats['users']}\n"
+                f"📱 Аккаунтов: {stats['accounts']} (свободно: {stats['available']}, продано: {stats['sold']})\n"
+                f"💸 Продажи: {_money_str(stats['revenue'])}₽\n"
+                f"💰 Пополнения: {_money_str(stats['deposits'])}₽"
+            )
+            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._admin_keyboard())
+
+    # user flows
+    def _show_profile(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        user = self.storage.get_user(user_id)
+        purchases = self.storage.get_purchases(user_id)
+        deposits = self.storage.get_user_deposits(user_id)
+        text = (
+            f"👤 Профиль\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n"
+            f"💸 Всего потрачено: {_money_str(user.get('total_spent', 0))}₽\n"
+            f"🛒 Покупок: {len(purchases)}\n"
+            f"💳 Пополнений: {len([d for d in deposits if d.get('status') == 'paid'])}"
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data=f"{CB}deposit"))
+        kb.add(InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _show_deposit_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        text = "💳 Выберите способ пополнения баланса:"
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("⭐ Telegram Stars", callback_data=f"{CB}deposit_stars"),
+            InlineKeyboardButton("💎 Crypto Bot", callback_data=f"{CB}deposit_crypto"),
+            InlineKeyboardButton("🏦 СБП", callback_data=f"{CB}deposit_sbp"),
+            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}profile"),
+        )
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _show_categories(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        categories = self.storage.get_categories()
+        user = self.storage.get_user(user_id)
+        if not categories:
+            text = "😔 Пока нет доступных аккаунтов. Зайдите позже."
+            kb = self._back_keyboard(f"{CB}main")
+        else:
+            text = f"🗂 Выберите страну/категорию:\n💰 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
+            kb = InlineKeyboardMarkup(row_width=1)
+            for cat in categories:
+                available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
+                kb.add(InlineKeyboardButton(
+                    f"{cat['name']} — {_money_str(cat['price'])}₽ ({available} шт)",
+                    callback_data=f"{CB}category:{cat['id']}"
+                ))
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _show_category(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+        cat = self.storage.get_category(category_id)
+        if not cat:
+            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            return
+        available = len(self.storage.get_accounts(category_id, STATUS_AVAILABLE))
+        user = self.storage.get_user(user_id)
+        text = (
+            f"📱 {cat['name']}\n"
+            f"💰 Цена: {_money_str(cat['price'])}₽\n"
+            f"📦 Доступно: {available} шт\n"
+            f"💳 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}purchase:{category_id}"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}buy"))
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+
+    def _purchase(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+        cat = self.storage.get_category(category_id)
+        if not cat:
+            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            return
+        user = self.storage.get_user(user_id)
+        balance = _to_dec(user.get("balance", 0))
+        price = _to_dec(cat["price"])
+        if balance < price:
+            self.bot.edit_message_text(
+                f"❌ Недостаточно средств.\n💰 Нужно: {_money_str(price)}₽",
+                chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy")
+            )
+            return
+        account = self.storage.get_available_account(category_id)
+        if not account:
+            self.bot.edit_message_text("😔 В этой категории закончились аккаунты.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            return
+
+        self.storage.update_balance(user_id, -price)
+        self.storage.add_spent(user_id, price)
+        self.storage.update_account_status(account["id"], STATUS_SOLD, user_id, _now())
+        self.storage.add_purchase(user_id, account["id"], float(price))
+
+        text = (
+            f"✅ Вы купили аккаунт!\n\n"
+            f"📞 Номер: <code>{account['phone']}</code>\n"
+            f"🆔 ID: <code>{account['id']}</code>\n\n"
+            "Используйте кнопки ниже для получения кодов."
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account['id']}"),
+            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account['id']}"),
+            InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
+        )
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+
+    def _show_my_purchases(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        accounts = self.storage.get_user_accounts(user_id)
+        if not accounts:
+            text = "📭 У вас пока нет купленных аккаунтов."
+            kb = self._back_keyboard(f"{CB}main")
+        else:
+            text = "📱 Ваши покупки:\n\n"
+            for acc in accounts:
+                text += f"📞 <code>{acc['phone']}</code> — {acc['status']}"
+                if acc.get("last_code"):
+                    text += f"\n   Последний код: <code>{acc['last_code']}</code> ({_fmt_ts(acc.get('last_code_at'))})"
+                text += "\n\n"
+            kb = InlineKeyboardMarkup(row_width=1)
+            for acc in accounts:
+                kb.add(
+                    InlineKeyboardButton(f"🔄 {acc['phone']}", callback_data=f"{CB}get_code:{acc['id']}"),
+                )
+                kb.add(
+                    InlineKeyboardButton(f"👂 {acc['phone']}", callback_data=f"{CB}listen:{acc['id']}"),
+                )
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _get_code(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+        account = self.storage.get_account(account_id)
+        if not account or account.get("buyer_id") != user_id:
+            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+            return
+        self.bot.edit_message_text("⏳ Получаю код...", chat_id, message_id)
+        code = get_latest_code(account_id)
+        if code:
+            text = f"📞 Номер: <code>{account['phone']}</code>\n🔢 Код: <code>{code}</code>"
+        else:
+            text = f"📞 Номер: <code>{account['phone']}</code>\n😔 Код пока не пришёл. Попробуйте позже или включите прослушку."
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB}get_code:{account_id}"),
+            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account_id}"),
+            InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
+        )
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+
+    def _listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+        account = self.storage.get_account(account_id)
+        if not account or account.get("buyer_id") != user_id:
+            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+            return
+        self.bot.edit_message_text("⏳ Запускаю прослушку...", chat_id, message_id)
+        result = start_listener(account_id, user_id, self.bot)
+        if result == "no_api_config":
+            text = "❌ API ID/API Hash не настроены. Обратитесь к администратору."
+        elif result == "ok":
+            text = (
+                f"👂 Прослушка аккаунта <code>{account['phone']}</code> запущена на {LISTEN_MINUTES} мин.\n"
+                "Все коды будут приходить сюда автоматически."
+            )
+        else:
+            text = "❌ Не удалось запустить прослушку."
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("🛑 Остановить", callback_data=f"{CB}stop_listen:{account_id}"))
+        kb.add(InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"))
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+
+    def _stop_listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+        account = self.storage.get_account(account_id)
+        if not account or account.get("buyer_id") != user_id:
+            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+            return
+        stop_listener(account_id)
+        self.bot.edit_message_text(
+            f"🛑 Прослушка аккаунта <code>{account['phone']}</code> остановлена.",
+            chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}my_purchases")
+        )
+
+    # deposit flows
+    def _start_deposit_stars(self, c: CallbackQuery) -> None:
+        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "stars", "next": "deposit_stars"}
+        self.bot.edit_message_text(
+            "⭐ Введите сумму в рублях (например 100):",
+            c.message.chat.id, c.message.message_id,
+            reply_markup=self._back_keyboard(f"{CB}deposit"),
+        )
+
+    def _start_deposit_crypto(self, c: CallbackQuery) -> None:
+        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "crypto", "next": "deposit_crypto"}
+        self.bot.edit_message_text(
+            "💎 Введите сумму в рублях (например 500):",
+            c.message.chat.id, c.message.message_id,
+            reply_markup=self._back_keyboard(f"{CB}deposit"),
+        )
+
+    def _start_deposit_sbp(self, c: CallbackQuery) -> None:
+        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "sbp", "next": "deposit_sbp"}
+        self.bot.edit_message_text(
+            "🏦 Введите сумму в рублях (например 1000):",
+            c.message.chat.id, c.message.message_id,
+            reply_markup=self._back_keyboard(f"{CB}deposit"),
+        )
+
+    def _handle_deposit_amount(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        try:
+            amount = _to_dec(m.text)
+        except Exception:
+            self.bot.send_message(m.chat.id, "❌ Введите число.")
+            return
+        state["amount_rub"] = float(amount)
+        self.user_states[m.from_user.id] = state
+        next_step = state.get("next")
+        if next_step == "deposit_stars":
+            self._send_stars_invoice(m.chat.id, m.from_user.id, float(amount))
+        elif next_step == "deposit_crypto":
+            self.user_states[m.from_user.id]["step"] = "deposit_crypto_asset"
+            self.bot.send_message(
+                m.chat.id,
+                "💎 Введите код актива (например USDT, BTC, TON):",
+                reply_markup=self._back_keyboard(f"{CB}deposit"),
+            )
+        elif next_step == "deposit_sbp":
+            self.user_states[m.from_user.id]["step"] = "deposit_sbp"
+            self._send_sbp_instructions(m.chat.id, m.from_user.id, float(amount))
+
+    def _send_stars_invoice(self, chat_id: int, user_id: int, amount_rub: float) -> None:
+        rate = self.storage.get_config("stars_to_rub") or DEFAULT_STARS_TO_RUB
+        stars_amount = max(1, int(amount_rub / float(rate)))
+        title = f"Пополнение баланса на {amount_rub}₽"
+        description = f"После оплаты {_money_str(amount_rub)}₽ будут зачислены на ваш баланс."
+        payload = f"stars_{user_id}_{uuid.uuid4().hex[:8]}"
+        self.storage.add_deposit(user_id, "stars", amount_rub, payload=payload)
+        prices = [LabeledPrice(label="XTR", amount=stars_amount)]
+        self.bot.send_invoice(
+            chat_id,
+            title,
+            description,
+            payload,
+            "XTR",
+            prices,
+            start_parameter=payload,
+        )
+        self.user_states.pop(user_id, None)
+
+    def _handle_successful_payment(self, m: Message) -> None:
+        payload = m.successful_payment.invoice_payload
+        deposit = self.storage.get_deposit_by_payload(payload)
+        if deposit:
+            self.storage.confirm_deposit(deposit["id"])
+            self.bot.send_message(
+                m.chat.id,
+                f"✅ Оплата получена. Баланс пополнен на {_money_str(deposit['amount_rub'])}₽.",
+                reply_markup=self._main_keyboard(m.from_user.id),
+            )
+            self._notify_admins(
+                f"💰 Пополнение Stars от {m.from_user.id} на {_money_str(deposit['amount_rub'])}₽"
+            )
+        else:
+            self.bot.send_message(m.chat.id, "✅ Оплата получена. Обратитесь в поддержку.")
+
+    def _handle_deposit_crypto_asset(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        asset = (m.text or "").strip().upper()
+        if asset not in ("USDT", "BTC", "TON", "ETH", "LTC"):
+            asset = "USDT"
+        amount_rub = state.get("amount_rub", 0)
+        rate = self.storage.get_config("usdt_to_rub") or DEFAULT_USDT_TO_RUB
+        foreign = round(amount_rub / float(rate), 6) if asset == "USDT" else None
+        payload = f"crypto_{m.from_user.id}_{uuid.uuid4().hex[:8]}"
+        description = f"Пополнение на {amount_rub}₽"
+        if not self.storage.get_config("crypto_bot_token"):
+            self.bot.send_message(
+                m.chat.id,
+                "❌ Crypto Bot не настроен. Обратитесь к администратору.",
+                reply_markup=self._back_keyboard(f"{CB}deposit"),
+            )
+            self.user_states.pop(m.from_user.id, None)
+            return
+        invoice_id = self._create_crypto_invoice(amount_rub, asset, description, payload)
+        if not invoice_id:
+            self.bot.send_message(m.chat.id, "❌ Не удалось создать счёт в Crypto Bot.", reply_markup=self._back_keyboard(f"{CB}deposit"))
+            self.user_states.pop(m.from_user.id, None)
+            return
+        self.storage.add_deposit(m.from_user.id, "crypto", amount_rub, payload=payload, external_id=str(invoice_id), foreign_amount=f"{foreign} {asset}")
+        text = (
+            f"💎 Счёт в Crypto Bot создан.\n"
+            f"Сумма: {amount_rub}₽ (~{foreign} {asset})\n"
+            f"Перейдите по ссылке и оплатите: https://t.me/{self.storage.get_config('crypto_bot_name') or 'CryptoBot'}?start={invoice_id}"
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"))
+        self.bot.send_message(m.chat.id, text, reply_markup=kb)
+        self.user_states.pop(m.from_user.id, None)
+
+    def _create_crypto_invoice(self, amount_rub: float, asset: str, description: str, payload: str) -> str | None:
+        token = self.storage.get_config("crypto_bot_token")
+        if not token:
+            return None
+        rate = self.storage.get_config("usdt_to_rub") or DEFAULT_USDT_TO_RUB
+        amount = round(amount_rub / float(rate), 6)
+        try:
+            resp = requests.post(
+                "https://pay.crypt.bot/api/createInvoice",
+                headers={"Crypto-Pay-API-Token": token},
+                json={"asset": asset, "amount": str(amount), "description": description, "payload": payload, "paid_btn_name": "openBot", "paid_btn_url": f"https://t.me/{self.storage.get_config('bot_username') or 'shop'}"},
+                timeout=20,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                return data["result"]["invoice_id"]
+            logger.error("CryptoBot createInvoice error: %s", data)
+        except Exception:
+            logger.exception("CryptoBot createInvoice")
+        return None
+
+    def _crypto_api_call(self, method: str, token: str, params: dict | None = None) -> dict | None:
+        try:
+            url = f"https://pay.crypt.bot/api/{method}"
+            resp = requests.get(url, headers={"Crypto-Pay-API-Token": token}, params=params or {}, timeout=20)
+            return resp.json()
+        except Exception:
+            logger.exception("CryptoBot api call")
+            return None
+
+    def _start_crypto_polling(self) -> None:
+        def poll() -> None:
+            while True:
+                try:
+                    token = self.storage.get_config("crypto_bot_token") if self.storage else None
+                    if token:
+                        self._poll_crypto_invoices(token)
+                except Exception:
+                    logger.exception("crypto polling")
+                time.sleep(30)
+        threading.Thread(target=poll, daemon=True, name="CryptoShopPoll").start()
+
+    def _poll_crypto_invoices(self, token: str) -> None:
+        data = self._crypto_api_call("getInvoices", token, {"status": "paid", "limit": 100})
+        if not data or not data.get("ok"):
+            return
+        for inv in data.get("result", {}).get("items", []):
+            ext = str(inv.get("invoice_id"))
+            payload = inv.get("payload")
+            deposit = self.storage.get_deposit_by_external(ext) or self.storage.get_deposit_by_payload(payload)
+            if deposit and deposit.get("status") != "paid":
+                self.storage.confirm_deposit(deposit["id"])
+                try:
+                    self.bot.send_message(deposit["user_id"], f"💰 Баланс пополнен на {_money_str(deposit['amount_rub'])}₽")
+                except Exception:
+                    pass
+                self._notify_admins(f"💎 Crypto Bot пополнение от {deposit['user_id']} на {_money_str(deposit['amount_rub'])}₽")
+
+    def _send_sbp_instructions(self, chat_id: int, user_id: int, amount_rub: float) -> None:
+        requisites = self.storage.get_config("sbp_requisites") or "Указать реквизиты в админ-меню"
+        payload = f"sbp_{user_id}_{uuid.uuid4().hex[:8]}"
+        self.storage.add_deposit(user_id, "sbp", amount_rub, payload=payload)
+        text = (
+            f"🏦 Переведите {_money_str(amount_rub)}₽ по СБП:\n"
+            f"<code>{requisites}</code>\n\n"
+            f"В комментарии укажите: <code>{payload}</code>\n"
+            f"После оплаты нажмите «Я оплатил» и ожидайте подтверждения администратора."
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("✅ Я оплатил", callback_data=f"{CB}deposit_confirm:{payload}"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"))
+        self.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+    def _handle_deposit_sbp(self, m: Message) -> None:
+        # handled by confirm callback; messages here ignored
+        self.bot.send_message(m.chat.id, "Нажмите «✅ Я оплатил» после перевода.", reply_markup=self._back_keyboard(f"{CB}deposit"))
+
+    def _handle_deposit_confirm(self, c: CallbackQuery) -> None:
+        data = c.data[len(CB):]
+        parts = data.split(":", 1)
+        payload = parts[1] if len(parts) > 1 else ""
+        deposit = self.storage.get_deposit_by_payload(payload)
+        if not deposit:
+            self.bot.answer_callback_query(c.id, "Счёт не найден")
+            return
+        self.bot.send_message(
+            c.message.chat.id,
+            "⏳ Ожидайте подтверждения платежа администратором.",
+            reply_markup=self._back_keyboard(f"{CB}deposit"),
+        )
+        self._notify_admins(
+            f"🏦 Новая заявка СБП\n"
+            f"Пользователь: {c.from_user.id}\n"
+            f"Сумма: {_money_str(deposit['amount_rub'])}₽\n"
+            f"Payload: <code>{payload}</code>\n"
+            f"Для подтверждения: <code>/confirm {deposit['id']}</code>"
+        )
+
+    # admin flows
+    def _show_admin_add_menu(self, chat_id: int, message_id: int | None = None) -> None:
+        text = "➕ Выберите способ добавления аккаунта:"
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("📞 По номеру + код", callback_data=f"{CB}admin_add_phone"),
+            InlineKeyboardButton("📋 Вставить session_string", callback_data=f"{CB}admin_add_session_text"),
+            InlineKeyboardButton("📎 Загрузить .session / ZIP", callback_data=f"{CB}admin_upload_session"),
+            InlineKeyboardButton("🗂 В кастомную категорию", callback_data=f"{CB}admin_add_custom"),
+            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}admin"),
+        )
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _handle_admin_add(self, m: Message) -> None:
+        # legacy / fallback handler; now individual states
+        self.user_states.pop(m.from_user.id, None)
+        self.bot.send_message(m.chat.id, "Используйте админ-меню для добавления аккаунтов.", reply_markup=self._admin_keyboard())
+
+    def _handle_admin_add_session_text(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        step = state.get("step")
+        if step == "price":
+            self._save_price_then_accounts(m.from_user.id, m.chat.id, m.text or "0", state.get("created_categories", []), state.get("lines", []))
+            return
+
+        lines = (m.text or "").strip().splitlines()
+        added = 0
+        errors: list[str] = []
+        created_categories: list[str] = []
+        pending_lines: list[tuple[str, str, str]] = []  # cat, phone, session
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            cat: str | None = None
+            data = line
+            if ":" in line:
+                maybe_cat, maybe_data = line.split(":", 1)
+                maybe_cat = maybe_cat.strip()
+                maybe_data = maybe_data.strip()
+                if maybe_cat and "|" in maybe_data:
+                    cat = maybe_cat
+                    data = maybe_data
+            if "|" not in data:
+                errors.append(f"Пропущено (нет |): {line}")
+                continue
+            phone, session = data.split("|", 1)
+            phone = phone.strip()
+            session = session.strip()
+            if not phone or not session:
+                errors.append(f"Пустой телефон/сессия: {line}")
+                continue
+            if cat is None:
+                cat = _detect_country(phone)
+            cat_row = self.storage.ensure_category(cat)
+            if cat_row.get("price", 0) == 0 and cat not in created_categories:
+                created_categories.append(cat)
+            self.storage.add_account(cat_row["id"], phone, session, proxy=state.get("proxy"))
+            added += 1
+
+        if created_categories:
+            self.user_states[m.from_user.id] = {
+                "state": "admin_add_session_text", "step": "price",
+                "created_categories": created_categories, "lines": lines,
+            }
+            self.bot.send_message(
+                m.chat.id,
+                f"🆕 Новые категории: {', '.join(created_categories)}.\n"
+                f"Введите цену для них (одна цена на все новые категории, ₽):",
+                reply_markup=self._back_keyboard(f"{CB}admin"),
             )
             return
 
-        if step == "accounts":
-            default_cat = state.get("default_cat", "Другое")
+        msg = f"✅ Добавлено аккаунтов: {added}\n"
+        if errors:
+            msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
+        self.user_states.pop(m.from_user.id, None)
+        self.bot.send_message(m.chat.id, msg, reply_markup=self._admin_keyboard())
+
+    def _save_price_then_accounts(self, user_id: int, chat_id: int, price_text: str, created_categories: list[str], lines: list[str]) -> None:
+        try:
+            price = _to_dec(price_text)
+        except Exception:
+            self.bot.send_message(chat_id, "❌ Введите число.", reply_markup=self._admin_keyboard())
+            return
+        for cat_name in created_categories:
+            cat = self.storage.get_category_by_name(cat_name)
+            if cat:
+                self.storage.update_category_price(cat["id"], float(price))
+        # reprocess lines and add accounts with correct category
+        added = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            cat: str | None = None
+            data = line
+            if ":" in line:
+                maybe_cat, maybe_data = line.split(":", 1)
+                maybe_cat = maybe_cat.strip()
+                maybe_data = maybe_data.strip()
+                if maybe_cat and "|" in maybe_data:
+                    cat = maybe_cat
+                    data = maybe_data
+            if "|" not in data:
+                continue
+            phone, session = data.split("|", 1)
+            phone = phone.strip()
+            session = session.strip()
+            if not phone or not session:
+                continue
+            if cat is None:
+                cat = _detect_country(phone)
+            cat_row = self.storage.ensure_category(cat)
+            self.storage.add_account(cat_row["id"], phone, session, proxy=state.get("proxy"))
+            added += 1
+        self.user_states.pop(user_id, None)
+        self.bot.send_message(chat_id, f"✅ Добавлено аккаунтов: {added}. Цена {price}₽ установлена.", reply_markup=self._admin_keyboard())
+
+    def _handle_admin_add_custom(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        step = state.get("step")
+        if step == "category":
+            cat_name = (m.text or "").strip()
+            if not cat_name:
+                cat_name = "Другое"
+            cat = self.storage.ensure_category(cat_name)
+            if cat.get("price", 0) == 0:
+                self.user_states[m.from_user.id] = {"state": "admin_add_custom", "step": "price", "category_name": cat_name}
+                self.bot.send_message(m.chat.id, "💰 Эта категория новая. Введите цену (₽):")
+                return
+            self.user_states[m.from_user.id] = {"state": "admin_add_custom", "step": "account", "category_name": cat_name, "category_id": cat["id"]}
+            self.bot.send_message(
+                m.chat.id,
+                "📋 Введите аккаунт: <code>phone|session_string</code>\n"
+                "Или несколько — по одному на строке.",
+                parse_mode="HTML",
+            )
+            return
+        if step == "price":
+            try:
+                price = _to_dec(m.text)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Введите число.")
+                return
+            cat_name = state.get("category_name", "Другое")
+            cat = self.storage.ensure_category(cat_name)
+            self.storage.update_category_price(cat["id"], float(price))
+            self.user_states[m.from_user.id] = {"state": "admin_add_custom", "step": "account", "category_name": cat_name, "category_id": cat["id"]}
+            self.bot.send_message(
+                m.chat.id,
+                "📋 Введите аккаунт: <code>phone|session_string</code>\n"
+                "Или несколько — по одному на строке.",
+                parse_mode="HTML",
+            )
+            return
+        if step == "account":
+            category_id = state.get("category_id")
             lines = (m.text or "").strip().splitlines()
             added = 0
-            errors: list[str] = []
-            created_categories: set[str] = set()
             for line in lines:
                 line = line.strip()
-                if not line:
+                if not line or "|" not in line:
                     continue
-                cat = default_cat
-                data = line
-                if ":" in line:
-                    maybe_cat, maybe_data = line.split(":", 1)
-                    maybe_cat = maybe_cat.strip()
-                    maybe_data = maybe_data.strip()
-                    if maybe_cat and "|" in maybe_data:
-                        cat = maybe_cat
-                        data = maybe_data
-                if "|" not in data:
-                    errors.append(f"Пропущено (нет |): {line}")
-                    continue
-                phone, session = data.split("|", 1)
+                phone, session = line.split("|", 1)
                 phone = phone.strip()
                 session = session.strip()
                 if not phone or not session:
-                    errors.append(f"Пустой телефон/сессия: {line}")
                     continue
-                category = self.storage.ensure_category(cat)
-                created_categories.add(cat)
-                self.storage.add_account(category["id"], phone, session)
+                self.storage.add_account(category_id, phone, session, proxy=state.get("proxy"))
                 added += 1
-
-            for cat_name in created_categories:
-                cat = self.storage.get_category_by_name(cat_name)
-                if cat and cat.get("price", 0) == 0:
-                    self.storage.update_category_price(cat["id"], 0)
-
             self.user_states.pop(m.from_user.id, None)
-            msg = f"✅ Добавлено аккаунтов: {added}\n"
-            if errors:
-                msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
-            self.bot.send_message(m.chat.id, msg, reply_markup=self._admin_keyboard())
+            self.bot.send_message(m.chat.id, f"✅ Добавлено аккаунтов: {added}", reply_markup=self._admin_keyboard())
+
+    def _handle_admin_add_phone(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        step = state.get("step")
+        api_id, api_hash = _pyrogram_config()
+        if not api_id or not api_hash:
+            self.bot.send_message(m.chat.id, "❌ API ID/API Hash не настроены.")
+            self.user_states.pop(m.from_user.id, None)
+            return
+
+        if step == "phone":
+            phone = (m.text or "").strip()
+            if not phone:
+                self.bot.send_message(m.chat.id, "❌ Введите номер телефона.")
+                return
+            proxy_text = None
+            if "|" in phone:
+                phone, proxy_text = phone.split("|", 1)
+                phone = phone.strip()
+                proxy_text = proxy_text.strip()
+            proxy = _parse_proxy(proxy_text)
+            self.user_states[m.from_user.id] = {"state": "admin_add_phone", "step": "code", "phone": phone, "proxy": proxy}
+            # send code in thread to avoid blocking
+            threading.Thread(
+                target=self._send_phone_code,
+                args=(m.chat.id, m.from_user.id, phone, proxy, api_id, api_hash),
+                daemon=True,
+            ).start()
+            return
+
+        if step == "code":
+            code = (m.text or "").strip()
+            self.user_states[m.from_user.id] = {**state, "step": "password", "code": code}
+            self.bot.send_message(
+                m.chat.id,
+                "🔐 Если есть облачный пароль — введите его.\n"
+                "Если нет — отправьте '-' или 'нет'.",
+            )
+            return
+
+        if step == "password":
+            password = (m.text or "").strip()
+            if password.lower() in ("", "-", "нет", "no", "none"):
+                password = None
+            self.user_states[m.from_user.id] = {**state, "step": "login"}
+            threading.Thread(
+                target=self._login_phone_account,
+                args=(m.chat.id, m.from_user.id, state["phone"], state["code"], password, state.get("proxy"), api_id, api_hash),
+                daemon=True,
+            ).start()
+            return
+
+        if step == "set_price":
+            try:
+                price = _to_dec(m.text)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Введите число.", reply_markup=self._back_keyboard(f"{CB}admin"))
+                return
+            category_id = state.get("category_id")
+            if category_id:
+                self.storage.update_category_price(category_id, float(price))
+            phone = state.get("phone")
+            session_string = state.get("session_string")
+            proxy = state.get("proxy")
+            if phone and session_string:
+                self.storage.add_account(category_id, phone, session_string, proxy=proxy)
+                self.bot.send_message(
+                    m.chat.id,
+                    f"✅ Аккаунт {phone} добавлен. Цена {price}₽ установлена.",
+                    reply_markup=self._admin_keyboard(),
+                )
+            else:
+                self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._admin_keyboard())
+            self.user_states.pop(m.from_user.id, None)
+
+    def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        try:
+            client = Client(
+                f"login_{user_id}_{_now()}",
+                api_id=api_id,
+                api_hash=api_hash,
+                phone_number=phone,
+                proxy=_proxy_for_pyrogram(proxy),
+                in_memory=True,
+                no_updates=True,
+            )
+            client.connect()
+            sent = client.send_code(phone)
+            state = self.user_states.get(user_id, {})
+            state["phone_code_hash"] = sent.phone_code_hash
+            self.user_states[user_id] = state
+            self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
+            client.disconnect()
+        except Exception:
+            logger.exception("send_code error")
+            self.bot.send_message(chat_id, "❌ Не удалось отправить код. Проверьте номер и прокси.")
+            self.user_states.pop(user_id, None)
+
+    def _login_phone_account(self, chat_id: int, user_id: int, phone: str, code: str, password: str | None,
+                             proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        client = None
+        try:
+            client = Client(
+                f"login_{user_id}_{_now()}",
+                api_id=api_id,
+                api_hash=api_hash,
+                phone_number=phone,
+                proxy=_proxy_for_pyrogram(proxy),
+                in_memory=True,
+                no_updates=True,
+            )
+            client.connect()
+            state = self.user_states.get(user_id, {})
+            phone_code_hash = state.get("phone_code_hash")
+            try:
+                client.sign_in(phone, phone_code_hash, code)
+            except SessionPasswordNeeded:
+                if not password:
+                    raise
+                client.check_password(password)
+            session_string = client.export_session_string()
+            # detect phone from me if possible
+            try:
+                me = client.get_me()
+                phone = me.phone_number or phone
+            except Exception:
+                pass
+            client.disconnect()
+            cat_name = _detect_country(phone)
+            cat = self.storage.ensure_category(cat_name)
+            if cat.get("price", 0) == 0:
+                # prompt admin for price
+                self.user_states[user_id] = {
+                    "state": "admin_add_phone", "step": "set_price",
+                    "phone": phone, "session_string": session_string, "proxy": proxy,
+                    "category_name": cat_name, "category_id": cat["id"],
+                }
+                self.bot.send_message(
+                    chat_id,
+                    f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):",
+                    reply_markup=self._back_keyboard(f"{CB}admin"),
+                )
+                return
+            self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
+            self.user_states.pop(user_id, None)
+            self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.", reply_markup=self._admin_keyboard())
+        except Exception:
+            logger.exception("login_phone_account error")
+            try:
+                if client:
+                    client.disconnect()
+            except Exception:
+                pass
+            self.user_states.pop(user_id, None)
+            self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте код, пароль и прокси.", reply_markup=self._admin_keyboard())
 
     def _handle_admin_price(self, m: Message) -> None:
         state = self.user_states.get(m.from_user.id, {})
         category_id = state.get("category_id")
+        if state.get("step") == "set_price":
+            try:
+                price = _to_dec(m.text)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Введите число.", reply_markup=self._back_keyboard(f"{CB}admin"))
+                return
+            if category_id:
+                self.storage.update_category_price(category_id, float(price))
+            phone = state.get("phone")
+            session_string = state.get("session_string")
+            proxy = state.get("proxy")
+            if phone and session_string:
+                self.storage.add_account(category_id, phone, session_string, proxy=proxy)
+                self.bot.send_message(
+                    m.chat.id,
+                    f"✅ Аккаунт {phone} добавлен. Цена {price}₽ установлена.",
+                    reply_markup=self._admin_keyboard(),
+                )
+            else:
+                self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._admin_keyboard())
+            self.user_states.pop(m.from_user.id, None)
+            return
         try:
             price = _to_dec(m.text)
         except Exception:
@@ -778,247 +1835,169 @@ class AccountShopBot:
             self.user_states.pop(m.from_user.id, None)
             self.bot.send_message(m.chat.id, "✅ Баланс пополнен.", reply_markup=self._admin_keyboard())
 
-    def _handle_support(self, m: Message) -> None:
+    def _handle_admin_confirm_payment(self, m: Message) -> None:
+        try:
+            deposit_id = int(m.text.strip())
+        except Exception:
+            self.bot.send_message(m.chat.id, "❌ Введите ID депозита.")
+            return
+        deposit = self.storage.get_deposit_by_external(str(deposit_id))
+        if not deposit:
+            deposit = self.storage.get_deposit_by_payload(str(deposit_id))
+        if not deposit:
+            self.bot.send_message(m.chat.id, "❌ Депозит не найден.")
+            return
+        self.storage.confirm_deposit(deposit["id"])
+        try:
+            self.bot.send_message(deposit["user_id"], f"💰 Ваш баланс пополнен на {_money_str(deposit['amount_rub'])}₽")
+        except Exception:
+            pass
         self.user_states.pop(m.from_user.id, None)
-        self._notify_admins(f"🆘 Поддержка от @{m.from_user.username or m.from_user.id} (ID {m.from_user.id}):\n{m.text}")
-        self.bot.send_message(m.chat.id, "✅ Сообщение отправлено администратору.", reply_markup=self._main_keyboard(m.from_user.id))
+        self.bot.send_message(m.chat.id, "✅ Депозит подтверждён.", reply_markup=self._admin_keyboard())
 
-    # callback dispatcher
-    def _handle_callback(self, c: CallbackQuery) -> None:
-        data = c.data[len(CB):]
-        parts = data.split(":", 3)
-        action = parts[0]
-
-        if action == "main":
-            user = self.storage.get_user(c.from_user.id)
-            text = (
-                f"👋 Привет, {c.from_user.first_name}!\n"
-                f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
-                "Выберите действие:"
-            )
-            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._main_keyboard(c.from_user.id))
-
-        elif action == "buy":
-            self._show_categories(c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "category":
-            self._show_category(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "purchase":
-            self._purchase(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "my_numbers":
-            self._show_my_numbers(c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "get_code":
-            self._get_code(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "listen":
-            self._listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "stop_listen":
-            self._stop_listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
-
-        elif action == "balance":
-            user = self.storage.get_user(c.from_user.id)
-            text = f"💰 Ваш баланс: {_money_str(user.get('balance', 0))}₽\n💸 Всего потрачено: {_money_str(user.get('total_spent', 0))}₽"
-            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._back_keyboard(f"{CB}main"))
-        elif action == "support":
-            self.user_states[c.from_user.id] = {"state": "support"}
-            self.bot.edit_message_text("🆘 Опишите проблему:", c.message.chat.id, c.message.message_id)
-
-        elif action == "admin":
-            if not self._is_admin(c.from_user.id):
-                self.bot.answer_callback_query(c.id, "Нет доступа")
+    def _handle_admin_create_category(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        step = state.get("step")
+        if step == "name":
+            name = (m.text or "").strip()
+            if not name:
+                self.bot.send_message(m.chat.id, "❌ Введите название.")
                 return
-            self.bot.edit_message_text("🛠 Админ-меню", c.message.chat.id, c.message.message_id, reply_markup=self._admin_keyboard())
-        elif action == "admin_add":
-            self.user_states[c.from_user.id] = {"state": "admin_add", "step": "category"}
-            self.bot.edit_message_text(
-                "Введите название категории по умолчанию (или оставьте пустым для 'Другое'):",
-                c.message.chat.id, c.message.message_id
-            )
-        elif action == "admin_accounts":
-            self._admin_accounts(c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "admin_delete_acc":
-            self._admin_delete_account(int(parts[1]), c.message.chat.id, c.message.message_id)
-        elif action == "admin_categories":
-            self._admin_categories(c.message.chat.id, c.message.message_id)
-        elif action == "admin_set_price":
-            self.user_states[c.from_user.id] = {"state": "admin_price", "category_id": int(parts[1])}
-            self.bot.edit_message_text("Введите новую цену:", c.message.chat.id, c.message.message_id)
-        elif action == "admin_delete_cat":
-            self._admin_delete_category(int(parts[1]), c.message.chat.id, c.message.message_id)
-        elif action == "admin_topup":
-            self.user_states[c.from_user.id] = {"state": "admin_topup", "step": "user_id"}
-            self.bot.edit_message_text("Введите ID пользователя для пополнения:", c.message.chat.id, c.message.message_id)
-        elif action == "admin_stats":
-            stats = self.storage.get_stats()
-            text = (
-                f"📊 Статистика\n"
-                f"👥 Пользователей: {stats['users']}\n"
-                f"📱 Аккаунтов: {stats['accounts']} (свободно: {stats['available']}, продано: {stats['sold']})\n"
-                f"💸 Выручка: {_money_str(stats['revenue'])}₽"
-            )
-            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._admin_keyboard())
+            self.user_states[m.from_user.id] = {"state": "admin_create_category", "step": "price", "name": name}
+            self.bot.send_message(m.chat.id, "💰 Введите цену (₽):")
+            return
+        if step == "price":
+            try:
+                price = _to_dec(m.text)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Введите число.")
+                return
+            name = state.get("name", "Другое")
+            cat = self.storage.ensure_category(name, float(price))
+            self.user_states.pop(m.from_user.id, None)
+            self.bot.send_message(m.chat.id, f"✅ Категория {cat['name']} создана.", reply_markup=self._admin_keyboard())
 
-    # user flows
-    def _show_categories(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
-        categories = self.storage.get_categories()
-        if not categories:
-            text = "😔 Пока нет доступных номеров."
-            kb = self._back_keyboard(f"{CB}main")
+    def _handle_upload_session(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        if not m.document:
+            self.bot.send_message(m.chat.id, "❌ Отправьте файл.")
+            return
+        file_name = m.document.file_name or ""
+        try:
+            file_info = self.bot.get_file(m.document.file_id)
+            downloaded = self.bot.download_file(file_info.file_path)
+        except Exception:
+            logger.exception("download session file")
+            self.bot.send_message(m.chat.id, "❌ Не удалось скачать файл.")
+            return
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        temp_dir = SESSIONS_DIR / f"upload_{m.from_user.id}_{int(_now())}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        saved_path = temp_dir / file_name
+        saved_path.write_bytes(downloaded)
+
+        files: list[Path] = []
+        if file_name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(saved_path, "r") as zf:
+                    zf.extractall(temp_dir)
+                for p in temp_dir.rglob("*.session"):
+                    if not p.name.endswith("-journal"):
+                        files.append(p)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Не удалось распаковать ZIP.")
+                return
+        elif file_name.lower().endswith(".session") and not file_name.endswith("-journal"):
+            files.append(saved_path)
         else:
-            text = "🗂 Выберите категорию:"
-            kb = InlineKeyboardMarkup(row_width=2)
-            for cat in categories:
-                available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
-                kb.add(InlineKeyboardButton(
-                    f"{cat['name']} — {_money_str(cat['price'])}₽ ({available})",
-                    callback_data=f"{CB}category:{cat['id']}"
-                ))
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
-
-    def _show_category(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
-        cat = self.storage.get_category(category_id)
-        if not cat:
-            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
-            return
-        available = len(self.storage.get_accounts(category_id, STATUS_AVAILABLE))
-        user = self.storage.get_user(user_id)
-        text = (
-            f"📱 {cat['name']}\n"
-            f"💰 Цена: {_money_str(cat['price'])}₽\n"
-            f"📦 Доступно: {available}\n"
-            f"💳 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
-        )
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🛒 Купить", callback_data=f"{CB}purchase:{category_id}"))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}buy"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-
-    def _purchase(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
-        cat = self.storage.get_category(category_id)
-        if not cat:
-            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
-            return
-        user = self.storage.get_user(user_id)
-        balance = _to_dec(user.get("balance", 0))
-        price = _to_dec(cat["price"])
-        if balance < price:
-            self.bot.edit_message_text(
-                f"❌ Недостаточно средств. Пополните баланс через администратора.\n💰 Нужно: {_money_str(price)}₽",
-                chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy")
-            )
-            return
-        account = self.storage.get_available_account(category_id)
-        if not account:
-            self.bot.edit_message_text("😔 В этой категории закончились номера.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            self.bot.send_message(m.chat.id, "❌ Нужен .session файл или ZIP.")
             return
 
-        self.storage.update_balance(user_id, -price)
-        self.storage.add_spent(user_id, price)
-        self.storage.update_account_status(account["id"], STATUS_SOLD, user_id, _now())
-        self.storage.add_purchase(user_id, account["id"], float(price))
+        api_id, api_hash = _pyrogram_config()
+        if not api_id or not api_hash:
+            self.bot.send_message(m.chat.id, "❌ API ID/API Hash не настроены.")
+            self.user_states.pop(m.from_user.id, None)
+            return
 
-        text = (
-            f"✅ Вы купили номер!\n\n"
-            f"📞 Номер: <code>{account['phone']}</code>\n"
-            f"🆔 ID аккаунта: <code>{account['id']}</code>\n\n"
-            "Используйте кнопки ниже для получения кодов."
-        )
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account['id']}"),
-            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account['id']}"),
-            InlineKeyboardButton("🔙 Мои номера", callback_data=f"{CB}my_numbers"),
-        )
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-
-    def _show_my_numbers(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
-        accounts = self.storage.get_user_accounts(user_id)
-        if not accounts:
-            text = "📭 У вас пока нет купленных номеров."
-            kb = self._back_keyboard(f"{CB}main")
-        else:
-            text = "📱 Ваши номера:\n\n"
-            for acc in accounts:
-                text += f"📞 <code>{acc['phone']}</code> — {acc['status']}"
-                if acc.get("last_code"):
-                    text += f"\n   Последний код: <code>{acc['last_code']}</code> ({_fmt_ts(acc.get('last_code_at'))})"
-                text += "\n\n"
-            kb = InlineKeyboardMarkup(row_width=2)
-            for acc in accounts:
-                kb.add(
-                    InlineKeyboardButton(f"🔄 {acc['phone']}", callback_data=f"{CB}get_code:{acc['id']}"),
-                    InlineKeyboardButton(f"👂 {acc['phone']}", callback_data=f"{CB}listen:{acc['id']}")
+        proxy = state.get("proxy")
+        added = 0
+        errors: list[str] = []
+        for path in files:
+            try:
+                # use a stable unique name per file
+                session_name = f"sess_{path.stem}_{int(_now())}"
+                target = SESSIONS_DIR / f"{session_name}.session"
+                shutil.copy(path, target)
+                client = Client(
+                    session_name,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    workdir=SESSIONS_DIR,
+                    proxy=_proxy_for_pyrogram(proxy),
+                    no_updates=True,
                 )
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+                client.connect()
+                session_string = client.export_session_string()
+                try:
+                    me = client.get_me()
+                    phone = me.phone_number or path.stem
+                except Exception:
+                    phone = path.stem
+                client.disconnect()
+                cat_name = _detect_country(str(phone))
+                cat = self.storage.ensure_category(cat_name)
+                self.storage.add_account(cat["id"], str(phone), session_string, proxy=proxy)
+                added += 1
+                try:
+                    target.unlink()
+                except Exception:
+                    pass
+            except Exception as e:
+                errors.append(f"{path.name}: {e}")
 
-    def _get_code(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
-        account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Номер не найден")
-            return
-        self.bot.edit_message_text("⏳ Получаю код...", chat_id, message_id)
-        code = get_latest_code(account_id)
-        if code:
-            text = f"📞 Номер: <code>{account['phone']}</code>\n🔢 Код: <code>{code}</code>"
-        else:
-            text = f"📞 Номер: <code>{account['phone']}</code>\n😔 Код пока не пришёл. Попробуйте позже или включите прослушку."
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB}get_code:{account_id}"),
-            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account_id}"),
-            InlineKeyboardButton("🔙 Мои номера", callback_data=f"{CB}my_numbers"),
-        )
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
 
-    def _listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
-        account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Номер не найден")
-            return
-        self.bot.edit_message_text("⏳ Запускаю прослушку...", chat_id, message_id)
-        result = start_listener(account_id, user_id, self.bot)
-        if result == "no_api_config":
-            text = "❌ API ID/API Hash не настроены. Обратитесь к администратору."
-        elif result == "ok":
-            text = (
-                f"👂 Прослушка номера <code>{account['phone']}</code> запущена на {LISTEN_MINUTES} мин.\n"
-                "Все коды будут приходить сюда автоматически."
-            )
-        else:
-            text = "❌ Не удалось запустить прослушку."
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🛑 Остановить", callback_data=f"{CB}stop_listen:{account_id}"))
-        kb.add(InlineKeyboardButton("🔙 Мои номера", callback_data=f"{CB}my_numbers"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self.user_states.pop(m.from_user.id, None)
+        msg = f"✅ Добавлено аккаунтов из файлов: {added}\n"
+        if errors:
+            msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
+        self.bot.send_message(m.chat.id, msg, reply_markup=self._admin_keyboard())
 
-    def _stop_listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
-        account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Номер не найден")
-            return
-        stop_listener(account_id)
-        self.bot.edit_message_text(
-            f"🛑 Прослушка номера <code>{account['phone']}</code> остановлена.",
-            chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}my_numbers")
-        )
-
-    # admin flows
     def _admin_accounts(self, user_id: int, chat_id: int, message_id: int) -> None:
         categories = self.storage.get_categories()
         if not categories:
             self.bot.edit_message_text("😔 Нет категорий.", chat_id, message_id, reply_markup=self._admin_keyboard())
             return
-        kb = InlineKeyboardMarkup()
+        kb = InlineKeyboardMarkup(row_width=1)
         for cat in categories:
-            kb.add(InlineKeyboardButton(cat["name"], callback_data=f"{CB}admin_accounts_cat:{cat['id']}"))
+            available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
+            kb.add(InlineKeyboardButton(f"{cat['name']} ({available} шт)", callback_data=f"{CB}admin_accounts_cat:{cat['id']}"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}admin"))
         self.bot.edit_message_text("🗂 Выберите категорию:", chat_id, message_id, reply_markup=kb)
+
+    def _admin_accounts_cat(self, category_id: int, chat_id: int, message_id: int) -> None:
+        cat = self.storage.get_category(category_id)
+        accounts = self.storage.get_accounts(category_id)
+        if not cat:
+            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._admin_keyboard())
+            return
+        if not accounts:
+            text = f"😔 В категории {cat['name']} нет аккаунтов."
+            kb = self._back_keyboard(f"{CB}admin_accounts")
+        else:
+            text = f"📋 {cat['name']} — {_money_str(cat['price'])}₽\n\n"
+            kb = InlineKeyboardMarkup(row_width=1)
+            for acc in accounts:
+                status = "✅" if acc["status"] == STATUS_AVAILABLE else "🛒"
+                kb.add(InlineKeyboardButton(
+                    f"{status} {acc['phone']} ({acc['status']})",
+                    callback_data=f"{CB}admin_delete_acc:{acc['id']}"
+                ))
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}admin_accounts"))
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     def _admin_delete_account(self, account_id: int, chat_id: int, message_id: int) -> None:
         account = self.storage.delete_account(account_id)
@@ -1033,7 +2012,9 @@ class AccountShopBot:
         categories = self.storage.get_categories()
         if not categories:
             text = "😔 Нет категорий."
-            kb = self._admin_keyboard()
+            kb = InlineKeyboardMarkup(row_width=1)
+            kb.add(InlineKeyboardButton("➕ Создать категорию", callback_data=f"{CB}admin_create_category"))
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}admin"))
         else:
             text = "🗂 Категории:\n\n"
             kb = InlineKeyboardMarkup(row_width=1)
@@ -1042,9 +2023,14 @@ class AccountShopBot:
                 text += f"• {cat['name']} — {_money_str(cat['price'])}₽ ({available} свободно)\n"
                 kb.add(InlineKeyboardButton(
                     f"💰 Цена {cat['name']}", callback_data=f"{CB}admin_set_price:{cat['id']}"
-                ), InlineKeyboardButton(
+                ))
+                kb.add(InlineKeyboardButton(
+                    f"➕ Добавить в {cat['name']}", callback_data=f"{CB}admin_add_to_cat:{cat['id']}"
+                ))
+                kb.add(InlineKeyboardButton(
                     f"🗑 Удалить {cat['name']}", callback_data=f"{CB}admin_delete_cat:{cat['id']}"
                 ))
+            kb.add(InlineKeyboardButton("➕ Создать категорию", callback_data=f"{CB}admin_create_category"))
             kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}admin"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
