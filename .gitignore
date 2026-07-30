@@ -6,7 +6,8 @@
 /logs
 /storage
 /configs
-/plugins
+/plugins/*
+!/plugins/telegram_account_shop.py
 /build
 /dist
 test.py
