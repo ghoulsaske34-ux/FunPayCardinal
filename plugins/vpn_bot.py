@@ -158,6 +158,22 @@ DEFAULT_SHARING_WINDOW = 300  # сек — окно одновременных �
 DEFAULT_UNBIND_COOLDOWN = 7 * 86400  # сек — раз в 7 дней пользователь может отвязать устройство
 MAX_CONNECTION_LOG = 2000
 
+# Российские домены/сервисы, которые клиент пускает впрямую (не через туннель)
+RU_DOMAINS_DIRECT = [
+    "domain:ru", "domain:su", "domain:xn--p1ai", "domain:moscow", "domain:ya.cc",
+    "domain:yandex.com", "domain:yandex.net", "domain:yango.com", "domain:vk.com",
+    "domain:vk.cc", "domain:mvk.com", "domain:mycdn.me", "domain:my.com", "domain:my.games",
+    "domain:ok.me", "domain:kaspersky.com", "domain:ozon.com", "domain:ozon.by",
+    "domain:ozon.kz", "domain:wildberries.by", "domain:wildberries.kz", "domain:2gis.com",
+    "domain:magnit.com", "domain:fix-price.com", "domain:x5.tech", "domain:megafon.com",
+    "domain:moex.com", "domain:okko.tv", "domain:okko.sport", "domain:boosty.to",
+    "domain:lenta.com", "domain:meduza.io", "domain:premier.one", "domain:hh.by",
+    "domain:hh.kz", "domain:mosmetro.tech", "domain:avs.io",
+]
+
+# IP, которые клиент пускает впрямую
+DIRECT_IPS = ["89.208.85.188"]
+
 DEFAULT_PLANS = {
     "trial": {
         "name": "Пробный",
@@ -4576,8 +4592,8 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription,
     """Строит JSON-подписку в формате v2rayNG/v2rayTun (полный Xray-конфиг с remarks)."""
     uuid = client_uuid or sub.client_uuid
     return {
-        "remarks": "🇪🇸Барселона ⚡️",
-        "log": {"access": "", "error": "", "loglevel": "warning"},
+        "remarks": "🇪🇸Барселона 🔥",
+        "log": {"access": "", "error": "", "loglevel": "Warning", "dnsLog": True},
         "dns": {"queryStrategy": "UseIPv4", "servers": ["1.1.1.1", "8.8.8.8", "8.8.4.4"]},
         "inbounds": [
             {
@@ -4626,9 +4642,13 @@ def build_v2raytun_json(vless_url: str, server: ServerConfig, sub: Subscription,
             {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
         ],
         "routing": {
+            "domainMatcher": "hybrid",
             "domainStrategy": "AsIs",
             "rules": [
-                {"type": "field", "port": "0-65535", "outboundTag": "proxy", "enabled": True}
+                {"type": "field", "domain": list(RU_DOMAINS_DIRECT), "outboundTag": "direct"},
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+                {"type": "field", "ip": list(DIRECT_IPS), "outboundTag": "direct"},
+                {"type": "field", "port": "0-65535", "outboundTag": "proxy", "enabled": True},
             ],
         },
     }
