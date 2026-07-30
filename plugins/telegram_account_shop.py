@@ -983,6 +983,14 @@ def init_plugin(cardinal: Any) -> None:
     global _storage, _shop_bot
     _storage = AccountStorage()
     token = _storage.get_config("bot_token")
+    if not token and CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            token = cfg.get("bot_token", "")
+            if token:
+                _storage.set_config("bot_token", token)
+        except Exception:
+            logger.exception("[TelegramAccountShop] Ошибка чтения config.json")
     if not token:
         logger.warning("[TelegramAccountShop] bot_token не задан. Создайте storage/cache/tg_account_shop/config.json с bot_token.")
         return
