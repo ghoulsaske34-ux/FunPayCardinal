@@ -75,7 +75,9 @@ class AccountStorage:
         self._migrate()
 
     def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _migrate(self) -> None:
         with self._lock, self._conn() as conn:
@@ -546,6 +548,14 @@ class AccountShopBot:
         self._setup_password: str | None = None
         self._ensure_setup_password()
         self._setup_handlers()
+        try:
+            self.bot.set_my_commands([
+                telebot.types.BotCommand("start", "Главное меню"),
+                telebot.types.BotCommand("balance", "Мой баланс"),
+                telebot.types.BotCommand("support", "Поддержка"),
+            ])
+        except Exception:
+            pass
 
     def _ensure_setup_password(self) -> None:
         pwd = self.storage.get_config("setup_password")
@@ -625,13 +635,16 @@ class AccountShopBot:
     def _setup_handlers(self) -> None:
         @self.bot.message_handler(commands=["start"])
         def on_start(m: Message) -> None:
-            user = self.storage.get_user(m.from_user.id, m.from_user.username)
-            text = (
-                f"👋 Привет, {m.from_user.first_name}!\n"
-                f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
-                "Выберите действие:"
-            )
-            self.bot.send_message(m.chat.id, text, reply_markup=self._main_keyboard(m.from_user.id))
+            try:
+                user = self.storage.get_user(m.from_user.id, m.from_user.username)
+                text = (
+                    f"👋 Привет, {m.from_user.first_name}!\n"
+                    f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
+                    "Выберите действие:"
+                )
+                self.bot.send_message(m.chat.id, text, reply_markup=self._main_keyboard(m.from_user.id))
+            except Exception:
+                logger.exception("[TelegramAccountShop] Ошибка /start")
 
         @self.bot.message_handler(commands=["setup"])
         def on_setup(m: Message) -> None:
