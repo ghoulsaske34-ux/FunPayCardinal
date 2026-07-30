@@ -5408,6 +5408,8 @@ class UserBot:
         kb.add(B("🔗 Профиль", callback_data=f"{CB_PREFIX}profile"))
         kb.add(B("💳 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
         kb.add(B("❔ Помощь", callback_data=f"{CB_PREFIX}help", style="danger"))
+        if user_id is not None and not storage.get_user(user_id).get("trial_used"):
+            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
         return kb
 
     def _main_menu_text(self, user_id: int) -> str:
@@ -5685,6 +5687,12 @@ class UserBot:
         if action == "toggle" and args:
             storage.toggle_user_setting(user_id, args[0])
             self._settings_menu(user_id, chat_id, c.message.message_id)
+            return
+
+        if action == "activate_code":
+            self.set_state(user_id, "enter_activation_code", {})
+            self._edit_message("Введите активационный код:", chat_id, c.message.message_id,
+                              reply_markup=K().add(B("Отмена", callback_data=f"{CB_PREFIX}profile")))
             return
 
         if action == "trial":

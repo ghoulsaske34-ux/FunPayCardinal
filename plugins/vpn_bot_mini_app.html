@@ -417,6 +417,7 @@ function renderSubDetail(main){
     (active ? `<div class='btn-group'>` +
       `<button class='btn' data-renew='` + esc(s.sub_id) + `'>` + icon('renew','icon-btn') + `Продлить</button>` +
       `<button class='btn btn-outline' data-change-plan='` + esc(s.sub_id) + `'>` + icon('bag','icon-btn') + `Сменить тариф</button>` +
+      `<button class='btn btn-outline' style='grid-column:1 / -1;' data-sub-devices='` + esc(s.sub_id) + `'>` + icon('phone','icon-btn') + `Устройства</button>` +
     `</div>` : ``);
 }
 
