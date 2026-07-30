@@ -45,26 +45,15 @@ body {
   overflow: hidden;
   transform: translate3d(0,0,0) rotate(0deg);
   transform-origin: 50% 50%;
-  animation: linesDrift 18s ease-in-out infinite alternate;
 }
 .line {
-  position: absolute; height: 5px;
-  background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4MCIgaGVpZ2h0PSIyMCIgdmlld0JveD0iMCAwIDgwIDIwIj48cGF0aCBkPSJNMCwxMCBRMjAsMCA0MCwxMCBUODAsMTAiIHN0cm9rZT0icmdiYSg3NCwyMjIsMTI4LDAuNzUpIiBzdHJva2Utd2lkdGg9IjIuNSIgZmlsbD0ibm9uZSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+");
+  position: absolute; height: 10px;
+  background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4MCIgaGVpZ2h0PSIyMCIgdmlld0JveD0iMCAwIDgwIDIwIj48cGF0aCBkPSJNMCwxMCBRMjAsMCA0MCwxMCBUODAsMTAiIHN0cm9rZT0icmdiYSg3NCwyMjIsMTI4LDAuNTUpIiBzdHJva2Utd2lkdGg9IjIuNSIgZmlsbD0ibm9uZSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+");
   background-size: 80px 100%;
   background-repeat: repeat-x;
   background-position: 0 0;
-  filter: drop-shadow(0 0 6px rgba(74,222,128,0.45));
-  animation: lineFlow 8s linear infinite;
-  opacity: .7;
-}
-@keyframes lineFlow {
-  0% { background-position: 0 0; opacity: .25; }
-  50% { opacity: .95; }
-  100% { background-position: 80px 0; opacity: .25; }
-}
-@keyframes linesDrift {
-  0% { transform: translate3d(0, 0, 0) rotate(0deg); }
-  100% { transform: translate3d(24px, -12px, 0) rotate(1.5deg); }
+  filter: drop-shadow(0 0 18px rgba(74,222,128,0.75));
+  opacity: .5;
 }
 #app { display: flex; flex-direction: column; height: 100%; position: relative; }
 header {
@@ -243,7 +232,36 @@ function daysLeft(ts){ const d=Math.ceil((ts*1000-Date.now())/86400000); return 
 function fmtDateTime(ts){ if(!ts) return '-'; const d=new Date(ts*1000); return d.toLocaleDateString('ru-RU')+' '+d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
+let flowBoost = 0;
+let flowLines = [];
+function bumpLines(){
+  flowBoost = 5 + Math.random() * 4;
+}
+function startLinesMotion(){
+  flowLines = Array.from(document.querySelectorAll('.line'));
+  let last = performance.now();
+  function step(now){
+    const dt = Math.min(now - last, 50);
+    last = now;
+    if (flowBoost > 0.01){
+      flowBoost *= Math.pow(0.94, dt/16);
+      if (flowBoost < 0.05) flowBoost = 0;
+    }
+    const t = now % 1000000;
+    for (const line of flowLines){
+      const speed = parseFloat(line.dataset.speed) || 0.02;
+      const dir = parseFloat(line.dataset.dir) || 1;
+      const phase = parseFloat(line.dataset.phase) || 0;
+      const px = (phase + t * speed * dir * (1 + flowBoost)) % 80;
+      line.style.backgroundPositionX = px.toFixed(1) + 'px';
+    }
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
 function render(pageId, push=true){
+  if (state.page !== pageId) bumpLines();
   if (push && state.page !== pageId) state.stack.push(state.page);
   state.page = pageId;
   $('backBtn').classList.toggle('visible', state.stack.length > 0);
@@ -731,9 +749,10 @@ function buildLines(){
     line.style.top = (i*6.5 + 3) + '%';
     line.style.width = (35 + Math.random()*55) + '%';
     line.style.left = (Math.random()*45) + '%';
-    line.style.animationDuration = (6 + Math.random()*7) + 's';
-    line.style.animationDelay = (Math.random()*-8) + 's';
-    line.style.opacity = (0.25 + Math.random()*0.55).toFixed(2);
+    line.dataset.speed = ((0.006 + Math.random()*0.018) * (0.6 + Math.random()*0.8)).toFixed(5);
+    line.dataset.dir = Math.random() > 0.5 ? '1' : '-1';
+    line.dataset.phase = (Math.random()*80).toFixed(1);
+    line.style.opacity = (0.35 + Math.random()*0.45).toFixed(2);
     el.appendChild(line);
   }
 }
@@ -742,6 +761,7 @@ async function init(){
   if (tg.setHeaderColor) tg.setHeaderColor('#07140b');
   if (tg.setBackgroundColor) tg.setBackgroundColor('#07140b');
   buildLines();
+  startLinesMotion();
   if (!initDataRaw()) { render('auth-error', false); return; }
   await loadConfig();
   await loadMe();
