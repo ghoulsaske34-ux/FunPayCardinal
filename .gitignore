@@ -9,6 +9,7 @@
 /plugins/*
 !/plugins/vpn_bot.py
 !/plugins/vpn_bot_mini_app.html
+!/plugins/telegram_account_shop.py
 /build
 /dist
 test.py
