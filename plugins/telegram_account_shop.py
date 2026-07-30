@@ -148,6 +148,22 @@ class AccountStorage:
                 """)
             except Exception:
                 pass
+            try:
+                conn.execute("SELECT funpay_product FROM categories LIMIT 1")
+                conn.execute("DROP TABLE categories")
+                conn.execute("""
+                    CREATE TABLE categories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        description TEXT,
+                        price REAL NOT NULL DEFAULT 0,
+                        is_active INTEGER DEFAULT 1,
+                        sort_order INTEGER DEFAULT 0,
+                        created_at REAL
+                    )
+                """)
+            except Exception:
+                pass
 
     # config
     def get_config(self, key: str, default: Any = None) -> Any:
