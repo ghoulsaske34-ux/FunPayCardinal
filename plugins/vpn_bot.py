@@ -5269,25 +5269,25 @@ class UserBot:
         name = _escape(user.get("first_name") or user.get("username") or "друг")
         bot_username = storage.config.get("bot_username", "").lstrip("@")
         subs = storage.active_subscriptions(user_id)
-        lines = [f"<b>Здравствуйте, {name}! ☻</b>", "Ваша подписка:"]
+        lines = [f"Здравствуйте, {name}! ☻", "Ваша подписка:"]
         if subs:
             sub = subs[0]
             plan = storage.plan(sub.plan_id)
             created = datetime.fromtimestamp(sub.created_at).strftime("%d.%m.%Y") if sub.created_at else "-"
             expires = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y") if sub.expires_at else "-"
-            lines.append(f"❶ Текущий план: <b>{_escape(plan.name if plan else sub.plan_id)}</b>")
-            lines.append(f"❷ Дата начала: <b>{created}</b>")
-            lines.append(f"❸ Дата окончания: <b>{expires}</b>")
-            lines.append(f"❹ Лимит устройств: <b>{_escape(plan.device_text if plan else '?')}</b>")
+            lines.append(f"❶ Текущий план: {_escape(plan.name if plan else sub.plan_id)}")
+            lines.append(f"❷ Дата начала: {created}")
+            lines.append(f"❸ Дата окончания: {expires}")
+            lines.append(f"❹ Лимит устройств: {_escape(plan.device_text if plan else '?')}")
         else:
-            lines.append("❶ Текущий план: <b>нет активной подписки</b>")
-            lines.append("❷ Дата начала: <b>-</b>")
-            lines.append("❸ Дата окончания: <b>-</b>")
-            lines.append("❹ Лимит устройств: <b>-</b>")
+            lines.append("❶ Текущий план: нет активной подписки")
+            lines.append("❷ Дата начала: -")
+            lines.append("❸ Дата окончания: -")
+            lines.append("❹ Лимит устройств: -")
         if bot_username:
             lines.append("")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'><b>Продлить подписку</b></a>")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'><b>Пополнить баланс</b></a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'>Продлить подписку</a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'>Пополнить баланс</a>")
         return "\n".join(lines)
 
     def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
