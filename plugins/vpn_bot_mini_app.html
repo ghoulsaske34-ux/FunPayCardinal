@@ -271,6 +271,8 @@ function render(pageId, push=true){
   else if (pageId === 'device-detail') renderDeviceDetail(main);
   else if (pageId === 'sub-devices') renderSubDevices(main);
   else if (pageId === 'my-device-detail') renderMyDeviceDetail(main);
+  else if (pageId === 'renew') renderRenew(main);
+  else if (pageId === 'change-plan') renderChangePlan(main);
   else if (pageId === 'refs') renderRefs(main);
   else if (pageId === 'profile') renderProfile(main);
   else if (pageId === 'deposit') renderDeposit(main);
@@ -282,7 +284,7 @@ function render(pageId, push=true){
 
 function updateNav(){
   let active = state.page;
-  if (active === 'device-detail' || active === 'sub-devices' || active === 'my-device-detail') active = 'subs';
+  if (active === 'device-detail' || active === 'sub-devices' || active === 'my-device-detail' || active === 'renew' || active === 'change-plan') active = 'subs';
   if (active === 'device-detail') active = 'devices';
   document.querySelectorAll('.bottom-nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===active));
 }
@@ -322,6 +324,8 @@ function renderHome(main){
   const info = homeSubInfo();
   const u = state.user || {};
   const username = u.username ? ', ' + esc(u.username) : '';
+  const canTrial = info.days===null && !u.trial_used;
+  const activeSub = info.sub;
   main.innerHTML = `` +
     `<div class='hero'><h1>Привет` + username + `</h1><p>Твой персональный VPN</p></div>` +
     `<div class='card balance-card' style='text-align:center;'>` +
@@ -334,13 +338,16 @@ function renderHome(main){
     `</div>` +
     `<div class='card sub-info'>` +
       `<div>` +
-        `<div class='card-title'>Подписка</div>` +
-        `<div style='font-size:15px;font-weight:700;'>` + (info.days!==null ? `VPN активна` : info.title) + `</div>` +
-        (info.days!==null ? `<div style='font-size:12px;color:var(--text-secondary);margin-top:2px;'>` + esc(info.title) + ` · до ` + fmtDate(info.sub.expires_at) + `</div>` : ``) +
+        `<div class='card-title'>` + (activeSub && activeSub.pending_plan ? `Сменится ` + activeSub.pending_plan.change_date : `Подписка`) + `</div>` +
+        `<div style='font-size:15px;font-weight:700;'>` + info.title + `</div>` +
+        (info.days!==null ? `<div style='font-size:12px;color:var(--text-secondary);margin-top:2px;'>до ` + fmtDate(activeSub.expires_at) + (activeSub && activeSub.pending_plan ? ` · на ` + esc(activeSub.pending_plan.plan_name) + ` ` + activeSub.pending_plan.months + ` мес.` : ``) + `</div>` : ``) +
       `</div>` +
       `<div class='sub-days'>` + (info.days!==null ? info.days + `<span>дней</span>` : ``) + `</div>` +
     `</div>` +
-    (info.days===null ? `<button class='btn' data-page='store'>Выбрать тариф</button>` : ``) +
+    (activeSub ? `<div class='btn-group'>` +
+      `<button class='btn' data-renew='` + esc(activeSub.sub_id) + `'>` + icon('renew','icon-btn') + `Продлить</button>` +
+      `<button class='btn btn-outline' data-change-plan='` + esc(activeSub.sub_id) + `'>` + icon('bag','icon-btn') + `Сменить тариф</button>` +
+    `</div>` : (canTrial ? `<button class='btn' data-trial='1'>🎁 Активировать пробный период</button>` + `<button class='btn btn-outline' data-page='store' style='margin-top:10px;'>Выбрать тариф</button>` : `<button class='btn' data-page='store'>Выбрать тариф</button>`)) +
     `<div class='card'>` +
       `<div class='card-title'>Подключить устройство</div>` +
       `<p style='font-size:12px;color:var(--text-secondary);margin:0 0 10px 0;'>Happ, Incy, v2rayTun, v2rayNG — выбери свою платформу</p>` +
@@ -356,6 +363,11 @@ function renderSubs(main){
   $('pageTitle').textContent = '';
   if (!state.subscriptions.length) {
     main.innerHTML = `<div class='empty'>У вас нет подписок. <a class='link' data-page='store'>Купить</a></div>`;
+    return;
+  }
+  if (state.subscriptions.length === 1) {
+    state.selectedSub = state.subscriptions[0];
+    render('sub-detail');
     return;
   }
   main.innerHTML = state.subscriptions.map(s=>{
@@ -379,6 +391,7 @@ function renderSubDetail(main){
   const devicesText = (s.devices_count||0) + ` / ` + (s.max_devices||'?');
   const subUrl = esc(s.sub_url||'');
   const qrUrl = s.qr_url || (API_BASE + `/qr?init_data=` + encodeURIComponent(initDataRaw()) + `&data=` + encodeURIComponent(s.sub_url||''));
+  const pendingText = s.pending_plan ? `<div class='stat-row'><span>Запланировано</span><b>` + esc(s.pending_plan.plan_name) + ` ` + s.pending_plan.months + ` мес. с ` + s.pending_plan.change_date + `</b></div>` : '';
   main.innerHTML = `` +
     `<div class='card'>` +
       `<div class='card-title'>` + esc(s.plan_name||s.plan_id) + `</div>` +
@@ -386,6 +399,7 @@ function renderSubDetail(main){
       `<div class='stat-row'><span>Действует до</span><b>` + fmtDate(s.expires_at) + `</b></div>` +
       `<div class='stat-row'><span>Осталось</span><b>` + daysLeft(s.expires_at) + `</b></div>` +
       `<div class='stat-row'><span>Устройств</span><b>` + devicesText + `</b></div>` +
+      pendingText +
     `</div>` +
     `<div class='card'>` +
       `<div class='card-title'>Ключ подписки</div>` +
@@ -402,7 +416,7 @@ function renderSubDetail(main){
     `</div>` +
     (active ? `<div class='btn-group'>` +
       `<button class='btn' data-renew='` + esc(s.sub_id) + `'>` + icon('renew','icon-btn') + `Продлить</button>` +
-      `<button class='btn btn-outline' data-sub-devices='` + esc(s.sub_id) + `'>` + icon('phone','icon-btn') + `Устройства</button>` +
+      `<button class='btn btn-outline' data-change-plan='` + esc(s.sub_id) + `'>` + icon('bag','icon-btn') + `Сменить тариф</button>` +
     `</div>` : ``);
 }
 
@@ -458,11 +472,89 @@ function renderMyDeviceDetail(main){
     `<button class='btn btn-outline' data-unbind='` + esc(s.sub_id) + `:` + d.index + `'>` + icon('phone','icon-btn') + `Отвязать устройство</button>`;
 }
 
-async function renewSubPrompt(id){
-  const months = prompt('На сколько месяцев продлить? (1, 3, 6, 12):','1'); if(!months) return;
+function planDurationOptions(plan, selectedMonths){
+  if (!plan || !plan.prices) return '';
+  return Object.entries(plan.prices).map(([m, price])=>{
+    const selected = String(m) === String(selectedMonths) ? ' selected' : '';
+    return `<option value='` + esc(m) + `'` + selected + `>` + esc(m) + ` мес. — ` + esc(price) + ` ₽</option>`;
+  }).join('');
+}
+
+function renderRenew(main){
+  $('pageTitle').textContent = 'Продление';
+  const s = state.selectedSub || (state.subscriptions||[]).find(s=>s.active && s.expires_at*1000>Date.now());
+  if (!s) { render('home'); return; }
+  state.selectedSub = s;
+  const plan = state.plans.find(p=>p.id === s.plan_id);
+  const opts = planDurationOptions(plan, s.months || 1);
+  if (!opts) { main.innerHTML = `<div class='empty'>Цены для продления не установлены.</div>`; return; }
+  const u = state.user || {};
+  main.innerHTML = `` +
+    `<div class='hero'><h1>` + esc(s.plan_name||s.plan_id) + `</h1><p>Продление подписки</p></div>` +
+    `<div class='card'>` +
+      `<div class='card-title'>Срок продления</div>` +
+      `<select id='renew-months'>` + opts + `</select>` +
+    `</div>` +
+    `<div class='card'>` +
+      `<div class='card-title'>Оплата</div>` +
+      `<button class='btn' data-renew-method='balance'>` + icon('wallet','icon-btn') + `С баланса (` + fmtMoney(u.balance||0) + ` ₽)</button>` +
+      `<button class='btn btn-outline' data-renew-method='platega' data-renew-asset='sbp' style='margin-top:8px;'>💳 Platega СБП</button>` +
+      `<button class='btn btn-outline' data-renew-method='platega' data-renew-asset='card' style='margin-top:8px;'>💳 Platega Карта</button>` +
+    `</div>`;
+}
+
+async function doRenew(method, asset){
+  const s = state.selectedSub; if(!s){ showToast('Подписка не выбрана'); return; }
+  const months = parseInt($('renew-months').value);
   try {
-    await api('/purchase', 'POST', { plan_id: state.selectedSub.plan_id, months: parseInt(months) });
-    showToast('Подписка продлена'); await loadMe(); render('subs');
+    const res = await api('/renew', 'POST', { sub_id: s.sub_id, months, method, asset });
+    if (res.ok) { showToast('Подписка продлена'); await loadMe(); render('home'); }
+    else if (res.payment_url) { tg.openLink(res.payment_url, {try_instant_view: false}); }
+    else { showToast(res.error||'Ошибка'); if(res.need_payment) render('deposit'); }
+  } catch(e){ showToast(e.message||'Ошибка'); }
+}
+
+function renderChangePlan(main){
+  $('pageTitle').textContent = 'Смена тарифа';
+  const s = state.selectedSub || (state.subscriptions||[]).find(s=>s.active && s.expires_at*1000>Date.now());
+  if (!s) { render('home'); return; }
+  state.selectedSub = s;
+  const currentId = s.plan_id;
+  const changeDate = fmtDate(s.expires_at);
+  main.innerHTML = `` +
+    `<div class='hero'><h1>Текущий тариф</h1><p>` + esc(s.plan_name||s.plan_id) + ` · меняется ` + changeDate + `</p></div>` +
+    `<div class='empty' style='padding:10px 0;'>Выберите новый тариф и срок. Списание и смена произойдут ` + changeDate + `.</div>` +
+    state.plans.filter(p=>p.id !== currentId).map(p=>{
+      const opts = planDurationOptions(p, Object.keys(p.prices||{})[0]);
+      return `<div class='card'>` +
+        `<div style='display:flex;justify-content:space-between;align-items:center;'>` +
+          `<div style='font-size:16px;font-weight:700;'>` + esc(p.name) + `</div>` +
+          `<div style='color:var(--text-secondary);font-size:12px;'>` + esc(p.device_text) + `</div>` +
+        `</div>` +
+        `<label>Срок</label>` +
+        `<select id='change-plan-months-` + esc(p.id) + `'>` + opts + `</select>` +
+        `<button class='btn' data-select-plan='` + esc(p.id) + `'>` + icon('bag','icon-btn') + `Запланировать смену</button>` +
+      `</div>`;
+    }).join('');
+}
+
+async function doChangePlan(planId){
+  const s = state.selectedSub; if(!s){ showToast('Подписка не выбрана'); return; }
+  const select = $('change-plan-months-' + planId);
+  if(!select){ showToast('Не выбран срок'); return; }
+  const months = parseInt(select.value);
+  try {
+    const res = await api('/change-plan', 'POST', { sub_id: s.sub_id, plan_id: planId, months });
+    if (res.ok) { showToast('Смена запланирована'); await loadMe(); render('home'); }
+    else { showToast(res.error||'Ошибка'); }
+  } catch(e){ showToast(e.message||'Ошибка'); }
+}
+
+async function activateTrial(){
+  try {
+    const res = await api('/activate-trial', 'POST', {});
+    if (res.ok) { showToast('Пробный период активирован'); await loadMe(); render('home'); }
+    else { showToast(res.error||'Ошибка'); }
   } catch(e){ showToast(e.message||'Ошибка'); }
 }
 
@@ -484,6 +576,8 @@ function renderStore(main){
 }
 
 async function buyPlan(planId){
+  const activeSub = (state.subscriptions||[]).find(s=>s.active && s.expires_at*1000>Date.now());
+  if (activeSub) { showToast('У вас уже есть активная подписка. Продлите или смените тариф.'); state.selectedSub = activeSub; render('change-plan'); return; }
   const select = $('dur-' + planId); if(!select){ showToast('Не выбран срок'); return; }
   const months = parseInt(select.value);
   try {
@@ -646,6 +740,8 @@ function renderRefs(main){
 function renderProfile(main){
   $('pageTitle').textContent = '';
   const u = state.user || {};
+  const activeSub = (state.subscriptions||[]).find(s=>s.active && s.expires_at*1000>Date.now());
+  const canTrial = !activeSub && !u.trial_used;
   main.innerHTML = `` +
     `<div class='card'>` +
       `<div class='card-title'>Пользователь</div>` +
@@ -655,6 +751,8 @@ function renderProfile(main){
       `<div class='stat-row'><span>Куплено месяцев</span><b>` + (u.total_months||0) + `</b></div>` +
       `<div class='stat-row'><span>Пробный период</span><b>` + (u.trial_used?'использован':'не использован') + `</b></div>` +
     `</div>` +
+    (canTrial ? `<button class='btn' data-trial='1'>` + icon('bag','icon-btn') + `🎁 Активировать пробный период</button>` : ``) +
+    (activeSub ? `<button class='btn btn-outline' data-page='subs'>` + icon('phone','icon-btn') + `Моя подписка</button>` : ``) +
     `<button class='btn' data-action='support'>` + icon('support','icon-btn') + `Написать в поддержку</button>` +
     (state.isAdmin ? `<button class='btn btn-outline' data-page='admin'>Админ-панель</button>` : ``);
 }
@@ -694,7 +792,15 @@ function handleMainClick(e){
   const planBtn = target.closest('[data-plan]');
   if (planBtn) { buyPlan(planBtn.dataset.plan); return; }
   const renewBtn = target.closest('[data-renew]');
-  if (renewBtn) { state.selectedSub = state.subscriptions.find(s=>s.sub_id===renewBtn.dataset.renew); renewSubPrompt(renewBtn.dataset.renew); return; }
+  if (renewBtn) { state.selectedSub = state.subscriptions.find(s=>s.sub_id===renewBtn.dataset.renew); render('renew'); return; }
+  const changePlanBtn = target.closest('[data-change-plan]');
+  if (changePlanBtn) { state.selectedSub = state.subscriptions.find(s=>s.sub_id===changePlanBtn.dataset.changePlan); render('change-plan'); return; }
+  const trialBtn = target.closest('[data-trial]');
+  if (trialBtn) { activateTrial(); return; }
+  const renewMethodBtn = target.closest('[data-renew-method]');
+  if (renewMethodBtn) { doRenew(renewMethodBtn.dataset.renewMethod, renewMethodBtn.dataset.renewAsset||''); return; }
+  const selectPlanBtn = target.closest('[data-select-plan]');
+  if (selectPlanBtn) { doChangePlan(selectPlanBtn.dataset.selectPlan); return; }
   const amountBtn = target.closest('[data-amount]');
   if (amountBtn) { $('depAmount').value = amountBtn.dataset.amount; return; }
   const payBtn = target.closest('[data-method]');
@@ -763,7 +869,13 @@ async function init(){
   if (!initDataRaw()) { render('auth-error', false); return; }
   await loadConfig();
   await loadMe();
-  render('home', false);
+  const validPages = ['home','renew','change-plan','store','deposit','devices','refs','profile','subs'];
+  const urlParams = new URLSearchParams(window.location.search);
+  const startParam = urlParams.get('page')
+    || (tg.initDataUnsafe && tg.initDataUnsafe.start_param)
+    || (location.hash ? location.hash.slice(1) : '');
+  const startPage = validPages.includes(startParam) ? startParam : 'home';
+  render(startPage, false);
   $('backBtn').onclick = ()=>{ state.stack.pop(); const prev = state.stack.pop() || 'home'; render(prev, false); };
   document.getElementById('main').onclick = handleMainClick;
   document.getElementById('nav').onclick = (e)=>{

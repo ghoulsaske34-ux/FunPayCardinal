@@ -2691,6 +2691,17 @@ class MiniAppAPI:
                 "client_uuid": dev_uuid,
                 "sub_url": dev_url,
             })
+        pending = None
+        if sub.pending_plan_id and sub.pending_plan_change_at:
+            pending_plan = storage.plan(sub.pending_plan_id)
+            pending = {
+                "plan_id": sub.pending_plan_id,
+                "plan_name": pending_plan.name if pending_plan else sub.pending_plan_id,
+                "months": sub.pending_plan_months,
+                "price": float(_money_round(sub.pending_plan_price)),
+                "change_at": sub.pending_plan_change_at,
+                "change_date": datetime.fromtimestamp(sub.pending_plan_change_at).strftime("%d.%m.%Y"),
+            }
         return {
             "sub_id": sub.sub_id,
             "plan_id": sub.plan_id,
@@ -2704,6 +2715,7 @@ class MiniAppAPI:
             "devices_count": devices_count,
             "sub_url": sub_url,
             "devices": devices,
+            "pending_plan": pending,
         }
 
     @staticmethod
@@ -2830,6 +2842,76 @@ class MiniAppAPI:
                 return {"ok": True, "payment_url": result["payment_url"]}
             return result
         return {"ok": False, "error": "Неизвестный способ оплаты"}
+
+    @staticmethod
+    def activate_trial(user_id: int) -> dict[str, Any]:
+        user = storage.get_user(user_id)
+        if user.get("trial_used"):
+            return {"ok": False, "error": "Пробный период уже использован"}
+        sub = storage.create_subscription(user_id, "trial", 0, is_trial=True)
+        user["trial_used"] = True
+        storage.update_user(user)
+        storage._add_transaction(user_id, 0, "trial", "trial", f"sub_{sub.sub_id}")
+        XrayAPI.add_or_update_client(sub)
+        return {"ok": True, "subscription": MiniAppAPI._subscription_dict(sub)}
+
+    @staticmethod
+    def renew(user_id: int, sub_id: str, months: int, method: str = "balance", asset: str = "") -> dict[str, Any]:
+        sub = storage.get_subscription(sub_id)
+        if not sub or sub.user_id != user_id:
+            return {"ok": False, "error": "Подписка не найдена"}
+        if months <= 0:
+            months = sub.months or 1
+        plan = storage.plan(sub.plan_id)
+        if not plan:
+            return {"ok": False, "error": "Тариф не найден"}
+        price = storage.price(sub.plan_id, months)
+        if price is None:
+            return {"ok": False, "error": "Цена для выбранного срока не установлена"}
+        if method == "balance":
+            user = storage.get_user(user_id)
+            if _to_dec(user.get("balance", 0)) < price:
+                return {"ok": False, "error": "Недостаточно средств", "need_payment": True, "price": float(_money_round(price))}
+            if not storage.deduct_balance(user_id, price, "renew", f"sub:{sub_id}:{months}"):
+                return {"ok": False, "error": "Ошибка списания средств"}
+            if _apply_renewal(user_id, sub_id, months, source="Баланс"):
+                return {"ok": True, "subscription": MiniAppAPI._subscription_dict(storage.get_subscription(sub_id))}
+            return {"ok": False, "error": "Не удалось продлить подписку"}
+        if method == "platega":
+            pm = {"sbp": 2, "card": 11, "crypto": 13}.get((asset or "").lower())
+            payload = f"renew:{user_id}:{sub_id}:{months}:{_money_str(price)}"
+            result = PlategaAPI.create_payment_url(user_id, price, payment_method=pm, method="platega_renew", payload=payload)
+            if result.get("ok"):
+                return {"ok": True, "payment_url": result["payment_url"], "transaction_id": result.get("transaction_id")}
+            return {"ok": False, "error": result.get("error", "Ошибка создания платежа")}
+        return {"ok": False, "error": "Неизвестный способ оплаты"}
+
+    @staticmethod
+    def change_plan(user_id: int, sub_id: str, plan_id: str, months: int) -> dict[str, Any]:
+        sub = storage.get_subscription(sub_id)
+        plan = storage.plan(plan_id)
+        if not sub or sub.user_id != user_id or not plan:
+            return {"ok": False, "error": "Подписка или тариф не найдены"}
+        if plan_id == "trial":
+            return {"ok": False, "error": "Нельзя сменить на пробный тариф"}
+        base_price = storage.price(plan_id, months)
+        if base_price is None:
+            return {"ok": False, "error": "Цена для выбранного срока не установлена"}
+        price = base_price
+        change_date = datetime.fromtimestamp(sub.expires_at).strftime("%d.%m.%Y")
+        sub.pending_plan_id = plan_id
+        sub.pending_plan_months = months
+        sub.pending_plan_price = price
+        sub.pending_plan_change_at = sub.expires_at
+        storage.update_subscription(sub)
+        return {
+            "ok": True,
+            "plan_name": plan.name,
+            "months": months,
+            "price": float(_money_round(price)),
+            "change_date": change_date,
+            "subscription": MiniAppAPI._subscription_dict(sub),
+        }
 
 
 class MetricsCollector:
@@ -3439,6 +3521,52 @@ class DeviceAuthServer:
             user_id = user.get("id", 0)
             plan_id = str(body.get("plan_id", ""))
             return JSONResponse(MiniAppAPI.purchase_stars_subscription(user_id, plan_id))
+
+        @app.post("/mini-app/api/activate-trial")
+        async def mini_app_activate_trial(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            return JSONResponse(MiniAppAPI.activate_trial(user_id))
+
+        @app.post("/mini-app/api/renew")
+        async def mini_app_renew(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            sub_id = str(body.get("sub_id", ""))
+            months = int(body.get("months", 0) or 0)
+            method = str(body.get("method", "balance")).lower()
+            asset = str(body.get("asset", "") or "")
+            return JSONResponse(MiniAppAPI.renew(user_id, sub_id, months, method, asset))
+
+        @app.post("/mini-app/api/change-plan")
+        async def mini_app_change_plan(request: Request) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="invalid json")
+            init_data = body.get("init_data") or ""
+            user = _verify_telegram_init_data(init_data)
+            if not user:
+                raise HTTPException(status_code=401, detail="invalid init_data")
+            user_id = user.get("id", 0)
+            sub_id = str(body.get("sub_id", ""))
+            plan_id = str(body.get("plan_id", ""))
+            months = int(body.get("months", 0) or 0)
+            return JSONResponse(MiniAppAPI.change_plan(user_id, sub_id, plan_id, months))
 
         @app.post("/mini-app/api/unbind-device")
         async def mini_app_unbind_device(request: Request) -> Any:
@@ -5280,8 +5408,6 @@ class UserBot:
         kb.add(B("🔗 Профиль", callback_data=f"{CB_PREFIX}profile"))
         kb.add(B("💳 Пополнить баланс", callback_data=f"{CB_PREFIX}deposit"))
         kb.add(B("❔ Помощь", callback_data=f"{CB_PREFIX}help", style="danger"))
-        if user_id is not None and not storage.get_user(user_id).get("trial_used"):
-            kb.add(B("🎁 Активировать пробный период", callback_data=f"{CB_PREFIX}trial"))
         return kb
 
     def _main_menu_text(self, user_id: int) -> str:
@@ -5306,8 +5432,8 @@ class UserBot:
             lines.append("❹ Лимит устройств: -")
         if bot_username:
             lines.append("")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=renew'>Продлить подписку</a>")
-            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?start=deposit'>Пополнить баланс</a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?startapp=renew'>Продлить подписку</a>")
+            lines.append(f"➡︎ <a href='https://t.me/{bot_username}?startapp=deposit'>Пополнить баланс</a>")
         return "\n".join(lines)
 
     def _main_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
@@ -5336,8 +5462,9 @@ class UserBot:
                 f"Баланс: {_money_str(storage.get_user(user_id).get('balance', 0))}₽")
         kb = K()
         kb.row_width = 1
-        kb.add(B("➡️ Продлить подписку", callback_data=f"{CB_PREFIX}sub_renew:{sub.sub_id}"))
-        kb.add(B("🔄 Сменить план", callback_data=f"{CB_PREFIX}change_plan:{sub.sub_id}"))
+        mini_url = storage.config.get("mini_app_public_url", "").rstrip("/")
+        if mini_url:
+            kb.add(B("📲 Продлить / Сменить тариф", web_app=WebAppInfo(url=f"{mini_url}?page=renew")))
         kb.add(B("📱 Устройства", callback_data=f"{CB_PREFIX}sub_devices:{sub.sub_id}"))
         kb.add(B("🔃 Перевыпустить подписку", callback_data=f"{CB_PREFIX}reissue:{sub.sub_id}"))
         kb.add(B("◀️ Назад", callback_data=f"{CB_PREFIX}main"))
