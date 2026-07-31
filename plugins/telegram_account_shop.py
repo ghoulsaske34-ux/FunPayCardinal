@@ -982,8 +982,6 @@ class AccountShopBot:
                 "support": self._handle_support,
                 "deposit_amount": self._handle_deposit_amount,
                 "deposit_crypto_asset": self._handle_deposit_crypto_asset,
-                "deposit_sbp": self._handle_deposit_sbp,
-                "deposit_confirm": self._handle_deposit_confirm,
                 "review": self._handle_review_text,
             }
             fn = dispatch.get(handler)
@@ -1078,14 +1076,14 @@ class AccountShopBot:
 
         elif action == "deposit":
             self._show_deposit_menu(c.from_user.id, c.message.chat.id, c.message.message_id)
-        elif action == "deposit_stars":
-            self._start_deposit_stars(c)
-        elif action == "deposit_crypto":
-            self._start_deposit_crypto(c)
-        elif action == "deposit_sbp":
-            self._start_deposit_sbp(c)
-        elif action == "deposit_confirm":
-            self._handle_deposit_confirm(c)
+        elif action == "deposit_amount":
+            self._on_deposit_amount(c)
+        elif action == "deposit_custom":
+            self._on_deposit_custom(c)
+        elif action == "deposit_method":
+            self._on_deposit_method(c)
+        elif action == "deposit_check":
+            self._handle_deposit_check(c)
         elif action == "review_start":
             self._start_review(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "review_publish":
@@ -1193,10 +1191,14 @@ class AccountShopBot:
             self.bot.send_message(chat_id, text, reply_markup=kb)
 
     def _show_deposit_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
-        text = "💳 Введите сумму пополнения в рублях (например 1000):"
-        self.user_states[user_id] = {"state": "deposit_amount", "method": "sbp", "next": "deposit_sbp"}
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        text = "💳 Выберите сумму пополнения:"
+        kb = InlineKeyboardMarkup(row_width=3)
+        amounts = [100, 200, 500, 1000, 2000, 5000]
+        kb.add(*[InlineKeyboardButton(f"{a}₽", callback_data=f"{CB}deposit_amount:{a}") for a in amounts])
+        kb.add(
+            InlineKeyboardButton("📝 Своя сумма", callback_data=f"{CB}deposit_custom"),
+            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"),
+        )
         if message_id:
             self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
         else:
@@ -1447,52 +1449,148 @@ class AccountShopBot:
         )
 
     # deposit flows
-    def _start_deposit_stars(self, c: CallbackQuery) -> None:
-        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "stars", "next": "deposit_stars"}
-        self.bot.edit_message_text(
-            "⭐ Введите сумму в рублях (например 100):",
-            c.message.chat.id, c.message.message_id,
-            reply_markup=self._back_keyboard(f"{CB}deposit"),
-        )
+    def _on_deposit_amount(self, c: CallbackQuery) -> None:
+        parts = c.data[len(CB):].split(":")
+        try:
+            amount_rub = float(int(parts[1]))
+        except Exception:
+            amount_rub = 0.0
+        self.user_states[c.from_user.id] = {"state": "deposit_method_select", "amount_rub": amount_rub}
+        self._show_deposit_methods(c.from_user.id, c.message.chat.id, c.message.message_id, amount_rub)
+        self.bot.answer_callback_query(c.id)
 
-    def _start_deposit_crypto(self, c: CallbackQuery) -> None:
-        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "crypto", "next": "deposit_crypto"}
+    def _on_deposit_custom(self, c: CallbackQuery) -> None:
+        self.user_states[c.from_user.id] = {"state": "deposit_amount"}
         self.bot.edit_message_text(
-            "💎 Введите сумму в рублях (например 500):",
+            "📝 Введите сумму пополнения в рублях:",
             c.message.chat.id, c.message.message_id,
             reply_markup=self._back_keyboard(f"{CB}deposit"),
         )
+        self.bot.answer_callback_query(c.id)
 
-    def _start_deposit_sbp(self, c: CallbackQuery) -> None:
-        self.user_states[c.from_user.id] = {"state": "deposit_amount", "method": "sbp", "next": "deposit_sbp"}
-        self.bot.edit_message_text(
-            "🏦 Введите сумму в рублях (например 1000):",
-            c.message.chat.id, c.message.message_id,
-            reply_markup=self._back_keyboard(f"{CB}deposit"),
+    def _show_deposit_methods(self, user_id: int, chat_id: int, message_id: int | None, amount_rub: float) -> None:
+        text = f"💳 Пополнение на {_money_str(amount_rub)}₽\n\nВыберите способ оплаты:"
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("⭐ Telegram Stars", callback_data=f"{CB}deposit_method:stars"),
+            InlineKeyboardButton("💎 Crypto Bot", callback_data=f"{CB}deposit_method:crypto"),
+            InlineKeyboardButton("🏦 СБП (Platega)", callback_data=f"{CB}deposit_method:sbp"),
+            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"),
         )
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _on_deposit_method(self, c: CallbackQuery) -> None:
+        parts = c.data[len(CB):].split(":")
+        method = parts[1] if len(parts) > 1 else "sbp"
+        state = self.user_states.get(c.from_user.id, {})
+        amount_rub = state.get("amount_rub", 0)
+        if not amount_rub:
+            self.bot.answer_callback_query(c.id, "Сначала выберите сумму")
+            return
+        if method == "stars":
+            self.bot.edit_message_text(
+                "⭐ Счёт Stars отправлен. Оплатите его в сообщении ниже.",
+                c.message.chat.id, c.message.message_id,
+                reply_markup=self._back_keyboard(f"{CB}main"),
+            )
+            self._send_stars_invoice(c.message.chat.id, c.from_user.id, amount_rub)
+        elif method == "crypto":
+            self.user_states[c.from_user.id] = {"state": "deposit_crypto_asset", "amount_rub": amount_rub}
+            self.bot.edit_message_text(
+                "💎 Введите код актива (например USDT, BTC, TON):",
+                c.message.chat.id, c.message.message_id,
+                reply_markup=self._back_keyboard(f"{CB}deposit"),
+            )
+        elif method == "sbp":
+            self._send_sbp_payment(c.message.chat.id, c.from_user.id, amount_rub, c.message.message_id)
+        self.bot.answer_callback_query(c.id)
 
     def _handle_deposit_amount(self, m: Message) -> None:
-        state = self.user_states.get(m.from_user.id, {})
         try:
             amount = _to_dec(m.text)
         except Exception:
             self.bot.send_message(m.chat.id, "❌ Введите число.")
             return
-        state["amount_rub"] = float(amount)
-        self.user_states[m.from_user.id] = state
-        next_step = state.get("next")
-        if next_step == "deposit_stars":
-            self._send_stars_invoice(m.chat.id, m.from_user.id, float(amount))
-        elif next_step == "deposit_crypto":
-            self.user_states[m.from_user.id]["step"] = "deposit_crypto_asset"
-            self.bot.send_message(
-                m.chat.id,
-                "💎 Введите код актива (например USDT, BTC, TON):",
-                reply_markup=self._back_keyboard(f"{CB}deposit"),
-            )
-        elif next_step == "deposit_sbp":
-            self.user_states[m.from_user.id]["step"] = "deposit_sbp"
-            self._send_sbp_instructions(m.chat.id, m.from_user.id, float(amount))
+        amount_rub = float(amount)
+        self.user_states[m.from_user.id] = {"state": "deposit_method_select", "amount_rub": amount_rub}
+        self._show_deposit_methods(m.from_user.id, m.chat.id, None, amount_rub)
+
+    def _send_sbp_payment(self, chat_id: int, user_id: int, amount_rub: float, message_id: int | None = None) -> None:
+        if not self.storage.get_config("platega_secret") or not self.storage.get_config("platega_merchant_id"):
+            text = "❌ Platega не настроен. Обратитесь к администратору."
+            if message_id:
+                self.bot.edit_message_text(text, chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}main"))
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=self._back_keyboard(f"{CB}main"))
+            self.user_states.pop(user_id, None)
+            return
+        tx = self._create_platega_transaction(user_id, amount_rub)
+        if not tx:
+            text = "❌ Не удалось создать платёж. Попробуйте позже."
+            if message_id:
+                self.bot.edit_message_text(text, chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}main"))
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=self._back_keyboard(f"{CB}main"))
+            self.user_states.pop(user_id, None)
+            return
+        transaction_id = tx.get("transactionId")
+        redirect = tx.get("redirect") or tx.get("url") or ""
+        qr = tx.get("qr") or ""
+        if transaction_id and not qr:
+            set_resp = self._set_platega_payment_method(transaction_id)
+            qr = (set_resp or {}).get("qr") or ""
+        pay_url = redirect or qr or ""
+        text = (
+            f"🏦 Оплатите {_money_str(amount_rub)}₽ по СБП\n\n"
+            f"QR/ссылка:\n<code>{qr or pay_url}</code>\n\n"
+            f"После оплаты нажмите «Проверить оплату» или дождитесь автоматического зачисления."
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        if pay_url:
+            kb.add(InlineKeyboardButton("🔗 Перейти к оплате", url=pay_url))
+        if transaction_id:
+            kb.add(InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"{CB}deposit_check:{transaction_id}"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb, parse_mode="HTML")
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        self.user_states.pop(user_id, None)
+        if transaction_id:
+            threading.Thread(target=self._poll_platega, args=(transaction_id, user_id, amount_rub), daemon=True, name=f"PlategaPoll-{transaction_id}").start()
+
+    def _handle_deposit_check(self, c: CallbackQuery) -> None:
+        parts = c.data[len(CB):].split(":")
+        transaction_id = parts[1] if len(parts) > 1 else ""
+        if not transaction_id:
+            self.bot.answer_callback_query(c.id, "Неизвестный платёж")
+            return
+        data = self._get_platega_transaction(transaction_id)
+        if not data:
+            self.bot.answer_callback_query(c.id, "Не удалось получить статус. Попробуйте позже.")
+            return
+        status = (data.get("status") or "").upper()
+        if status == "CONFIRMED":
+            deposit = self.storage.get_deposit_by_external(transaction_id)
+            if deposit and deposit.get("status") != "paid":
+                self.storage.confirm_deposit(deposit["id"])
+                try:
+                    self.bot.send_message(
+                        c.message.chat.id,
+                        f"✅ Оплата получена. Баланс пополнен на {_money_str(deposit['amount_rub'])}₽.",
+                        reply_markup=self._main_keyboard(c.from_user.id),
+                    )
+                except Exception:
+                    pass
+                self._notify_admins(f"💰 СБП пополнение от {c.from_user.id} на {_money_str(deposit['amount_rub'])}₽")
+            self.bot.answer_callback_query(c.id, "✅ Оплата получена!")
+        elif status in ("CANCELED", "FAILED", "EXPIRED"):
+            self.bot.answer_callback_query(c.id, "❌ Платёж не был завершён.")
+        else:
+            self.bot.answer_callback_query(c.id, "⏳ Платёж ещё не получен. Попробуйте позже.")
 
     def _send_stars_invoice(self, chat_id: int, user_id: int, amount_rub: float) -> None:
         rate = self.storage.get_config("stars_to_rub") or DEFAULT_STARS_TO_RUB
