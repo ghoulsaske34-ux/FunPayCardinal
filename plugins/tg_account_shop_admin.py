@@ -539,6 +539,8 @@ class ShopAdminPanel:
         "reviews_channel": "Канал отзывов",
         "reviews_moderation_chat_id": "ID чата модерации",
         "bot_token": "Токен бота",
+        "crypto_bot_token": "Токен Crypto Bot",
+        "crypto_bot_name": "Юзернейм Crypto Bot",
         "platega_merchant_id": "Platega merchant ID",
     }
 
@@ -547,7 +549,7 @@ class ShopAdminPanel:
         kb = InlineKeyboardMarkup(row_width=1)
         for key, label in self.CFG_LABELS.items():
             val = self.storage.get_config(key, "")
-            if key == "bot_token" and val and isinstance(val, str) and len(val) > 12:
+            if key in ("bot_token", "crypto_bot_token") and val and isinstance(val, str) and len(val) > 12:
                 val = val[:8] + "..." + val[-4:]
             if key == "platega_merchant_id" and val and isinstance(val, str) and len(val) > 12:
                 val = val[:8] + "..." + val[-8:]
