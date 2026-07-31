@@ -865,13 +865,13 @@ class AccountShopBot:
             elif not reviews_url.startswith(("http://", "https://")):
                 reviews_url = f"https://t.me/{reviews_url}"
         kb.add(
-            InlineKeyboardButton("🟢 📲 Купить аккаунт", callback_data=f"{CB}buy"),
+            InlineKeyboardButton("📲 Купить аккаунт", callback_data=f"{CB}buy", style="success"),
             InlineKeyboardButton("🗂️ Мои аккаунты", callback_data=f"{CB}my_purchases"),
             InlineKeyboardButton("💳 Пополнить баланс", callback_data=f"{CB}deposit"),
         )
         if reviews_url:
             kb.add(InlineKeyboardButton("📕 Отзывы", url=reviews_url))
-        kb.add(InlineKeyboardButton("🔴 ❔ Помощь", callback_data=f"{CB}support"))
+        kb.add(InlineKeyboardButton("❔ Помощь", callback_data=f"{CB}support", style="danger"))
         return kb
 
     def _main_text(self, user_id: int, first_name: str | None = None) -> str:
