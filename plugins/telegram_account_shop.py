@@ -45,6 +45,7 @@ BIND_TO_DELETE = None
 
 # --- константы ---
 CB = "tgshop:"
+CB_ADMIN = "tgsa:"
 STORAGE_DIR = Path("storage/cache/tg_account_shop")
 SESSIONS_DIR = STORAGE_DIR / "sessions"
 DB_FILE = STORAGE_DIR / "shop.db"
@@ -539,6 +540,14 @@ class AccountStorage:
             rows = conn.execute(
                 "SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC LIMIT ?",
                 (user_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_deposits(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deposits ORDER BY id DESC LIMIT ?",
+                (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -2376,40 +2385,12 @@ def init_plugin(cardinal: Any) -> None:
     logger.info("[TelegramAccountShop] Инициализация бота")
     _shop_bot = AccountShopBot(token, _storage, cardinal=cardinal)
 
-    # регистрация в ПУ Cardinal (до default_cp, чтобы кнопки работали)
+    # Регистрация админ-панели в Cardinal ПУ
     try:
-        cardinal.add_telegram_commands(
-            UUID,
-            [
-                ("shopstart", "Главное меню", False),
-                ("shopprofile", "Мой профиль", False),
-                ("shopsupport", "Поддержка", False),
-                ("shopsetup", "Код администратора", False),
-            ],
-        )
+        import tg_account_shop_admin
+        tg_account_shop_admin.register(cardinal, _storage, _shop_bot, UUID)
     except Exception:
-        logger.exception("Ошибка регистрации команд в Cardinal")
-
-    if CBT_FPC and cardinal and hasattr(cardinal, "telegram") and cardinal.telegram:
-        def open_plugin_settings(c: CallbackQuery):
-            username = _shop_bot.bot_username if _shop_bot else ""
-            kb = InlineKeyboardMarkup(row_width=1)
-            if username:
-                kb.add(InlineKeyboardButton("🛠 Админ-меню в боте", url=f"https://t.me/{username}?start=admin"))
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CBT_FPC.PLUGINS_LIST}:0"))
-            cardinal.telegram.bot.edit_message_text(
-                f"<b>Telegram Account Shop</b>\n\n"
-                f"Для управления откройте админ-меню в боте @{username or '...'}.\n"
-                f"Код первичной настройки: <code>{_shop_bot._setup_password if _shop_bot else ''}</code>",
-                c.message.chat.id, c.message.message_id,
-                reply_markup=kb, parse_mode="HTML",
-            )
-            cardinal.telegram.bot.answer_callback_query(c.id)
-
-        cardinal.telegram.cbq_handler(
-            open_plugin_settings,
-            lambda c: c.data.startswith(f"{CBT_FPC.PLUGIN_SETTINGS}:{UUID}:"),
-        )
+        logger.exception("Ошибка регистрации админ-панели в Cardinal")
 
 
 def start_plugin(cardinal: Any) -> None:

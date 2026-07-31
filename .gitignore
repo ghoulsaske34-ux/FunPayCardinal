@@ -8,6 +8,7 @@
 /configs
 /plugins/*
 !/plugins/telegram_account_shop.py
+!/plugins/tg_account_shop_admin.py
 /build
 /dist
 test.py
