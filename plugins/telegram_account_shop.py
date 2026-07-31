@@ -57,8 +57,9 @@ STATUS_AVAILABLE = "available"
 STATUS_SOLD = "sold"
 STATUS_LISTENING = "listening"
 
-DEFAULT_STARS_TO_RUB = 1.5
+DEFAULT_STARS_PER_RUB = 1.3
 DEFAULT_USDT_TO_RUB = 90.0
+DEFAULT_TON_TO_RUB = 300.0
 
 PLATEGA_BASE = "https://app.platega.io"
 PLATEGA_PAYFORM = "https://pay.platega.io"
@@ -981,7 +982,6 @@ class AccountShopBot:
                 "admin_create_category": self._handle_admin_create_category,
                 "support": self._handle_support,
                 "deposit_amount": self._handle_deposit_amount,
-                "deposit_crypto_asset": self._handle_deposit_crypto_asset,
                 "review": self._handle_review_text,
             }
             fn = dispatch.get(handler)
@@ -1082,6 +1082,8 @@ class AccountShopBot:
             self._on_deposit_custom(c)
         elif action == "deposit_method":
             self._on_deposit_method(c)
+        elif action == "deposit_crypto":
+            self._on_deposit_crypto(c)
         elif action == "deposit_check":
             self._handle_deposit_check(c)
         elif action == "review_start":
@@ -1472,7 +1474,7 @@ class AccountShopBot:
         kb.add(
             InlineKeyboardButton("⭐ Telegram Stars", callback_data=f"{CB}deposit_method:stars"),
             InlineKeyboardButton("💎 Crypto Bot", callback_data=f"{CB}deposit_method:crypto"),
-            InlineKeyboardButton("🏦 СБП (Platega)", callback_data=f"{CB}deposit_method:sbp"),
+            InlineKeyboardButton("🏦 СБП", callback_data=f"{CB}deposit_method:sbp"),
             InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"),
         )
         if message_id:
@@ -1496,12 +1498,7 @@ class AccountShopBot:
             )
             self._send_stars_invoice(c.message.chat.id, c.from_user.id, amount_rub)
         elif method == "crypto":
-            self.user_states[c.from_user.id] = {"state": "deposit_crypto_asset", "amount_rub": amount_rub}
-            self.bot.edit_message_text(
-                "💎 Введите код актива (например USDT, BTC, TON):",
-                c.message.chat.id, c.message.message_id,
-                reply_markup=self._back_keyboard(f"{CB}deposit"),
-            )
+            self._show_crypto_assets(c, amount_rub)
         elif method == "sbp":
             self._send_sbp_payment(c.message.chat.id, c.from_user.id, amount_rub, c.message.message_id)
         self.bot.answer_callback_query(c.id)
@@ -1518,7 +1515,7 @@ class AccountShopBot:
 
     def _send_sbp_payment(self, chat_id: int, user_id: int, amount_rub: float, message_id: int | None = None) -> None:
         if not self.storage.get_config("platega_secret") or not self.storage.get_config("platega_merchant_id"):
-            text = "❌ Platega не настроен. Обратитесь к администратору."
+            text = "❌ СБП не настроен. Обратитесь к администратору."
             if message_id:
                 self.bot.edit_message_text(text, chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}main"))
             else:
@@ -1540,10 +1537,10 @@ class AccountShopBot:
         if transaction_id and not qr:
             set_resp = self._set_platega_payment_method(transaction_id)
             qr = (set_resp or {}).get("qr") or ""
-        pay_url = redirect or qr or ""
+        pay_url = qr or redirect or ""
         text = (
             f"🏦 Оплатите {_money_str(amount_rub)}₽ по СБП\n\n"
-            f"QR/ссылка:\n<code>{qr or pay_url}</code>\n\n"
+            f"Ссылка/QR:\n<code>{qr or pay_url}</code>\n\n"
             f"После оплаты нажмите «Проверить оплату» или дождитесь автоматического зачисления."
         )
         kb = InlineKeyboardMarkup(row_width=1)
@@ -1591,8 +1588,8 @@ class AccountShopBot:
             self.bot.answer_callback_query(c.id, "⏳ Платёж ещё не получен. Попробуйте позже.")
 
     def _send_stars_invoice(self, chat_id: int, user_id: int, amount_rub: float) -> None:
-        rate = self.storage.get_config("stars_to_rub") or DEFAULT_STARS_TO_RUB
-        stars_amount = max(1, int(amount_rub / float(rate)))
+        rate = self.storage.get_config("stars_per_rub") or DEFAULT_STARS_PER_RUB
+        stars_amount = max(1, int(amount_rub * float(rate)))
         title = f"Пополнение баланса на {amount_rub}₽"
         description = f"После оплаты {_money_str(amount_rub)}₽ будут зачислены на ваш баланс."
         payload = f"stars_{user_id}_{uuid.uuid4().hex[:8]}"
@@ -1626,45 +1623,105 @@ class AccountShopBot:
         else:
             self.bot.send_message(m.chat.id, "✅ Оплата получена. Обратитесь в поддержку.")
 
-    def _handle_deposit_crypto_asset(self, m: Message) -> None:
-        state = self.user_states.get(m.from_user.id, {})
-        asset = (m.text or "").strip().upper()
-        if asset not in ("USDT", "BTC", "TON", "ETH", "LTC"):
+    def _show_crypto_assets(self, c: CallbackQuery, amount_rub: float) -> None:
+        text = f"💎 Выберите валюту для пополнения на {_money_str(amount_rub)}₽:"
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("USDT", callback_data=f"{CB}deposit_crypto:USDT"),
+            InlineKeyboardButton("TON", callback_data=f"{CB}deposit_crypto:TON"),
+        )
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+    def _on_deposit_crypto(self, c: CallbackQuery) -> None:
+        parts = c.data[len(CB):].split(":")
+        asset = parts[1] if len(parts) > 1 else "USDT"
+        if asset not in ("USDT", "TON"):
             asset = "USDT"
+        state = self.user_states.get(c.from_user.id, {})
         amount_rub = state.get("amount_rub", 0)
-        rate = self.storage.get_config("usdt_to_rub") or DEFAULT_USDT_TO_RUB
-        foreign = round(amount_rub / float(rate), 6) if asset == "USDT" else None
-        payload = f"crypto_{m.from_user.id}_{uuid.uuid4().hex[:8]}"
-        description = f"Пополнение на {amount_rub}₽"
+        if not amount_rub:
+            self.bot.answer_callback_query(c.id, "Сначала выберите сумму")
+            return
         if not self.storage.get_config("crypto_bot_token"):
-            self.bot.send_message(
-                m.chat.id,
+            self.bot.edit_message_text(
                 "❌ Crypto Bot не настроен. Обратитесь к администратору.",
+                c.message.chat.id, c.message.message_id,
                 reply_markup=self._back_keyboard(f"{CB}deposit"),
             )
-            self.user_states.pop(m.from_user.id, None)
+            self.user_states.pop(c.from_user.id, None)
             return
+        rate = self._get_crypto_rate(asset)
+        if not rate:
+            self.bot.answer_callback_query(c.id, "Не удалось получить курс. Попробуйте позже.")
+            return
+        foreign = round(amount_rub / float(rate), 6)
+        payload = f"crypto_{c.from_user.id}_{uuid.uuid4().hex[:8]}"
+        description = f"Пополнение баланса на {amount_rub}₽"
         invoice_id = self._create_crypto_invoice(amount_rub, asset, description, payload)
         if not invoice_id:
-            self.bot.send_message(m.chat.id, "❌ Не удалось создать счёт в Crypto Bot.", reply_markup=self._back_keyboard(f"{CB}deposit"))
-            self.user_states.pop(m.from_user.id, None)
+            self.bot.edit_message_text(
+                "❌ Не удалось создать счёт в Crypto Bot.",
+                c.message.chat.id, c.message.message_id,
+                reply_markup=self._back_keyboard(f"{CB}deposit"),
+            )
+            self.user_states.pop(c.from_user.id, None)
             return
-        self.storage.add_deposit(m.from_user.id, "crypto", amount_rub, payload=payload, external_id=str(invoice_id), foreign_amount=f"{foreign} {asset}")
+        self.storage.add_deposit(c.from_user.id, "crypto", amount_rub, payload=payload, external_id=str(invoice_id), foreign_amount=f"{foreign} {asset}")
+        crypto_bot_name = self.storage.get_config("crypto_bot_name") or "CryptoBot"
+        pay_url = f"https://t.me/{crypto_bot_name}?start={invoice_id}"
         text = (
-            f"💎 Счёт в Crypto Bot создан.\n"
-            f"Сумма: {amount_rub}₽ (~{foreign} {asset})\n"
-            f"Перейдите по ссылке и оплатите: https://t.me/{self.storage.get_config('crypto_bot_name') or 'CryptoBot'}?start={invoice_id}"
+            f"💎 Счёт Crypto Bot создан.\n"
+            f"Сумма: {amount_rub}₽ (~{foreign} {asset})\n\n"
+            f"Перейдите по ссылке и оплатите:\n{pay_url}"
         )
         kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("🔗 Перейти к оплате", url=pay_url))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"))
-        self.bot.send_message(m.chat.id, text, reply_markup=kb)
-        self.user_states.pop(m.from_user.id, None)
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb, disable_web_page_preview=True)
+        self.user_states.pop(c.from_user.id, None)
+        self.bot.answer_callback_query(c.id)
+
+    def _get_crypto_exchange_rates(self) -> dict[str, float]:
+        token = self.storage.get_config("crypto_bot_token")
+        if not token:
+            return {}
+        data = self._crypto_api_call("getExchangeRates", token)
+        if not data or not data.get("ok"):
+            logger.error("CryptoBot getExchangeRates error: %s", data)
+            return {}
+        rates = {}
+        for item in data.get("result", []):
+            if item.get("target") == "RUB":
+                source = item.get("source")
+                try:
+                    rates[source] = float(item.get("rate", "0"))
+                except Exception:
+                    pass
+        for asset, rate in rates.items():
+            if asset in ("USDT", "TON"):
+                self.storage.set_config(f"{asset.lower()}_to_rub", rate)
+        return rates
+
+    def _get_crypto_rate(self, asset: str) -> float | None:
+        rates = self._get_crypto_exchange_rates()
+        if rates and asset in rates:
+            return rates[asset]
+        fallback = self.storage.get_config(f"{asset.lower()}_to_rub")
+        if fallback:
+            try:
+                return float(fallback)
+            except Exception:
+                pass
+        return {"USDT": DEFAULT_USDT_TO_RUB, "TON": DEFAULT_TON_TO_RUB}.get(asset)
 
     def _create_crypto_invoice(self, amount_rub: float, asset: str, description: str, payload: str) -> str | None:
         token = self.storage.get_config("crypto_bot_token")
         if not token:
             return None
-        rate = self.storage.get_config("usdt_to_rub") or DEFAULT_USDT_TO_RUB
+        rate = self._get_crypto_rate(asset)
+        if not rate:
+            return None
         amount = round(amount_rub / float(rate), 6)
         try:
             resp = requests.post(
@@ -1795,36 +1852,6 @@ class AccountShopBot:
             logger.exception("Platega set payment method")
         return None
 
-    def _send_sbp_instructions(self, chat_id: int, user_id: int, amount_rub: float) -> None:
-        if not self.storage.get_config("platega_secret") or not self.storage.get_config("platega_merchant_id"):
-            self.bot.send_message(chat_id, "❌ Platega не настроен. Обратитесь к администратору.", reply_markup=self._back_keyboard(f"{CB}main"))
-            self.user_states.pop(user_id, None)
-            return
-        tx = self._create_platega_transaction(user_id, amount_rub)
-        if not tx:
-            self.bot.send_message(chat_id, "❌ Не удалось создать платёж. Попробуйте позже.", reply_markup=self._back_keyboard(f"{CB}main"))
-            self.user_states.pop(user_id, None)
-            return
-        transaction_id = tx.get("transactionId")
-        qr = tx.get("qr") or ""
-        if not qr and transaction_id:
-            set_resp = self._set_platega_payment_method(transaction_id)
-            qr = (set_resp or {}).get("qr") or ""
-        if not qr:
-            redirect = tx.get("redirect") or tx.get("url") or ""
-            qr = redirect
-        text = (
-            f"🏦 Оплатите {_money_str(amount_rub)}₽ по СБП (QR НСПК):\n"
-            f"<code>{qr}</code>\n\n"
-            f"После оплаты баланс зачислится автоматически."
-        )
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        self.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
-        self.user_states.pop(user_id, None)
-        if transaction_id:
-            threading.Thread(target=self._poll_platega, args=(transaction_id, user_id, amount_rub), daemon=True, name=f"PlategaPoll-{transaction_id}").start()
-
     def _poll_platega(self, transaction_id: str, user_id: int, amount_rub: float) -> None:
         checked = 0
         while checked < 180:
@@ -1853,14 +1880,6 @@ class AccountShopBot:
                 except Exception:
                     pass
                 break
-
-    def _handle_deposit_sbp(self, m: Message) -> None:
-        # handled by deposit flow; messages here ignored
-        self.bot.send_message(m.chat.id, "Введите сумму пополнения.", reply_markup=self._back_keyboard(f"{CB}main"))
-
-    def _handle_deposit_confirm(self, c: CallbackQuery) -> None:
-        # Not used with Platega (auto-confirmation via polling)
-        self.bot.answer_callback_query(c.id, "Платёж подтверждается автоматически.")
 
     # admin flows
     def _show_admin_add_menu(self, chat_id: int, message_id: int | None = None) -> None:
