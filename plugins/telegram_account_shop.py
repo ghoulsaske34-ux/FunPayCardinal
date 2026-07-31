@@ -1658,8 +1658,8 @@ class AccountShopBot:
         foreign = round(amount_rub / float(rate), 6)
         payload = f"crypto_{c.from_user.id}_{uuid.uuid4().hex[:8]}"
         description = f"Пополнение баланса на {amount_rub}₽"
-        invoice_id = self._create_crypto_invoice(amount_rub, asset, description, payload)
-        if not invoice_id:
+        invoice = self._create_crypto_invoice(amount_rub, asset, description, payload)
+        if not invoice:
             self.bot.edit_message_text(
                 "❌ Не удалось создать счёт в Crypto Bot.",
                 c.message.chat.id, c.message.message_id,
@@ -1667,9 +1667,13 @@ class AccountShopBot:
             )
             self.user_states.pop(c.from_user.id, None)
             return
+        invoice_id = invoice.get("invoice_id")
+        pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
+        if not pay_url:
+            hash_ = invoice.get("hash") or str(invoice_id)
+            crypto_bot_name = self.storage.get_config("crypto_bot_name") or "CryptoBot"
+            pay_url = f"https://t.me/{crypto_bot_name}?start={hash_}"
         self.storage.add_deposit(c.from_user.id, "crypto", amount_rub, payload=payload, external_id=str(invoice_id), foreign_amount=f"{foreign} {asset}")
-        crypto_bot_name = self.storage.get_config("crypto_bot_name") or "CryptoBot"
-        pay_url = f"https://t.me/{crypto_bot_name}?start={invoice_id}"
         text = (
             f"💎 Счёт Crypto Bot создан.\n"
             f"Сумма: {amount_rub}₽ (~{foreign} {asset})\n\n"
@@ -1715,7 +1719,7 @@ class AccountShopBot:
                 pass
         return {"USDT": DEFAULT_USDT_TO_RUB, "TON": DEFAULT_TON_TO_RUB}.get(asset)
 
-    def _create_crypto_invoice(self, amount_rub: float, asset: str, description: str, payload: str) -> str | None:
+    def _create_crypto_invoice(self, amount_rub: float, asset: str, description: str, payload: str) -> dict | None:
         token = self.storage.get_config("crypto_bot_token")
         if not token:
             return None
@@ -1727,12 +1731,18 @@ class AccountShopBot:
             resp = requests.post(
                 "https://pay.crypt.bot/api/createInvoice",
                 headers={"Crypto-Pay-API-Token": token},
-                json={"asset": asset, "amount": str(amount), "description": description, "payload": payload, "paid_btn_name": "openBot", "paid_btn_url": f"https://t.me/{self.storage.get_config('bot_username') or 'shop'}"},
+                json={
+                    "currency_type": "crypto",
+                    "asset": asset,
+                    "amount": str(amount),
+                    "description": description,
+                    "payload": payload,
+                },
                 timeout=20,
             )
             data = resp.json()
             if data.get("ok"):
-                return data["result"]["invoice_id"]
+                return data.get("result")
             logger.error("CryptoBot createInvoice error: %s", data)
         except Exception:
             logger.exception("CryptoBot createInvoice")
@@ -1760,7 +1770,7 @@ class AccountShopBot:
         threading.Thread(target=poll, daemon=True, name="CryptoShopPoll").start()
 
     def _poll_crypto_invoices(self, token: str) -> None:
-        data = self._crypto_api_call("getInvoices", token, {"status": "paid", "limit": 100})
+        data = self._crypto_api_call("getInvoices", token, {"status": "paid", "count": 100})
         if not data or not data.get("ok"):
             return
         for inv in data.get("result", {}).get("items", []):
