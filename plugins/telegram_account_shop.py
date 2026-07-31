@@ -864,6 +864,9 @@ class AccountShopBot:
                 reviews_url = f"https://t.me/{reviews_url[1:]}"
             elif not reviews_url.startswith(("http://", "https://")):
                 reviews_url = f"https://t.me/{reviews_url}"
+        support = self.storage.get_config("support_contact") or ""
+        if support and not support.startswith(("http://", "https://", "tg://")):
+            support = f"https://t.me/{support.lstrip('@')}"
         kb.add(
             InlineKeyboardButton("📲 Купить аккаунт", callback_data=f"{CB}buy", style="success"),
             InlineKeyboardButton("🗂️ Мои аккаунты", callback_data=f"{CB}my_purchases"),
@@ -871,7 +874,10 @@ class AccountShopBot:
         )
         if reviews_url:
             kb.add(InlineKeyboardButton("📕 Отзывы", url=reviews_url))
-        kb.add(InlineKeyboardButton("❔ Помощь", callback_data=f"{CB}support", style="danger"))
+        if support:
+            kb.add(InlineKeyboardButton("❔ Помощь", url=support, style="danger"))
+        else:
+            kb.add(InlineKeyboardButton("❔ Помощь", callback_data=f"{CB}support", style="danger"))
         return kb
 
     def _main_text(self, user_id: int, first_name: str | None = None) -> str:
@@ -1017,6 +1023,11 @@ class AccountShopBot:
 
     def _handle_support(self, m: Message) -> None:
         self.user_states.pop(m.from_user.id, None)
+        support = self.storage.get_config("support_contact") or ""
+        if support:
+            username = support.lstrip("@")
+            self.bot.send_message(m.chat.id, f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>", parse_mode="HTML", reply_markup=self._main_keyboard(m.from_user.id))
+            return
         self._notify_admins(f"🆘 Поддержка от @{m.from_user.username or m.from_user.id} (ID {m.from_user.id}):\n{m.text}")
         self.bot.send_message(m.chat.id, "✅ Сообщение отправлено администратору.", reply_markup=self._main_keyboard(m.from_user.id))
 
@@ -1048,8 +1059,13 @@ class AccountShopBot:
         elif action == "profile":
             self._show_profile(c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "support":
-            self.user_states[c.from_user.id] = {"state": "support"}
-            self.bot.edit_message_text("🆘 Опишите проблему. Мы ответим в ближайшее время.", c.message.chat.id, c.message.message_id)
+            support = self.storage.get_config("support_contact") or ""
+            if support:
+                username = support.lstrip("@")
+                self.bot.send_message(c.message.chat.id, f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>", parse_mode="HTML", reply_markup=self._main_keyboard(c.from_user.id))
+            else:
+                self.user_states[c.from_user.id] = {"state": "support"}
+                self.bot.edit_message_text("🆘 Опишите проблему. Мы ответим в ближайшее время.", c.message.chat.id, c.message.message_id)
 
         elif action == "deposit":
             self._show_deposit_menu(c.from_user.id, c.message.chat.id, c.message.message_id)
@@ -2357,20 +2373,18 @@ def init_plugin(cardinal: Any) -> None:
         logger.warning("[TelegramAccountShop] bot_token не задан. Создайте storage/cache/tg_account_shop/config.json с bot_token.")
         return
 
-    # лениво стартуем Pyrogram clients
     logger.info("[TelegramAccountShop] Инициализация бота")
     _shop_bot = AccountShopBot(token, _storage, cardinal=cardinal)
-    threading.Thread(target=_shop_bot.run, daemon=True, name="TgAccountShopBot").start()
 
-    # регистрация в ПУ Cardinal
+    # регистрация в ПУ Cardinal (до default_cp, чтобы кнопки работали)
     try:
         cardinal.add_telegram_commands(
             UUID,
             [
-                ("start", "Главное меню", True),
-                ("profile", "Мой профиль", True),
-                ("support", "Поддержка", True),
-                ("setup", "Код администратора", False),
+                ("shopstart", "Главное меню", False),
+                ("shopprofile", "Мой профиль", False),
+                ("shopsupport", "Поддержка", False),
+                ("shopsetup", "Код администратора", False),
             ],
         )
     except Exception:
@@ -2397,6 +2411,12 @@ def init_plugin(cardinal: Any) -> None:
             lambda c: c.data.startswith(f"{CBT_FPC.PLUGIN_SETTINGS}:{UUID}:"),
         )
 
+
+def start_plugin(cardinal: Any) -> None:
+    if _shop_bot:
+        threading.Thread(target=_shop_bot.run, daemon=True, name="TgAccountShopBot").start()
+
+
 def stop_plugin(cardinal: Any) -> None:
     global _shop_bot
     for client in list(_active_clients.values()):
@@ -2409,5 +2429,6 @@ def stop_plugin(cardinal: Any) -> None:
         _shop_bot.stop()
         _shop_bot = None
 
-BIND_TO_POST_START = [init_plugin]
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_POST_START = [start_plugin]
 BIND_TO_PRE_STOP = [stop_plugin]
