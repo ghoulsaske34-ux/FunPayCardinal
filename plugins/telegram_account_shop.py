@@ -1464,11 +1464,13 @@ class AccountShopBot:
         state = self.user_states.get(m.from_user.id, {})
         step = state.get("step")
         if step == "price":
-            self._save_price_then_accounts(m.from_user.id, m.chat.id, m.text or "0", state.get("created_categories", []), state.get("lines", []))
+            self._save_price_then_accounts(
+                m.from_user.id, m.chat.id, m.text or "0",
+                state.get("created_categories", []), state.get("pending_lines", [])
+            )
             return
 
         lines = (m.text or "").strip().splitlines()
-        added = 0
         errors: list[str] = []
         created_categories: list[str] = []
         pending_lines: list[tuple[str, str, str]] = []  # cat, phone, session
@@ -1500,13 +1502,13 @@ class AccountShopBot:
             cat_row = self.storage.ensure_category(cat)
             if cat_row.get("price", 0) == 0 and cat not in created_categories:
                 created_categories.append(cat)
-            self.storage.add_account(cat_row["id"], phone, session, proxy=state.get("proxy"))
-            added += 1
+            pending_lines.append((cat, phone, session))
 
         if created_categories:
             self.user_states[m.from_user.id] = {
                 "state": "admin_add_session_text", "step": "price",
-                "created_categories": created_categories, "lines": lines,
+                "created_categories": created_categories, "pending_lines": pending_lines,
+                "errors": errors, "proxy": state.get("proxy"),
             }
             self.bot.send_message(
                 m.chat.id,
@@ -1516,13 +1518,14 @@ class AccountShopBot:
             )
             return
 
+        added = self._add_pending_lines(m.from_user.id, pending_lines)
         msg = f"✅ Добавлено аккаунтов: {added}\n"
         if errors:
             msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
         self.user_states.pop(m.from_user.id, None)
         self.bot.send_message(m.chat.id, msg, reply_markup=self._admin_keyboard())
 
-    def _save_price_then_accounts(self, user_id: int, chat_id: int, price_text: str, created_categories: list[str], lines: list[str]) -> None:
+    def _save_price_then_accounts(self, user_id: int, chat_id: int, price_text: str, created_categories: list[str], pending_lines: list[tuple[str, str, str]]) -> None:
         try:
             price = _to_dec(price_text)
         except Exception:
@@ -1532,35 +1535,19 @@ class AccountShopBot:
             cat = self.storage.get_category_by_name(cat_name)
             if cat:
                 self.storage.update_category_price(cat["id"], float(price))
-        # reprocess lines and add accounts with correct category
-        added = 0
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            cat: str | None = None
-            data = line
-            if ":" in line:
-                maybe_cat, maybe_data = line.split(":", 1)
-                maybe_cat = maybe_cat.strip()
-                maybe_data = maybe_data.strip()
-                if maybe_cat and "|" in maybe_data:
-                    cat = maybe_cat
-                    data = maybe_data
-            if "|" not in data:
-                continue
-            phone, session = data.split("|", 1)
-            phone = phone.strip()
-            session = session.strip()
-            if not phone or not session:
-                continue
-            if cat is None:
-                cat = _detect_country(phone)
-            cat_row = self.storage.ensure_category(cat)
-            self.storage.add_account(cat_row["id"], phone, session, proxy=state.get("proxy"))
-            added += 1
+        added = self._add_pending_lines(user_id, pending_lines)
         self.user_states.pop(user_id, None)
         self.bot.send_message(chat_id, f"✅ Добавлено аккаунтов: {added}. Цена {price}₽ установлена.", reply_markup=self._admin_keyboard())
+
+    def _add_pending_lines(self, user_id: int, pending_lines: list[tuple[str, str, str]]) -> int:
+        user_state = self.user_states.get(user_id, {})
+        proxy = user_state.get("proxy")
+        added = 0
+        for cat, phone, session in pending_lines:
+            cat_row = self.storage.ensure_category(cat)
+            self.storage.add_account(cat_row["id"], phone, session, proxy=proxy)
+            added += 1
+        return added
 
     def _handle_admin_add_custom(self, m: Message) -> None:
         state = self.user_states.get(m.from_user.id, {})
