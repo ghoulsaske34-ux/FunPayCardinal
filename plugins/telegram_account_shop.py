@@ -24,6 +24,11 @@ from pyrogram.handlers import MessageHandler
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, BotCommand
 
 try:
+    from tg_bot import CBT as CBT_FPC
+except Exception:
+    CBT_FPC = None
+
+try:
     import phonenumbers
 except Exception:
     phonenumbers = None
@@ -34,7 +39,7 @@ VERSION = "2.1.0"
 DESCRIPTION = "Telegram-магазин аккаунтов с автовыдачей SMS/кодов через Pyrogram"
 CREDITS = "@ghoulsaske34"
 UUID = "85d48499-79da-462e-af82-9feb2c399d7c"
-SETTINGS_PAGE = False
+SETTINGS_PAGE = True
 BIND_TO_DELETE = None
 
 # --- константы ---
@@ -52,6 +57,9 @@ STATUS_LISTENING = "listening"
 
 DEFAULT_STARS_TO_RUB = 1.5
 DEFAULT_USDT_TO_RUB = 90.0
+
+PLATEGA_BASE = "https://app.platega.io"
+PLATEGA_SBP = 2
 
 # --- утилиты ---
 def _to_dec(value: Any) -> Decimal:
@@ -258,6 +266,22 @@ class AccountStorage:
                 CREATE TABLE IF NOT EXISTS config (
                     key TEXT PRIMARY KEY,
                     value TEXT
+                );
+                CREATE TABLE IF NOT EXISTS review_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    purchase_id INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    text TEXT,
+                    created_at REAL,
+                    moderated_at REAL
+                );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    text TEXT NOT NULL,
+                    created_at REAL
                 );
                 """
             )
@@ -534,6 +558,47 @@ class AccountStorage:
             "deposits": float(deposits),
         }
 
+    def add_review_request(self, user_id: int, purchase_id: int | None = None) -> int:
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO review_requests(user_id, purchase_id, status, created_at) VALUES(?, ?, ?, ?)",
+                (user_id, purchase_id, "pending", _now())
+            )
+            return cur.lastrowid
+
+    def get_review_request(self, request_id: int) -> dict[str, Any] | None:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM review_requests WHERE id=?", (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_review_text(self, request_id: int, text: str) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("UPDATE review_requests SET text=? WHERE id=?", (text, request_id))
+
+    def approve_review(self, request_id: int) -> dict[str, Any] | None:
+        with self._lock, self._conn() as conn:
+            req = conn.execute("SELECT * FROM review_requests WHERE id=?", (request_id,)).fetchone()
+            if not req:
+                return None
+            req = dict(req)
+            if req.get("status") == "published":
+                return req
+            conn.execute("UPDATE review_requests SET status='published', moderated_at=? WHERE id=?", (_now(), request_id))
+            conn.execute(
+                "INSERT INTO reviews(user_id, username, text, created_at) VALUES(?, ?, ?, ?)",
+                (req["user_id"], req.get("username") or "", req.get("text") or "", _now())
+            )
+            return req
+
+    def decline_review(self, request_id: int) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("UPDATE review_requests SET status='declined', moderated_at=? WHERE id=?", (_now(), request_id))
+
+    def get_reviews(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            rows = conn.execute("SELECT * FROM reviews ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
 _storage: AccountStorage | None = None
 _shop_bot: "AccountShopBot" | None = None
 
@@ -726,9 +791,10 @@ class AccountShopBot:
         self.cardinal = cardinal
         self.user_states: dict[int, dict[str, Any]] = {}
         self._setup_password: str | None = None
+        self.bot_username: str = ""
+        self._load_bot_username()
         self._ensure_setup_password()
         self._setup_handlers()
-        self._start_crypto_polling()
         try:
             self.bot.set_my_commands([
                 BotCommand("start", "Главное меню"),
@@ -737,6 +803,15 @@ class AccountShopBot:
             ])
         except Exception:
             pass
+
+    def _load_bot_username(self) -> None:
+        try:
+            me = self.bot.get_me()
+            if me and me.username:
+                self.bot_username = me.username
+                self.storage.set_config("bot_username", me.username)
+        except Exception:
+            self.bot_username = self.storage.get_config("bot_username") or ""
 
     def _ensure_setup_password(self) -> None:
         pwd = self.storage.get_config("setup_password")
@@ -779,22 +854,31 @@ class AccountShopBot:
     # keyboards
     def _main_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
         kb = InlineKeyboardMarkup(row_width=1)
-        if self._is_admin(user_id):
-            kb.add(
-                InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"),
-                InlineKeyboardButton("📱 Мои покупки", callback_data=f"{CB}my_purchases"),
-                InlineKeyboardButton("👤 Профиль", callback_data=f"{CB}profile"),
-                InlineKeyboardButton("🔴 Поддержка", callback_data=f"{CB}support"),
-                InlineKeyboardButton("🛠 Админ-меню", callback_data=f"{CB}admin"),
-            )
-        else:
-            kb.add(
-                InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"),
-                InlineKeyboardButton("📱 Мои покупки", callback_data=f"{CB}my_purchases"),
-                InlineKeyboardButton("👤 Профиль", callback_data=f"{CB}profile"),
-                InlineKeyboardButton("🔴 Поддержка", callback_data=f"{CB}support"),
-            )
+        reviews_url = self.storage.get_config("reviews_channel")
+        kb.add(
+            InlineKeyboardButton("🟢 📲 Купить аккаунт", callback_data=f"{CB}buy"),
+            InlineKeyboardButton("🗂️ Мои аккаунты", callback_data=f"{CB}my_purchases"),
+            InlineKeyboardButton("💳 Пополнить баланс", callback_data=f"{CB}deposit"),
+        )
+        if reviews_url:
+            kb.add(InlineKeyboardButton("📕 Отзывы", url=reviews_url))
+        kb.add(InlineKeyboardButton("🔴 ❔ Помощь", callback_data=f"{CB}support"))
         return kb
+
+    def _main_text(self, user_id: int, first_name: str | None = None) -> str:
+        user = self.storage.get_user(user_id)
+        purchases = self.storage.get_purchases(user_id)
+        name = first_name or user.get("username") or "друг"
+        return (
+            f"Здравствуйте, {name}! ☻\n"
+            f"Ваш профиль:\n"
+            f"❶ ID Профиля: <code>{user_id}</code>\n"
+            f"❷ Баланс: {_money_str(user.get('balance', 0))}₽\n"
+            f"❸ Всего потрачено: {_money_str(user.get('total_spent', 0))}₽\n"
+            f"❹ Покупок: {len(purchases)}\n\n"
+            f"➡︎ <a href=\"https://t.me/{self.bot_username}?start=buy\">Купить аккаунт</a>\n"
+            f"➡︎ <a href=\"https://t.me/{self.bot_username}?start=deposit\">Пополнить баланс</a>"
+        )
 
     def _admin_keyboard(self) -> InlineKeyboardMarkup:
         kb = InlineKeyboardMarkup(row_width=1)
@@ -809,6 +893,16 @@ class AccountShopBot:
         )
         return kb
 
+    def _show_admin_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        if not self._is_admin(user_id):
+            self.bot.send_message(chat_id, "Нет доступа.")
+            return
+        text = "🛠 Админ-меню"
+        if message_id:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=self._admin_keyboard())
+        else:
+            self.bot.send_message(chat_id, text, reply_markup=self._admin_keyboard())
+
     def _back_keyboard(self, payload: str) -> InlineKeyboardMarkup:
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=payload))
@@ -819,13 +913,18 @@ class AccountShopBot:
         @self.bot.message_handler(commands=["start"])
         def on_start(m: Message) -> None:
             try:
-                user = self.storage.get_user(m.from_user.id, m.from_user.username)
-                text = (
-                    f"👋 Привет, {m.from_user.first_name}!\n"
-                    f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
-                    "Выберите действие:"
-                )
-                self.bot.send_message(m.chat.id, text, reply_markup=self._main_keyboard(m.from_user.id))
+                self.storage.get_user(m.from_user.id, m.from_user.username)
+                arg = (m.text or "").strip().split()[1:2]
+                param = arg[0] if arg else ""
+                if param == "buy":
+                    self._show_categories(m.from_user.id, m.chat.id, None)
+                elif param == "deposit":
+                    self._show_deposit_menu(m.from_user.id, m.chat.id, None)
+                elif param == "admin":
+                    self._show_admin_menu(m.from_user.id, m.chat.id, None)
+                else:
+                    text = self._main_text(m.from_user.id, m.from_user.first_name)
+                    self.bot.send_message(m.chat.id, text, reply_markup=self._main_keyboard(m.from_user.id), parse_mode="HTML")
             except Exception:
                 logger.exception("[TelegramAccountShop] Ошибка /start")
 
@@ -861,6 +960,7 @@ class AccountShopBot:
                 "deposit_crypto_asset": self._handle_deposit_crypto_asset,
                 "deposit_sbp": self._handle_deposit_sbp,
                 "deposit_confirm": self._handle_deposit_confirm,
+                "review": self._handle_review_text,
             }
             fn = dispatch.get(handler)
             if fn:
@@ -918,13 +1018,8 @@ class AccountShopBot:
         action = parts[0]
 
         if action == "main":
-            user = self.storage.get_user(c.from_user.id)
-            text = (
-                f"👋 Привет, {c.from_user.first_name}!\n"
-                f"💰 Баланс: {_money_str(user.get('balance', 0))}₽\n\n"
-                "Выберите действие:"
-            )
-            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._main_keyboard(c.from_user.id))
+            text = self._main_text(c.from_user.id, c.from_user.first_name)
+            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._main_keyboard(c.from_user.id), parse_mode="HTML")
 
         elif action == "buy":
             self._show_categories(c.from_user.id, c.message.chat.id, c.message.message_id)
@@ -957,14 +1052,21 @@ class AccountShopBot:
             self._start_deposit_sbp(c)
         elif action == "deposit_confirm":
             self._handle_deposit_confirm(c)
+        elif action == "review_start":
+            self._start_review(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "review_publish":
+            self._publish_review(int(parts[1]))
+            self.bot.answer_callback_query(c.id, "Отзыв опубликован")
+            self.bot.edit_message_text("✅ Отзыв опубликован", c.message.chat.id, c.message.message_id)
+        elif action == "review_decline":
+            self._decline_review(int(parts[1]))
+            self.bot.answer_callback_query(c.id, "Отзыв отклонён")
+            self.bot.edit_message_text("❌ Отзыв отклонён", c.message.chat.id, c.message.message_id)
         elif action == "noop":
             self.bot.answer_callback_query(c.id, "Отправьте ответным сообщением")
 
         elif action == "admin":
-            if not self._is_admin(c.from_user.id):
-                self.bot.answer_callback_query(c.id, "Нет доступа")
-                return
-            self.bot.edit_message_text("🛠 Админ-меню", c.message.chat.id, c.message.message_id, reply_markup=self._admin_keyboard())
+            self._show_admin_menu(c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "admin_add":
             self._show_admin_add_menu(c.message.chat.id, c.message.message_id)
         elif action == "admin_add_phone":
@@ -1057,14 +1159,10 @@ class AccountShopBot:
             self.bot.send_message(chat_id, text, reply_markup=kb)
 
     def _show_deposit_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
-        text = "💳 Выберите способ пополнения баланса:"
+        text = "💳 Введите сумму пополнения в рублях (например 1000):"
+        self.user_states[user_id] = {"state": "deposit_amount", "method": "sbp", "next": "deposit_sbp"}
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            InlineKeyboardButton("⭐ Telegram Stars", callback_data=f"{CB}deposit_stars"),
-            InlineKeyboardButton("💎 Crypto Bot", callback_data=f"{CB}deposit_crypto"),
-            InlineKeyboardButton("🏦 СБП", callback_data=f"{CB}deposit_sbp"),
-            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}profile"),
-        )
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         if message_id:
             self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
         else:
@@ -1131,7 +1229,7 @@ class AccountShopBot:
         self.storage.update_balance(user_id, -price)
         self.storage.add_spent(user_id, price)
         self.storage.update_account_status(account["id"], STATUS_SOLD, user_id, _now())
-        self.storage.add_purchase(user_id, account["id"], float(price))
+        purchase_id = self.storage.add_purchase(user_id, account["id"], float(price))
 
         text = (
             f"✅ Вы купили аккаунт!\n\n"
@@ -1146,6 +1244,17 @@ class AccountShopBot:
             InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
         )
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        if purchase_id:
+            threading.Timer(120.0, self._ask_for_review, args=(user_id, purchase_id)).start()
+
+    def _ask_for_review(self, user_id: int, purchase_id: int) -> None:
+        try:
+            req_id = self.storage.add_review_request(user_id, purchase_id)
+            kb = InlineKeyboardMarkup(row_width=1)
+            kb.add(InlineKeyboardButton("Оставить отзыв", callback_data=f"{CB}review_start:{req_id}"))
+            self.bot.send_message(user_id, "Если не трудно оставьте отзыв!", reply_markup=kb)
+        except Exception:
+            logger.exception("Review request failed")
 
     def _show_my_purchases(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         accounts = self.storage.get_user_accounts(user_id)
@@ -1172,6 +1281,82 @@ class AccountShopBot:
             self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
         else:
             self.bot.send_message(chat_id, text, reply_markup=kb)
+
+    def _start_review(self, request_id: int, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+        req = self.storage.get_review_request(request_id)
+        if not req or req.get("user_id") != user_id or req.get("status") != "pending":
+            self.bot.answer_callback_query(message_id, "Запрос не найден")
+            return
+        self.user_states[user_id] = {"state": "review", "review_request_id": request_id}
+        if message_id:
+            self.bot.edit_message_text("📝 Напишите ваш отзыв одним сообщением.", chat_id, message_id)
+        else:
+            self.bot.send_message(chat_id, "📝 Напишите ваш отзыв одним сообщением.")
+
+    def _handle_review_text(self, m: Message) -> None:
+        state = self.user_states.get(m.from_user.id, {})
+        request_id = state.get("review_request_id")
+        text = (m.text or "").strip()
+        if not text or len(text) < 3:
+            self.bot.send_message(m.chat.id, "❌ Отзыв слишком короткий.")
+            return
+        self.storage.save_review_text(request_id, text)
+        self.user_states.pop(m.from_user.id, None)
+        self.bot.send_message(m.chat.id, "✅ Спасибо! Ваш отзыв отправлен на модерацию.")
+        self._send_review_for_moderation(request_id, m.from_user.id, text)
+
+    def _send_review_for_moderation(self, request_id: int, user_id: int, text: str) -> None:
+        user = self.storage.get_user(user_id)
+        username = user.get("username") or str(user_id)
+        mod_text = (
+            f"📝 Новый отзыв\n"
+            f"От: @{username} (ID {user_id})\n"
+            f"Текст: {text}\n\n"
+            f"Для публикации: /publish_review {request_id}\n"
+            f"Для отклонения: /decline_review {request_id}"
+        )
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Опубликовать", callback_data=f"{CB}review_publish:{request_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"{CB}review_decline:{request_id}"),
+        )
+        moderation_chat = self.storage.get_config("reviews_moderation_chat_id")
+        if moderation_chat:
+            try:
+                self.bot.send_message(int(moderation_chat), mod_text, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        self._notify_admins(mod_text)
+
+    def _publish_review(self, request_id: int) -> None:
+        req = self.storage.approve_review(request_id)
+        if not req:
+            return
+        user_id = req["user_id"]
+        text = req.get("text") or ""
+        user = self.storage.get_user(user_id)
+        username = user.get("username") or "Покупатель"
+        channel = self.storage.get_config("reviews_channel")
+        if channel:
+            try:
+                self.bot.send_message(int(channel), f"📕 Отзыв от @{username}:\n{text}")
+            except Exception:
+                pass
+        try:
+            self.bot.send_message(user_id, "✅ Ваш отзыв опубликован!")
+        except Exception:
+            pass
+
+    def _decline_review(self, request_id: int) -> None:
+        req = self.storage.get_review_request(request_id)
+        if not req:
+            return
+        self.storage.decline_review(request_id)
+        try:
+            self.bot.send_message(req["user_id"], "❌ Ваш отзыв не прошёл модерацию.")
+        except Exception:
+            pass
 
     def _get_code(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
         account = self.storage.get_account(account_id)
@@ -1399,45 +1584,120 @@ class AccountShopBot:
                     pass
                 self._notify_admins(f"💎 Crypto Bot пополнение от {deposit['user_id']} на {_money_str(deposit['amount_rub'])}₽")
 
+    def _platega_headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "X-MerchantId": self.storage.get_config("platega_merchant_id") or "",
+            "X-Secret": self.storage.get_config("platega_secret") or "",
+        }
+
+    def _create_platega_transaction(self, user_id: int, amount_rub: float) -> dict[str, Any] | None:
+        payload = f"platega_{user_id}_{uuid.uuid4().hex[:8]}"
+        body = {
+            "paymentMethod": PLATEGA_SBP,
+            "paymentDetails": {"amount": float(amount_rub), "currency": "RUB"},
+            "description": "Пополнение баланса PepeVPN",
+            "return": "https://pepevpn.site/payment/success",
+            "failedUrl": "https://pepevpn.site/payment/fail",
+            "payload": payload,
+            "metadata": {"userId": str(user_id), "userName": ""},
+        }
+        try:
+            resp = requests.post(
+                f"{PLATEGA_BASE}/transaction/process",
+                headers=self._platega_headers(),
+                json=body,
+                timeout=30,
+            )
+            data = resp.json()
+            if resp.ok and data.get("transactionId"):
+                self.storage.add_deposit(user_id, "platega", amount_rub, payload=payload, external_id=data.get("transactionId"))
+                return data
+            logger.error("Platega create error: %s %s", resp.status_code, data)
+        except Exception:
+            logger.exception("Platega create transaction")
+        return None
+
+    def _get_platega_transaction(self, transaction_id: str) -> dict[str, Any] | None:
+        try:
+            resp = requests.get(
+                f"{PLATEGA_BASE}/transaction/{transaction_id}",
+                headers=self._platega_headers(),
+                timeout=20,
+            )
+            if resp.ok:
+                return resp.json()
+            logger.error("Platega status error: %s %s", resp.status_code, resp.text)
+        except Exception:
+            logger.exception("Platega get transaction")
+        return None
+
     def _send_sbp_instructions(self, chat_id: int, user_id: int, amount_rub: float) -> None:
-        requisites = self.storage.get_config("sbp_requisites") or "Указать реквизиты в админ-меню"
-        payload = f"sbp_{user_id}_{uuid.uuid4().hex[:8]}"
-        self.storage.add_deposit(user_id, "sbp", amount_rub, payload=payload)
+        if not self.storage.get_config("platega_secret") or not self.storage.get_config("platega_merchant_id"):
+            self.bot.send_message(chat_id, "❌ Platega не настроен. Обратитесь к администратору.", reply_markup=self._back_keyboard(f"{CB}main"))
+            self.user_states.pop(user_id, None)
+            return
+        tx = self._create_platega_transaction(user_id, amount_rub)
+        if not tx:
+            self.bot.send_message(chat_id, "❌ Не удалось создать платёж. Попробуйте позже.", reply_markup=self._back_keyboard(f"{CB}main"))
+            self.user_states.pop(user_id, None)
+            return
+        transaction_id = tx.get("transactionId")
+        qr = tx.get("qr") or ""
+        if not qr and transaction_id:
+            details = self._get_platega_transaction(transaction_id)
+            qr = (details or {}).get("qr") or ""
+        if not qr:
+            redirect = tx.get("redirect") or tx.get("url") or ""
+            qr = redirect
         text = (
-            f"🏦 Переведите {_money_str(amount_rub)}₽ по СБП:\n"
-            f"<code>{requisites}</code>\n\n"
-            f"В комментарии укажите: <code>{payload}</code>\n"
-            f"После оплаты нажмите «Я оплатил» и ожидайте подтверждения администратора."
+            f"🏦 Оплатите {_money_str(amount_rub)}₽ по СБП (QR НСПК):\n"
+            f"<code>{qr}</code>\n\n"
+            f"После оплаты баланс зачислится автоматически."
         )
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("✅ Я оплатил", callback_data=f"{CB}deposit_confirm:{payload}"))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}deposit"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         self.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        self.user_states.pop(user_id, None)
+        if transaction_id:
+            threading.Thread(target=self._poll_platega, args=(transaction_id, user_id, amount_rub), daemon=True, name=f"PlategaPoll-{transaction_id}").start()
+
+    def _poll_platega(self, transaction_id: str, user_id: int, amount_rub: float) -> None:
+        checked = 0
+        while checked < 180:
+            time.sleep(10)
+            checked += 1
+            data = self._get_platega_transaction(transaction_id)
+            if not data:
+                continue
+            status = data.get("status", "").upper()
+            if status == "CONFIRMED":
+                deposit = self.storage.get_deposit_by_external(transaction_id)
+                if deposit and deposit.get("status") != "paid":
+                    self.storage.confirm_deposit(deposit["id"])
+                    try:
+                        self.bot.send_message(
+                            user_id,
+                            f"✅ Оплата получена. Баланс пополнен на {_money_str(amount_rub)}₽.",
+                            reply_markup=self._main_keyboard(user_id),
+                        )
+                    except Exception:
+                        pass
+                break
+            if status in ("CANCELED", "FAILED", "EXPIRED"):
+                try:
+                    self.bot.send_message(user_id, "❌ Платёж не был завершён.", reply_markup=self._main_keyboard(user_id))
+                except Exception:
+                    pass
+                break
 
     def _handle_deposit_sbp(self, m: Message) -> None:
-        # handled by confirm callback; messages here ignored
-        self.bot.send_message(m.chat.id, "Нажмите «✅ Я оплатил» после перевода.", reply_markup=self._back_keyboard(f"{CB}deposit"))
+        # handled by deposit flow; messages here ignored
+        self.bot.send_message(m.chat.id, "Введите сумму пополнения.", reply_markup=self._back_keyboard(f"{CB}main"))
 
     def _handle_deposit_confirm(self, c: CallbackQuery) -> None:
-        data = c.data[len(CB):]
-        parts = data.split(":", 1)
-        payload = parts[1] if len(parts) > 1 else ""
-        deposit = self.storage.get_deposit_by_payload(payload)
-        if not deposit:
-            self.bot.answer_callback_query(c.id, "Счёт не найден")
-            return
-        self.bot.send_message(
-            c.message.chat.id,
-            "⏳ Ожидайте подтверждения платежа администратором.",
-            reply_markup=self._back_keyboard(f"{CB}deposit"),
-        )
-        self._notify_admins(
-            f"🏦 Новая заявка СБП\n"
-            f"Пользователь: {c.from_user.id}\n"
-            f"Сумма: {_money_str(deposit['amount_rub'])}₽\n"
-            f"Payload: <code>{payload}</code>\n"
-            f"Для подтверждения: <code>/confirm {deposit['id']}</code>"
-        )
+        # Not used with Platega (auto-confirmation via polling)
+        self.bot.answer_callback_query(c.id, "Платёж подтверждается автоматически.")
 
     # admin flows
     def _show_admin_add_menu(self, chat_id: int, message_id: int | None = None) -> None:
@@ -2060,6 +2320,41 @@ def init_plugin(cardinal: Any) -> None:
     logger.info("[TelegramAccountShop] Инициализация бота")
     _shop_bot = AccountShopBot(token, _storage, cardinal=cardinal)
     threading.Thread(target=_shop_bot.run, daemon=True, name="TgAccountShopBot").start()
+
+    # регистрация в ПУ Cardinal
+    try:
+        cardinal.add_telegram_commands(
+            UUID,
+            [
+                ("start", "Главное меню", True),
+                ("profile", "Мой профиль", True),
+                ("support", "Поддержка", True),
+                ("setup", "Код администратора", False),
+            ],
+        )
+    except Exception:
+        logger.exception("Ошибка регистрации команд в Cardinal")
+
+    if CBT_FPC and cardinal and hasattr(cardinal, "telegram") and cardinal.telegram:
+        def open_plugin_settings(c: CallbackQuery):
+            username = _shop_bot.bot_username if _shop_bot else ""
+            kb = InlineKeyboardMarkup(row_width=1)
+            if username:
+                kb.add(InlineKeyboardButton("🛠 Админ-меню в боте", url=f"https://t.me/{username}?start=admin"))
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CBT_FPC.PLUGINS_LIST}:0"))
+            cardinal.telegram.bot.edit_message_text(
+                f"<b>Telegram Account Shop</b>\n\n"
+                f"Для управления откройте админ-меню в боте @{username or '...'}.\n"
+                f"Код первичной настройки: <code>{_shop_bot._setup_password if _shop_bot else ''}</code>",
+                c.message.chat.id, c.message.message_id,
+                reply_markup=kb, parse_mode="HTML",
+            )
+            cardinal.telegram.bot.answer_callback_query(c.id)
+
+        cardinal.telegram.cbq_handler(
+            open_plugin_settings,
+            lambda c: c.data.startswith(f"{CBT_FPC.PLUGIN_SETTINGS}:{UUID}:"),
+        )
 
 def stop_plugin(cardinal: Any) -> None:
     global _shop_bot
