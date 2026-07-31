@@ -1195,10 +1195,8 @@ class AccountShopBot:
         kb = InlineKeyboardMarkup(row_width=3)
         amounts = [100, 200, 500, 1000, 2000, 5000]
         kb.add(*[InlineKeyboardButton(f"{a}₽", callback_data=f"{CB}deposit_amount:{a}") for a in amounts])
-        kb.add(
-            InlineKeyboardButton("📝 Своя сумма", callback_data=f"{CB}deposit_custom"),
-            InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"),
-        )
+        kb.add(InlineKeyboardButton("📝 Своя сумма", callback_data=f"{CB}deposit_custom"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         if message_id:
             self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
         else:
