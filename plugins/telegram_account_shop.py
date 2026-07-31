@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -59,7 +60,10 @@ DEFAULT_STARS_TO_RUB = 1.5
 DEFAULT_USDT_TO_RUB = 90.0
 
 PLATEGA_BASE = "https://app.platega.io"
+PLATEGA_PAYFORM = "https://pay.platega.io"
 PLATEGA_SBP = 2
+PLATEGA_SIG_KEY = "9mp^mz)]{[%nf|j6ga]k}t|?1siul(68"
+PLATEGA_SIG_IV = "3A6QgvggIDssBA=="
 
 # --- утилиты ---
 def _to_dec(value: Any) -> Decimal:
@@ -855,6 +859,11 @@ class AccountShopBot:
     def _main_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
         kb = InlineKeyboardMarkup(row_width=1)
         reviews_url = self.storage.get_config("reviews_channel")
+        if reviews_url:
+            if reviews_url.startswith("@"):
+                reviews_url = f"https://t.me/{reviews_url[1:]}"
+            elif not reviews_url.startswith(("http://", "https://")):
+                reviews_url = f"https://t.me/{reviews_url}"
         kb.add(
             InlineKeyboardButton("🟢 📲 Купить аккаунт", callback_data=f"{CB}buy"),
             InlineKeyboardButton("🗂️ Мои аккаунты", callback_data=f"{CB}my_purchases"),
@@ -1342,7 +1351,10 @@ class AccountShopBot:
             try:
                 self.bot.send_message(int(channel), f"📕 Отзыв от @{username}:\n{text}")
             except Exception:
-                pass
+                try:
+                    self.bot.send_message(str(channel), f"📕 Отзыв от @{username}:\n{text}")
+                except Exception:
+                    pass
         try:
             self.bot.send_message(user_id, "✅ Ваш отзыв опубликован!")
         except Exception:
@@ -1591,6 +1603,13 @@ class AccountShopBot:
             "X-Secret": self.storage.get_config("platega_secret") or "",
         }
 
+    def _platega_signature(self) -> str:
+        merchant = self.storage.get_config("platega_merchant_id") or ""
+        now = int(time.time())
+        ms = int(time.time() * 1000)
+        raw = f"{now}:{merchant}:{PLATEGA_SIG_KEY}:{PLATEGA_SIG_IV}:{ms}"
+        return base64.b64encode(raw.encode()).decode()
+
     def _create_platega_transaction(self, user_id: int, amount_rub: float) -> dict[str, Any] | None:
         payload = f"platega_{user_id}_{uuid.uuid4().hex[:8]}"
         body = {
@@ -1632,6 +1651,28 @@ class AccountShopBot:
             logger.exception("Platega get transaction")
         return None
 
+    def _set_platega_payment_method(self, transaction_id: str) -> dict[str, Any] | None:
+        merchant = self.storage.get_config("platega_merchant_id") or ""
+        headers = {
+            "Content-Type": "application/json",
+            "X-MerchantId": merchant,
+            "signature": self._platega_signature(),
+            "Referer": f"{PLATEGA_PAYFORM}/sbp-qr?id={transaction_id}&mh={merchant}",
+        }
+        try:
+            resp = requests.post(
+                f"{PLATEGA_BASE}/v2/transaction/{transaction_id}/set",
+                headers=headers,
+                json={"paymentMethod": PLATEGA_SBP},
+                timeout=30,
+            )
+            if resp.ok:
+                return resp.json()
+            logger.error("Platega set method error: %s %s", resp.status_code, resp.text)
+        except Exception:
+            logger.exception("Platega set payment method")
+        return None
+
     def _send_sbp_instructions(self, chat_id: int, user_id: int, amount_rub: float) -> None:
         if not self.storage.get_config("platega_secret") or not self.storage.get_config("platega_merchant_id"):
             self.bot.send_message(chat_id, "❌ Platega не настроен. Обратитесь к администратору.", reply_markup=self._back_keyboard(f"{CB}main"))
@@ -1645,8 +1686,8 @@ class AccountShopBot:
         transaction_id = tx.get("transactionId")
         qr = tx.get("qr") or ""
         if not qr and transaction_id:
-            details = self._get_platega_transaction(transaction_id)
-            qr = (details or {}).get("qr") or ""
+            set_resp = self._set_platega_payment_method(transaction_id)
+            qr = (set_resp or {}).get("qr") or ""
         if not qr:
             redirect = tx.get("redirect") or tx.get("url") or ""
             qr = redirect
