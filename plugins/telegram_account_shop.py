@@ -1605,6 +1605,7 @@ class AccountShopBot:
             title,
             description,
             payload,
+            "",
             "XTR",
             prices,
             start_parameter=payload,
