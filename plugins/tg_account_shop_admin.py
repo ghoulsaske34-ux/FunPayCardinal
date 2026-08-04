@@ -25,11 +25,19 @@ except Exception:
 try:
     from telethon.sync import TelegramClient
     from telethon import connection, events
-    from telethon.errors import SessionPasswordNeededError
+    from telethon.errors import (
+        SessionPasswordNeededError,
+        PhoneCodeInvalidError,
+        PhoneCodeExpiredError,
+        PasswordHashInvalidError,
+    )
     from telethon.sessions import StringSession
 except Exception:
     TelegramClient = None
     SessionPasswordNeededError = None
+    PhoneCodeInvalidError = None
+    PhoneCodeExpiredError = None
+    PasswordHashInvalidError = None
     connection = None
     events = None
     StringSession = None
@@ -680,6 +688,8 @@ class ShopAdminPanel:
         _ensure_event_loop()
         client = None
         try:
+            if not phone:
+                raise ValueError("Номер телефона не указан")
             client = self._login_client(proxy, api_id, api_hash)
             client.connect()
             sent = client.send_code_request(phone)
@@ -692,12 +702,18 @@ class ShopAdminPanel:
             try:
                 client.sign_in(phone, code, phone_code_hash=phone_code_hash)
             except SessionPasswordNeededError:
-                self.bot.send_message(chat_id, "🔐 Введите облачный пароль (или '-' если нет):")
+                self.bot.send_message(chat_id, "🔐 Аккаунт защищён облачным паролем. Введите его:")
                 password = q.get()
-                if password is None:
-                    raise RuntimeError("Отменено")
-                if password not in ("", "-", "нет", "no", "none"):
+                if password is None or password in ("", "-", "нет", "no", "none"):
+                    raise RuntimeError("Облачный пароль не введён")
+                try:
                     client.sign_in(password=password)
+                except PasswordHashInvalidError:
+                    raise RuntimeError("Неверный облачный пароль")
+            except PhoneCodeInvalidError:
+                raise RuntimeError("Неверный код подтверждения")
+            except PhoneCodeExpiredError:
+                raise RuntimeError("Код подтверждения истёк. Начните заново.")
             session_string = client.session.save()
             try:
                 me = client.get_me()
@@ -717,7 +733,8 @@ class ShopAdminPanel:
                 self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
                 self.tg.clear_state(chat_id, user_id)
                 self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.")
-        except Exception:
+        except Exception as e:
+            err_text = f"{type(e).__name__}: {e}"
             logger.exception("admin login worker error")
             if client:
                 try:
@@ -726,7 +743,7 @@ class ShopAdminPanel:
                     pass
             self.tg.clear_state(chat_id, user_id)
             self._login_queues.pop(user_id, None)
-            self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте номер, код, пароль и прокси.")
+            self.bot.send_message(chat_id, f"❌ Ошибка авторизации: <code>{err_text[:400]}</code>\n\nПроверьте номер, код, пароль и прокси.", parse_mode="HTML")
 
     # --- telethon login helpers ---
     def _api_config(self) -> tuple[int, str]:
@@ -754,7 +771,7 @@ class ShopAdminPanel:
         step = data.get("step")
 
         if step == "code":
-            code = (m.text or "").strip()
+            code = (m.text or m.caption or "").strip()
             q = self._login_queues.get(m.from_user.id)
             if q:
                 q.put(code)
@@ -764,7 +781,7 @@ class ShopAdminPanel:
             return
 
         if step == "password":
-            password = (m.text or "").strip()
+            password = (m.text or m.caption or "").strip()
             q = self._login_queues.get(m.from_user.id)
             if q:
                 q.put(password)
@@ -782,7 +799,9 @@ class ShopAdminPanel:
                 self.bot.send_message(m.chat.id, "❌ Telethon не установлен.", reply_markup=self._back_kb(CBA_MAIN))
                 self.tg.clear_state(m.chat.id, m.from_user.id)
                 return
-            phone = (m.text or "").strip()
+            phone = (m.text or m.caption or "").strip()
+            if not phone and getattr(m, "contact", None):
+                phone = (m.contact.phone_number or "").strip()
             if not phone:
                 self.bot.send_message(m.chat.id, "❌ Введите номер телефона.")
                 return

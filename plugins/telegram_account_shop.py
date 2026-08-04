@@ -23,7 +23,12 @@ import requests
 import telebot
 from telethon.sync import TelegramClient
 from telethon import events, connection
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+)
 from telethon.sessions import StringSession
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, BotCommand
 
@@ -729,6 +734,8 @@ def _login_worker(
     _ensure_event_loop()
     client = None
     try:
+        if not phone:
+            raise ValueError("Номер телефона не указан")
         client = _login_client(proxy, api_id, api_hash)
         client.connect()
         sent = client.send_code_request(phone)
@@ -741,12 +748,18 @@ def _login_worker(
         try:
             client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
-            bot.send_message(chat_id, "🔐 Введите облачный пароль (или '-' если нет):")
+            bot.send_message(chat_id, "🔐 Аккаунт защищён облачным паролем. Введите его:")
             password = q.get()
-            if password is None:
-                raise RuntimeError("Отменено")
-            if password not in ("", "-", "нет", "no", "none"):
+            if password is None or password in ("", "-", "нет", "no", "none"):
+                raise RuntimeError("Облачный пароль не введён")
+            try:
                 client.sign_in(password=password)
+            except PasswordHashInvalidError:
+                raise RuntimeError("Неверный облачный пароль")
+        except PhoneCodeInvalidError:
+            raise RuntimeError("Неверный код подтверждения")
+        except PhoneCodeExpiredError:
+            raise RuntimeError("Код подтверждения истёк. Начните заново.")
         session_string = client.session.save()
         try:
             me = client.get_me()
@@ -767,7 +780,8 @@ def _login_worker(
             storage.add_account(cat["id"], phone, session_string, proxy=proxy)
             user_states.pop(user_id, None)
             bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.")
-    except Exception:
+    except Exception as e:
+        err_text = f"{type(e).__name__}: {e}"
         logger.exception("login worker error")
         if client:
             try:
@@ -775,7 +789,7 @@ def _login_worker(
             except Exception:
                 pass
         user_states.pop(user_id, None)
-        bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте номер, код, пароль и прокси.")
+        bot.send_message(chat_id, f"❌ Ошибка авторизации: <code>{err_text[:400]}</code>\n\nПроверьте номер, код, пароль и прокси.", parse_mode="HTML")
 
 def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
     if _storage is None:
@@ -2154,7 +2168,9 @@ class AccountShopBot:
             return
 
         if step in (None, "phone"):
-            phone = (m.text or "").strip()
+            phone = (m.text or m.caption or "").strip()
+            if not phone and getattr(m, "contact", None):
+                phone = (m.contact.phone_number or "").strip()
             if not phone:
                 self.bot.send_message(m.chat.id, "❌ Введите номер телефона.")
                 return
@@ -2174,7 +2190,7 @@ class AccountShopBot:
             return
 
         if step == "code":
-            code = (m.text or "").strip()
+            code = (m.text or m.caption or "").strip()
             q = state.get("login_queue")
             if q:
                 q.put(code)
@@ -2184,7 +2200,7 @@ class AccountShopBot:
             return
 
         if step == "password":
-            password = (m.text or "").strip()
+            password = (m.text or m.caption or "").strip()
             q = state.get("login_queue")
             if q:
                 q.put(password)
