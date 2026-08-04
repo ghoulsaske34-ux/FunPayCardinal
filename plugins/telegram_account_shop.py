@@ -153,6 +153,35 @@ _COUNTRY_FALLBACK = {
     "421": "Словакия",
 }
 
+# Build reverse map from localized country name to calling code / region.
+_NAME_TO_CODE: dict[str, str] = {}
+_NAME_TO_REGION: dict[str, str] = {}
+
+def _build_country_meta_map() -> None:
+    if not phonenumbers:
+        return
+    try:
+        from phonenumbers.geocoder import description_for_number
+        for region_tuple in phonenumbers.COUNTRY_CODE_TO_REGION_CODE.values():
+            for region in region_tuple:
+                try:
+                    n = phonenumbers.example_number_for_type(region, phonenumbers.PhoneNumberType.MOBILE)
+                    if not n:
+                        continue
+                    desc = description_for_number(n, "ru")
+                    if not desc:
+                        continue
+                    cc = str(n.country_code)
+                    if desc not in _NAME_TO_CODE:
+                        _NAME_TO_CODE[desc] = cc
+                        _NAME_TO_REGION[desc] = region
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+_build_country_meta_map()
+
 def _detect_country(phone: str) -> str:
     digits = re.sub(r"\D", "", phone)
     if not digits:
@@ -160,7 +189,6 @@ def _detect_country(phone: str) -> str:
     if phonenumbers:
         try:
             parsed = phonenumbers.parse("+" + digits, None)
-            name = phonenumbers.region_code_for_country_code(parsed.country_code)
             # get country name if available
             from phonenumbers.geocoder import description_for_number
             desc = description_for_number(parsed, "ru")
@@ -208,30 +236,16 @@ def _parse_proxy(text: str | None) -> dict[str, Any] | None:
         return {"scheme": "socks5", "hostname": m.group(1), "port": int(m.group(2)), "username": None, "password": None}
     return None
 
-_NAME_TO_CODE: dict[str, str] = {v: k for k, v in _COUNTRY_FALLBACK.items()}
-
-def _country_code_from_name(name: str) -> str:
-    return _NAME_TO_CODE.get(name, "")
-
-def _flag_for_region(region: str) -> str:
-    region = region.upper()
-    if len(region) != 2 or not region.isalpha():
-        return ""
-    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in region)
-
 def _country_meta(name: str) -> tuple[str, str]:
     """Return (phone_code, flag_emoji) for a country/category name."""
-    code = _country_code_from_name(name)
-    if not code:
-        return "", ""
-    if phonenumbers:
-        try:
-            region = phonenumbers.region_code_for_country_code(int(code))
-            if region:
-                return f"+{code}", _flag_for_region(region)
-        except Exception:
-            pass
-    return f"+{code}", ""
+    code = _NAME_TO_CODE.get(name, "")
+    region = _NAME_TO_REGION.get(name, "")
+    if code and region:
+        flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in region.upper())
+        return f"+{code}", flag
+    if code:
+        return f"+{code}", ""
+    return "", ""
 
 # --- хранилище ---
 class AccountStorage:

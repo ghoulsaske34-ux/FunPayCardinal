@@ -67,6 +67,8 @@ CBA_ACCOUNTS_BY_CAT = f"{CB_ADMIN}acc_by_cat:"
 CBA_DEPOSITS = f"{CB_ADMIN}deposits"
 CBA_STATS = f"{CB_ADMIN}stats"
 CBA_SETTINGS = f"{CB_ADMIN}settings"
+CBA_PHOTOS = f"{CB_ADMIN}photos"
+CBA_SET_PHOTO = f"{CB_ADMIN}set_photo:"
 CBA_EDIT_CFG = f"{CB_ADMIN}edit_cfg:"
 
 STATE_PREFIX = "tgsa_state_"
@@ -77,6 +79,7 @@ STATE_ADD_ACCOUNTS = f"{STATE_PREFIX}add_accounts"
 STATE_ADD_ACCOUNTS_PRICE = f"{STATE_PREFIX}add_accounts_price"
 STATE_ADD_PHONE = f"{STATE_PREFIX}add_phone"
 STATE_EDIT_CFG = f"{STATE_PREFIX}edit_cfg"
+STATE_EDIT_PHOTO = f"{STATE_PREFIX}edit_photo"
 
 STATUS_AVAILABLE = "available"
 
@@ -251,7 +254,7 @@ class ShopAdminPanel:
             self.tg.cbq_handler(self.on_callback, lambda c: c.data.startswith(CB_ADMIN))
             self.tg.msg_handler(
                 self.on_message,
-                content_types=["text", "document"],
+                content_types=["text", "document", "photo"],
                 func=lambda m: self._in_admin_state(m),
             )
             try:
@@ -358,6 +361,10 @@ class ShopAdminPanel:
                 self.show_stats(c)
             elif action == "settings":
                 self.show_settings(c)
+            elif action == "photos":
+                self.show_photos(c)
+            elif action == "set_photo":
+                self.edit_photo_start(c, arg1)
             elif action == "edit_cfg":
                 self.edit_config_start(c, arg1)
         except Exception:
@@ -375,6 +382,9 @@ class ShopAdminPanel:
             return
         state = s["state"]
         try:
+            if state == STATE_EDIT_PHOTO:
+                self.save_photo(m)
+                return
             if m.content_type == "document":
                 self.bot.send_message(m.chat.id, "❌ В этом режиме нужно отправить текст.")
                 return
@@ -638,6 +648,15 @@ class ShopAdminPanel:
         "platega_merchant_id": "Platega merchant ID",
     }
 
+    PHOTO_LABELS: dict[str, str] = {
+        "main": "Главное меню",
+        "buy": "Каталог",
+        "category": "Карточка товара",
+        "deposit": "Пополнение",
+        "profile": "Профиль",
+        "purchases": "Мои покупки",
+    }
+
     def show_settings(self, c: CallbackQuery) -> None:
         text = "<b>⚙️ Настройки</b>\n\n"
         kb = InlineKeyboardMarkup(row_width=1)
@@ -653,6 +672,7 @@ class ShopAdminPanel:
                 val = val[:27] + "..."
             text += f"{label}: <code>{html.escape(str(val))}</code>\n"
             kb.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"{CBA_EDIT_CFG}{key}"))
+        kb.add(InlineKeyboardButton("🖼 Фото сообщений", callback_data=CBA_PHOTOS))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_MAIN))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
@@ -673,6 +693,78 @@ class ShopAdminPanel:
         self.tg.clear_state(m.chat.id, m.from_user.id)
         label = self.CFG_LABELS.get(key, key)
         self.bot.send_message(m.chat.id, f"✅ <b>{html.escape(label)}</b> обновлено.", parse_mode="HTML", reply_markup=self._back_kb(CBA_SETTINGS))
+
+    def show_photos(self, c: CallbackQuery) -> None:
+        text = "<b>🖼 Фото для сообщений бота</b>\n\n"
+        kb = InlineKeyboardMarkup(row_width=1)
+        for key, label in self.PHOTO_LABELS.items():
+            val = self.storage.get_config(f"photo_{key}", "")
+            text += f"{label}: <code>{html.escape(str(val) if val else '—')}</code>\n"
+            kb.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"{CBA_SET_PHOTO}{key}"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_SETTINGS))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def edit_photo_start(self, c: CallbackQuery, key: str) -> None:
+        label = self.PHOTO_LABELS.get(key, key)
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_EDIT_PHOTO, {"key": key})
+        text = (
+            f"🖼 Пришлите фото для <b>{html.escape(label)}</b>.\n"
+            f"Или введите URL/путь к файлу текстом.\n"
+            f"Чтобы удалить, отправьте <code>-</code>."
+        )
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=CBA_PHOTOS))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def _photo_dir(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "..", "storage", "cache", "tg_account_shop", "photos")
+
+    def _save_photo_file(self, file_info, key: str) -> str:
+        photo_dir = self._photo_dir()
+        os.makedirs(photo_dir, exist_ok=True)
+        ext = ".jpg"
+        if file_info.file_path:
+            ext = os.path.splitext(file_info.file_path)[1] or ".jpg"
+        path = os.path.join(photo_dir, f"{key}_{int(time.time())}{ext}")
+        downloaded = self.bot.download_file(file_info.file_path)
+        with open(path, "wb") as f:
+            f.write(downloaded)
+        return path
+
+    def save_photo(self, m: Message) -> None:
+        s = self.tg.get_state(m.chat.id, m.from_user.id)
+        if not s:
+            return
+        key = s["data"]["key"]
+        self.tg.clear_state(m.chat.id, m.from_user.id)
+        label = self.PHOTO_LABELS.get(key, key)
+
+        text_val = (m.text or "").strip()
+        if text_val == "-":
+            self.storage.set_config(f"photo_{key}", "")
+            self.bot.send_message(m.chat.id, f"✅ Фото для <b>{html.escape(label)}</b> удалено.", parse_mode="HTML", reply_markup=self._back_kb(CBA_PHOTOS))
+            return
+        if text_val:
+            self.storage.set_config(f"photo_{key}", text_val)
+            self.bot.send_message(m.chat.id, f"✅ Путь/URL для <b>{html.escape(label)}</b> обновлён.", parse_mode="HTML", reply_markup=self._back_kb(CBA_PHOTOS))
+            return
+
+        file_id = None
+        if m.content_type == "photo":
+            file_id = m.photo[-1].file_id
+        elif m.content_type == "document" and m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
+            file_id = m.document.file_id
+        if not file_id:
+            self.bot.send_message(m.chat.id, "❌ Пришлите изображение или введите путь/URL.", reply_markup=self._back_kb(CBA_PHOTOS))
+            return
+
+        try:
+            file_info = self.bot.get_file(file_id)
+            path = self._save_photo_file(file_info, key)
+            self.storage.set_config(f"photo_{key}", path)
+            self.bot.send_message(m.chat.id, f"✅ Фото для <b>{html.escape(label)}</b> сохранено.", parse_mode="HTML", reply_markup=self._back_kb(CBA_PHOTOS))
+        except Exception:
+            logger.exception("save_photo error")
+            self.bot.send_message(m.chat.id, "❌ Не удалось сохранить фото.", reply_markup=self._back_kb(CBA_PHOTOS))
 
     def _login_client(self, proxy: dict[str, Any] | None, api_id: int, api_hash: str):
         proxy_t = _proxy_for_telethon(proxy)
