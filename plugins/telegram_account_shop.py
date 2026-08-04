@@ -651,7 +651,7 @@ def _get_default_proxy() -> dict[str, Any] | None:
     return _parse_proxy(_storage.get_config("default_proxy")) if _storage else None
 
 def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot):
-    def handler(event):
+    async def handler(event):
         msg = event.message
         text = getattr(msg, "message", None) or getattr(msg, "caption", None) or ""
         codes = _extract_codes(text)
