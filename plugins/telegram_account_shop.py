@@ -339,9 +339,26 @@ class AccountStorage:
                 """
             )
             # удалить устаревшие столбцы/таблицы при необходимости
-            for col, sql in (("proxy", "ALTER TABLE accounts ADD COLUMN proxy TEXT"),):
+            account_cols = [
+                ("proxy", "ALTER TABLE accounts ADD COLUMN proxy TEXT"),
+                ("buyer_id", "ALTER TABLE accounts ADD COLUMN buyer_id INTEGER"),
+                ("purchased_at", "ALTER TABLE accounts ADD COLUMN purchased_at REAL"),
+                ("expires_at", "ALTER TABLE accounts ADD COLUMN expires_at REAL"),
+                ("last_code", "ALTER TABLE accounts ADD COLUMN last_code TEXT"),
+                ("last_code_at", "ALTER TABLE accounts ADD COLUMN last_code_at REAL"),
+            ]
+            for col, sql in account_cols:
                 try:
                     conn.execute(f"SELECT {col} FROM accounts LIMIT 1")
+                except Exception:
+                    conn.execute(sql)
+            category_cols = [
+                ("is_active", "ALTER TABLE categories ADD COLUMN is_active INTEGER DEFAULT 1"),
+                ("sort_order", "ALTER TABLE categories ADD COLUMN sort_order INTEGER DEFAULT 0"),
+            ]
+            for col, sql in category_cols:
+                try:
+                    conn.execute(f"SELECT {col} FROM categories LIMIT 1")
                 except Exception:
                     conn.execute(sql)
             try:
@@ -437,7 +454,14 @@ class AccountStorage:
         with self._lock, self._conn() as conn:
             existing = conn.execute("SELECT * FROM categories WHERE name=?", (name,)).fetchone()
             if existing:
-                return dict(existing)
+                d = dict(existing)
+                if d.get("is_active") == 0:
+                    conn.execute(
+                        "UPDATE categories SET is_active=1, price=MAX(price, ?) WHERE id=?",
+                        (float(price or 0), d["id"])
+                    )
+                    d = dict(conn.execute("SELECT * FROM categories WHERE id=?", (d["id"],)).fetchone())
+                return d
             cur = conn.execute(
                 "INSERT INTO categories(name, price, created_at) VALUES(?, ?, ?)",
                 (name, float(price), _now())
@@ -460,7 +484,7 @@ class AccountStorage:
                 (category_id,)
             ).fetchone()[0]
             if count == 0:
-                conn.execute("DELETE FROM categories WHERE id=?", (category_id,))
+                conn.execute("UPDATE categories SET is_active=0 WHERE id=?", (category_id,))
 
     # accounts
     def add_account(self, category_id: int, phone: str, session_string: str, proxy: dict[str, Any] | None = None) -> int:
@@ -774,9 +798,13 @@ def _stop_listener(account_id: int, account_id_int: int) -> None:
     if client:
         _disconnect_client(client)
     if _storage:
-        _storage.update_account_status(account_id_int, STATUS_SOLD)
         account = _storage.get_account(account_id_int)
         if account:
+            _storage.update_account_status(
+                account_id_int, STATUS_SOLD,
+                buyer_id=account.get("buyer_id"),
+                purchased_at=account.get("purchased_at"),
+            )
             _storage.cleanup_empty_category(account["category_id"])
 
 def _telethon_client(account: dict[str, Any], api_id: int, api_hash: str) -> TelegramClient:
@@ -910,7 +938,12 @@ def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
     thread.start()
 
     expires = _now() + LISTEN_MINUTES * 60
-    _storage.update_account_status(account_id, STATUS_LISTENING, expires_at=expires)
+    _storage.update_account_status(
+        account_id, STATUS_LISTENING,
+        buyer_id=account.get("buyer_id") or buyer_id,
+        purchased_at=account.get("purchased_at") or _now(),
+        expires_at=expires,
+    )
 
     # таймер авто-остановки
     t = threading.Timer(LISTEN_MINUTES * 60, lambda: _stop_listener(account_id, account_id))
@@ -1313,11 +1346,11 @@ class AccountShopBot:
         elif action == "my_purchases":
             self._show_my_purchases(c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "get_code":
-            self._get_code(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._get_code(int(parts[1]), c)
         elif action == "listen":
-            self._listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._listen(int(parts[1]), c)
         elif action == "stop_listen":
-            self._stop_listen(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._stop_listen(int(parts[1]), c)
 
         elif action == "profile":
             self._show_profile(c.from_user.id, c.message.chat.id, c.message.message_id)
@@ -1344,7 +1377,7 @@ class AccountShopBot:
         elif action == "deposit_check":
             self._handle_deposit_check(c)
         elif action == "review_start":
-            self._start_review(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._start_review(int(parts[1]), c)
         elif action == "review_publish":
             self._publish_review(int(parts[1]))
             self.bot.answer_callback_query(c.id, "Отзыв опубликован")
@@ -1472,11 +1505,17 @@ class AccountShopBot:
         kb = InlineKeyboardMarkup(row_width=1)
         for cat in categories:
             available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
+            if available <= 0:
+                continue
             kb.add(InlineKeyboardButton(
                 self._category_button_text(cat, available),
                 callback_data=f"{CB}category:{cat['id']}"
             ))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        if not kb.keyboard:
+            text = "😔 Пока нет доступных аккаунтов. Зайдите позже."
+            kb = self._back_keyboard(f"{CB}main")
+        else:
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("buy"))
 
     def _quantity_text(self, cat: dict[str, Any], qty: str, available: int, user: dict[str, Any]) -> str:
@@ -1638,16 +1677,16 @@ class AccountShopBot:
             kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("purchases"))
 
-    def _start_review(self, request_id: int, user_id: int, chat_id: int, message_id: int | None = None) -> None:
+    def _start_review(self, request_id: int, c: CallbackQuery) -> None:
         req = self.storage.get_review_request(request_id)
-        if not req or req.get("user_id") != user_id or req.get("status") != "pending":
-            self.bot.answer_callback_query(message_id, "Запрос не найден")
+        chat_id = c.message.chat.id
+        message_id = c.message.message_id
+        if not req or req.get("user_id") != c.from_user.id or req.get("status") != "pending":
+            self.bot.answer_callback_query(c.id, "Запрос не найден")
             return
-        self.user_states[user_id] = {"state": "review", "review_request_id": request_id}
-        if message_id:
-            self.bot.edit_message_text("📝 Напишите ваш отзыв одним сообщением.", chat_id, message_id)
-        else:
-            self.bot.send_message(chat_id, "📝 Напишите ваш отзыв одним сообщением.")
+        self.user_states[c.from_user.id] = {"state": "review", "review_request_id": request_id}
+        self.bot.answer_callback_query(c.id, "📝 Напишите отзыв")
+        self.bot.edit_message_text("📝 Напишите ваш отзыв одним сообщением.", chat_id, message_id)
 
     def _handle_review_text(self, m: Message) -> None:
         state = self.user_states.get(m.from_user.id, {})
@@ -1717,11 +1756,14 @@ class AccountShopBot:
         except Exception:
             pass
 
-    def _get_code(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+    def _get_code(self, account_id: int, c: CallbackQuery) -> None:
         account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+        chat_id = c.message.chat.id
+        message_id = c.message.message_id
+        if not account or account.get("buyer_id") != c.from_user.id:
+            self.bot.answer_callback_query(c.id, "Аккаунт не найден")
             return
+        self.bot.answer_callback_query(c.id, "⏳ Получаю код...")
         self.bot.edit_message_text("⏳ Получаю код...", chat_id, message_id)
         code = get_latest_code(account_id)
         if code:
@@ -1736,13 +1778,16 @@ class AccountShopBot:
         )
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
-    def _listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+    def _listen(self, account_id: int, c: CallbackQuery) -> None:
         account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+        chat_id = c.message.chat.id
+        message_id = c.message.message_id
+        if not account or account.get("buyer_id") != c.from_user.id:
+            self.bot.answer_callback_query(c.id, "Аккаунт не найден")
             return
+        self.bot.answer_callback_query(c.id, "⏳ Запускаю прослушку...")
         self.bot.edit_message_text("⏳ Запускаю прослушку...", chat_id, message_id)
-        result = start_listener(account_id, user_id, self.bot)
+        result = start_listener(account_id, c.from_user.id, self.bot)
         if result == "no_api_config":
             text = "❌ API ID/API Hash не настроены. Обратитесь к администратору."
         elif result == "ok":
@@ -1757,11 +1802,14 @@ class AccountShopBot:
         kb.add(InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
-    def _stop_listen(self, account_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+    def _stop_listen(self, account_id: int, c: CallbackQuery) -> None:
         account = self.storage.get_account(account_id)
-        if not account or account.get("buyer_id") != user_id:
-            self.bot.answer_callback_query(message_id, "Аккаунт не найден")
+        chat_id = c.message.chat.id
+        message_id = c.message.message_id
+        if not account or account.get("buyer_id") != c.from_user.id:
+            self.bot.answer_callback_query(c.id, "Аккаунт не найден")
             return
+        self.bot.answer_callback_query(c.id, "⏳ Останавливаю...")
         stop_listener(account_id)
         self.bot.edit_message_text(
             f"🛑 Прослушка аккаунта <code>{account['phone']}</code> остановлена.",
