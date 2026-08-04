@@ -64,8 +64,11 @@ CBA_ADD_ACCOUNTS = f"{CB_ADMIN}add_accounts"
 CBA_ADD_PHONE = f"{CB_ADMIN}add_phone"
 CBA_LIST_ACCOUNTS = f"{CB_ADMIN}list_accounts"
 CBA_ACCOUNTS_BY_CAT = f"{CB_ADMIN}acc_by_cat:"
+CBA_GET_CODE = f"{CB_ADMIN}get_code:"
+CBA_ADD_TO_CAT = f"{CB_ADMIN}add_to_cat:"
 CBA_DEPOSITS = f"{CB_ADMIN}deposits"
 CBA_STATS = f"{CB_ADMIN}stats"
+CBA_BALANCE = f"{CB_ADMIN}balance"
 CBA_SETTINGS = f"{CB_ADMIN}settings"
 CBA_PHOTOS = f"{CB_ADMIN}photos"
 CBA_SET_PHOTO = f"{CB_ADMIN}set_photo:"
@@ -78,6 +81,7 @@ STATE_ADD_CATEGORY_PRICE = f"{STATE_PREFIX}add_cat_price"
 STATE_ADD_ACCOUNTS = f"{STATE_PREFIX}add_accounts"
 STATE_ADD_ACCOUNTS_PRICE = f"{STATE_PREFIX}add_accounts_price"
 STATE_ADD_PHONE = f"{STATE_PREFIX}add_phone"
+STATE_BALANCE = f"{STATE_PREFIX}balance"
 STATE_EDIT_CFG = f"{STATE_PREFIX}edit_cfg"
 STATE_EDIT_PHOTO = f"{STATE_PREFIX}edit_photo"
 
@@ -146,6 +150,12 @@ _COUNTRY_FALLBACK: dict[str, str] = {
     "58": "Венесуэла",
     "51": "Перу",
 }
+
+
+def _extract_codes(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return re.findall(r"\b\d{4,6}\b", text)
 
 
 def _to_dec(value: Any) -> Decimal:
@@ -298,6 +308,7 @@ class ShopAdminPanel:
             InlineKeyboardButton("📞 Добавить по номеру", callback_data=CBA_ADD_PHONE),
             InlineKeyboardButton("📦 Список аккаунтов", callback_data=CBA_LIST_ACCOUNTS),
             InlineKeyboardButton("💰 Пополнения", callback_data=CBA_DEPOSITS),
+            InlineKeyboardButton("💳 Баланс пользователя", callback_data=CBA_BALANCE),
             InlineKeyboardButton("📊 Статистика", callback_data=CBA_STATS),
             InlineKeyboardButton("⚙️ Настройки", callback_data=CBA_SETTINGS),
             InlineKeyboardButton("🔙 Назад", callback_data=back_data),
@@ -355,8 +366,14 @@ class ShopAdminPanel:
                 self.list_categories_for_accounts(c)
             elif action == "acc_by_cat":
                 self.show_accounts_by_cat(c, int(arg1))
+            elif action == "get_code":
+                self.get_code_admin(c, int(arg1))
+            elif action == "add_to_cat":
+                self.add_to_category_start(c, int(arg1))
             elif action == "deposits":
                 self.show_deposits(c)
+            elif action == "balance":
+                self.balance_start(c)
             elif action == "stats":
                 self.show_stats(c)
             elif action == "settings":
@@ -400,6 +417,8 @@ class ShopAdminPanel:
                 self.add_accounts_price(m)
             elif state == STATE_ADD_PHONE:
                 self.add_phone_text(m)
+            elif state == STATE_BALANCE:
+                self.save_balance(m)
             elif state == STATE_EDIT_CFG:
                 self.save_config(m)
         except Exception:
@@ -508,13 +527,15 @@ class ShopAdminPanel:
         errors: list[str] = []
         created: list[str] = []
         pending: list[dict[str, str]] = []
+        s = self.tg.get_state(m.chat.id, m.from_user.id)
+        fixed_category_id = s.get("data", {}).get("category_id") if s else None
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             cat: str | None = None
             data = line
-            if ":" in line:
+            if fixed_category_id is None and ":" in line:
                 maybe_cat, maybe_data = line.split(":", 1)
                 maybe_cat = maybe_cat.strip()
                 maybe_data = maybe_data.strip()
@@ -530,14 +551,17 @@ class ShopAdminPanel:
             if not phone or not session:
                 errors.append(f"Пустое поле: {line[:40]}")
                 continue
-            if cat is None:
+            if fixed_category_id is not None:
+                cat_row = self.storage.get_category(fixed_category_id)
+                cat = cat_row["name"] if cat_row else _detect_country(phone)
+            elif cat is None:
                 cat = _detect_country(phone)
             cat_row = self.storage.ensure_category(cat)
             if cat_row.get("price", 0) == 0 and cat not in created:
                 created.append(cat)
             pending.append({"cat": cat, "phone": phone, "session": session})
         if created:
-            self.tg.set_state(m.chat.id, m.id, m.from_user.id, STATE_ADD_ACCOUNTS_PRICE, {"pending": pending, "created": created, "errors": errors})
+            self.tg.set_state(m.chat.id, m.id, m.from_user.id, STATE_ADD_ACCOUNTS_PRICE, {"pending": pending, "created": created, "errors": errors, "category_id": fixed_category_id})
             text = f"🆕 Новые категории: {', '.join(created)}.\nВведите одну цену для всех новых категорий (₽):"
             self.bot.send_message(m.chat.id, text, reply_markup=self._back_kb(CBA_CATEGORIES))
             return
@@ -546,7 +570,8 @@ class ShopAdminPanel:
         msg = f"✅ Добавлено аккаунтов: {added}\n"
         if errors:
             msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
-        self.bot.send_message(m.chat.id, msg, reply_markup=self._back_kb(CBA_CATEGORIES))
+        back_target = CBA_ACCOUNTS_BY_CAT + str(fixed_category_id) if fixed_category_id else CBA_CATEGORIES
+        self.bot.send_message(m.chat.id, msg, reply_markup=self._back_kb(back_target))
 
     def add_accounts_price(self, m: Message) -> None:
         s = self.tg.get_state(m.chat.id, m.from_user.id)
@@ -560,6 +585,7 @@ class ShopAdminPanel:
         created = s["data"]["created"]
         pending = s["data"]["pending"]
         errors = s["data"].get("errors", [])
+        fixed_category_id = s["data"].get("category_id")
         for cat_name in created:
             cat_row = self.storage.get_category_by_name(cat_name) or self.storage.ensure_category(cat_name)
             self.storage.update_category_price(cat_row["id"], float(price))
@@ -568,7 +594,8 @@ class ShopAdminPanel:
         msg = f"✅ Добавлено {added} аккаунтов. Цена {price}₽ установлена для {len(created)} категорий.\n"
         if errors:
             msg += f"⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:10])
-        self.bot.send_message(m.chat.id, msg, reply_markup=self._back_kb(CBA_CATEGORIES))
+        back_target = CBA_ACCOUNTS_BY_CAT + str(fixed_category_id) if fixed_category_id else CBA_CATEGORIES
+        self.bot.send_message(m.chat.id, msg, reply_markup=self._back_kb(back_target))
 
     def _flush_pending(self, pending: list[dict[str, str]]) -> int:
         added = 0
@@ -600,13 +627,141 @@ class ShopAdminPanel:
         text = f"<b>{html.escape(cat['name'])}</b>\n\n"
         if not accounts:
             text += "Нет аккаунтов."
-        else:
-            for a in accounts[:50]:
-                text += f"ID {a['id']} | <code>{a['phone']}</code> | {a['status']}\n"
-            if len(accounts) > 50:
-                text += f"... и ещё {len(accounts) - 50}\n"
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_LIST_ACCOUNTS))
+        kb = InlineKeyboardMarkup(row_width=1)
+        for a in accounts[:50]:
+            text += f"ID {a['id']} | <code>{a['phone']}</code> | {a['status']}\n"
+            kb.add(InlineKeyboardButton(
+                f"📞 {a['phone']} ({a['status']}) — получить код",
+                callback_data=f"{CBA_GET_CODE}{a['id']}"
+            ))
+        if len(accounts) > 50:
+            text += f"... и ещё {len(accounts) - 50}\n"
+        kb.add(InlineKeyboardButton("➕ Добавить аккаунт в эту категорию", callback_data=f"{CBA_ADD_TO_CAT}{cat_id}"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_LIST_ACCOUNTS))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def add_to_category_start(self, c: CallbackQuery, cat_id: int) -> None:
+        cat = self.storage.get_category(cat_id)
+        if not cat:
+            return
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_ACCOUNTS, {"category_id": cat_id})
+        text = (
+            f"➕ Добавление в <b>{html.escape(cat['name'])}</b>\n\n"
+            "Отправьте аккаунты в формате:\n"
+            "<code>+79001234567|session_string</code>\n\n"
+            "Можно несколько строк."
+        )
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=f"{CBA_ACCOUNTS_BY_CAT}{cat_id}"))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def get_code_admin(self, c: CallbackQuery, account_id: int) -> None:
+        account = self.storage.get_account(account_id)
+        if not account:
+            self.bot.answer_callback_query(c.id, "Аккаунт не найден", show_alert=True)
+            return
+        self.bot.answer_callback_query(c.id, "⏳ Подключаюсь к аккаунту...")
+        threading.Thread(
+            target=self._get_code_worker,
+            args=(c.message.chat.id, account),
+            daemon=True,
+        ).start()
+
+    def _get_code_worker(self, chat_id: int, account: dict[str, Any]) -> None:
+        _ensure_event_loop()
+        client = None
+        try:
+            api_id, api_hash = self._api_config()
+            if not api_id or not api_hash:
+                raise ValueError("Не заданы api_id / api_hash в настройках")
+            proxy = account.get("proxy") or self.storage.get_config("default_proxy")
+            if isinstance(proxy, str):
+                proxy = _parse_proxy(proxy)
+            proxy_t = _proxy_for_telethon(proxy)
+            kwargs: dict[str, Any] = {"api_id": api_id, "api_hash": api_hash}
+            if proxy_t and isinstance(proxy_t, tuple):
+                kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+                kwargs["proxy"] = proxy_t
+            elif proxy_t:
+                kwargs["proxy"] = proxy_t
+            client = TelegramClient(StringSession(account.get("session_string") or ""), **kwargs)
+            client.connect()
+            code = self._last_code_from_client(client)
+            if code:
+                self.bot.send_message(
+                    chat_id,
+                    f"📞 <code>{html.escape(account.get('phone', ''))}</code>\n"
+                    f"🔑 Последний код: <code>{code}</code>",
+                    parse_mode="HTML",
+                )
+            else:
+                self.bot.send_message(chat_id, f"📞 <code>{html.escape(account.get('phone', ''))}</code>\n❌ Код не найден в последних сообщениях.", parse_mode="HTML")
+        except Exception as e:
+            logger.exception("get_code_admin error")
+            self.bot.send_message(chat_id, f"❌ Ошибка подключения к аккаунту <code>{html.escape(account.get('phone', ''))}</code>:\n<pre>{html.escape(str(e))}</pre>", parse_mode="HTML")
+        finally:
+            try:
+                if client:
+                    client.disconnect()
+            except Exception:
+                pass
+
+    def _last_code_from_client(self, client: TelegramClient) -> str | None:
+        try:
+            msgs = client.get_messages(777000, limit=20)
+            for m in msgs:
+                codes = _extract_codes(m.text or m.message or "")
+                if codes:
+                    return codes[-1]
+        except Exception:
+            pass
+        try:
+            for dialog in client.iter_dialogs(limit=20):
+                try:
+                    msg = client.get_messages(dialog.id, limit=1)[0]
+                except Exception:
+                    continue
+                codes = _extract_codes(msg.text or msg.message or "")
+                if codes:
+                    return codes[-1]
+        except Exception:
+            pass
+        return None
+
+    def balance_start(self, c: CallbackQuery) -> None:
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_BALANCE, {})
+        text = (
+            "💳 Изменение баланса\n\n"
+            "Введите ID пользователя и сумму через пробел.\n"
+            "Сумма может быть отрицательной для уменьшения баланса.\n\n"
+            "Пример: <code>123456789 500</code>\n"
+            "Или: <code>123456789 -200</code>"
+        )
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=CBA_MAIN))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def save_balance(self, m: Message) -> None:
+        parts = (m.text or "").strip().split()
+        if len(parts) != 2:
+            self.bot.send_message(m.chat.id, "❌ Введите ID и сумму через пробел.", reply_markup=self._back_kb(CBA_MAIN))
+            return
+        try:
+            user_id = int(parts[0])
+            amount = _to_dec(parts[1])
+        except Exception:
+            self.bot.send_message(m.chat.id, "❌ ID и сумма должны быть числами.", reply_markup=self._back_kb(CBA_MAIN))
+            return
+        user = self.storage.get_user(user_id)
+        self.storage.update_balance(user_id, amount)
+        self.tg.clear_state(m.chat.id, m.from_user.id)
+        new_balance = _to_dec(user.get("balance", 0)) + amount
+        sign = "+" if amount >= 0 else ""
+        self.bot.send_message(
+            m.chat.id,
+            f"✅ Баланс пользователя <code>{user_id}</code> изменён на {sign}{amount}₽\n"
+            f"💰 Текущий баланс: {new_balance}₽",
+            parse_mode="HTML",
+            reply_markup=self._back_kb(CBA_MAIN),
+        )
 
     # --- deposits / stats ---
     def show_deposits(self, c: CallbackQuery) -> None:
