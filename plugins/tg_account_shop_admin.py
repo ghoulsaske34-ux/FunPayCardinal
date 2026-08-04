@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 import logging
+import queue
 import re
 import threading
 import time
@@ -223,6 +224,7 @@ class ShopAdminPanel:
         self.uuid = uuid
         self.tg = cardinal.telegram
         self.bot = cardinal.telegram.bot
+        self._login_queues: dict[int, queue.Queue] = {}
 
     def register(self) -> None:
         if CBT_FPC and self.tg:
@@ -666,6 +668,57 @@ class ShopAdminPanel:
             kwargs["proxy"] = proxy_t
         return TelegramClient(StringSession(), **kwargs)
 
+    def _login_worker(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        client = None
+        try:
+            client = self._login_client(proxy, api_id, api_hash)
+            client.connect()
+            sent = client.send_code_request(phone)
+            phone_code_hash = sent.phone_code_hash
+            self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
+            q = self._login_queues[user_id]
+            code = q.get()
+            if code is None:
+                raise RuntimeError("Отменено")
+            try:
+                client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            except SessionPasswordNeededError:
+                self.bot.send_message(chat_id, "🔐 Введите облачный пароль (или '-' если нет):")
+                password = q.get()
+                if password is None:
+                    raise RuntimeError("Отменено")
+                if password not in ("", "-", "нет", "no", "none"):
+                    client.sign_in(password=password)
+            session_string = client.session.save()
+            try:
+                me = client.get_me()
+                phone = me.phone or phone
+            except Exception:
+                pass
+            client.disconnect()
+            cat_name = _detect_country(phone)
+            cat = self.storage.ensure_category(cat_name)
+            if cat.get("price", 0) == 0:
+                self.tg.set_state(chat_id, None, user_id, STATE_ADD_PHONE, {
+                    "step": "set_price", "phone": phone, "session_string": session_string,
+                    "proxy": proxy, "category_name": cat_name, "category_id": cat["id"],
+                })
+                self.bot.send_message(chat_id, f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):")
+            else:
+                self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
+                self.tg.clear_state(chat_id, user_id)
+                self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.")
+        except Exception:
+            logger.exception("admin login worker error")
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+            self.tg.clear_state(chat_id, user_id)
+            self._login_queues.pop(user_id, None)
+            self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте номер, код, пароль и прокси.")
+
     # --- telethon login helpers ---
     def _api_config(self) -> tuple[int, str]:
         api_id = self.storage.get_config("api_id")
@@ -690,17 +743,36 @@ class ShopAdminPanel:
             return
         data = s["data"]
         step = data.get("step")
-        api_id, api_hash = self._api_config()
-        if not api_id or not api_hash:
-            self.bot.send_message(m.chat.id, "❌ Сначала задайте api_id и api_hash в настройках плагина.", reply_markup=self._back_kb(CBA_MAIN))
-            self.tg.clear_state(m.chat.id, m.from_user.id)
+
+        if step == "code":
+            code = (m.text or "").strip()
+            q = self._login_queues.get(m.from_user.id)
+            if q:
+                q.put(code)
+                self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {**data, "step": "password"})
+            else:
+                self.tg.clear_state(m.chat.id, m.from_user.id)
             return
-        if not TelegramClient:
-            self.bot.send_message(m.chat.id, "❌ Telethon не установлен.", reply_markup=self._back_kb(CBA_MAIN))
+
+        if step == "password":
+            password = (m.text or "").strip()
+            q = self._login_queues.get(m.from_user.id)
+            if q:
+                q.put(password)
+            self._login_queues.pop(m.from_user.id, None)
             self.tg.clear_state(m.chat.id, m.from_user.id)
             return
 
-        if step == "phone":
+        if step in (None, "phone"):
+            api_id, api_hash = self._api_config()
+            if not api_id or not api_hash:
+                self.bot.send_message(m.chat.id, "❌ Сначала задайте api_id и api_hash в настройках плагина.", reply_markup=self._back_kb(CBA_MAIN))
+                self.tg.clear_state(m.chat.id, m.from_user.id)
+                return
+            if not TelegramClient:
+                self.bot.send_message(m.chat.id, "❌ Telethon не установлен.", reply_markup=self._back_kb(CBA_MAIN))
+                self.tg.clear_state(m.chat.id, m.from_user.id)
+                return
             phone = (m.text or "").strip()
             if not phone:
                 self.bot.send_message(m.chat.id, "❌ Введите номер телефона.")
@@ -711,37 +783,14 @@ class ShopAdminPanel:
                 phone = phone.strip()
                 proxy_text = proxy_text.strip()
             proxy = _parse_proxy(proxy_text) or self._get_default_proxy()
+            q: queue.Queue = queue.Queue()
+            self._login_queues[m.from_user.id] = q
             self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
                 **data, "step": "code", "phone": phone, "proxy": proxy,
             })
             threading.Thread(
-                target=self._send_phone_code,
+                target=self._login_worker,
                 args=(m.chat.id, m.from_user.id, phone, proxy, api_id, api_hash),
-                daemon=True,
-            ).start()
-            return
-
-        if step == "code":
-            code = (m.text or "").strip()
-            self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
-                **data, "step": "password", "code": code,
-            })
-            self.bot.send_message(m.chat.id, "🔐 Если есть облачный пароль — введите его.\nЕсли нет — отправьте '-' или 'нет'.")
-            return
-
-        if step == "password":
-            password = (m.text or "").strip()
-            if password.lower() in ("", "-", "нет", "no", "none"):
-                password = None
-            phone = data.get("phone")
-            code = data.get("code")
-            proxy = data.get("proxy")
-            self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
-                **data, "step": "login", "password": password,
-            })
-            threading.Thread(
-                target=self._login_phone_account,
-                args=(m.chat.id, m.from_user.id, phone, code, password, proxy, api_id, api_hash),
                 daemon=True,
             ).start()
             return
@@ -765,80 +814,7 @@ class ShopAdminPanel:
                 self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._back_kb(CBA_MAIN))
             self.tg.clear_state(m.chat.id, m.from_user.id)
 
-    def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
-        client = None
-        try:
-            client = self._login_client(proxy, api_id, api_hash)
-            client.connect()
-            sent = client.send_code_request(phone)
-            s = self.tg.get_state(chat_id, user_id)
-            if s:
-                data = s["data"]
-                data["phone_code_hash"] = sent.phone_code_hash
-                data["client"] = client
-                self.tg.set_state(chat_id, s["mid"], user_id, STATE_ADD_PHONE, data)
-            self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
-        except Exception:
-            logger.exception("admin send_code error")
-            if client:
-                try:
-                    client.disconnect()
-                except Exception:
-                    pass
-            self.bot.send_message(chat_id, "❌ Не удалось отправить код. Проверьте номер и прокси.")
-            self.tg.clear_state(chat_id, user_id)
 
-    def _login_phone_account(self, chat_id: int, user_id: int, phone: str, code: str, password: str | None,
-                             proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
-        client = None
-        try:
-            s = self.tg.get_state(chat_id, user_id)
-            client = s["data"].get("client") if s else None
-            if not client:
-                client = self._login_client(proxy, api_id, api_hash)
-            if not client.is_connected():
-                client.connect()
-            phone_code_hash = s["data"].get("phone_code_hash") if s else None
-            try:
-                client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-            except SessionPasswordNeededError:
-                if not password:
-                    raise
-                client.sign_in(password=password)
-            session_string = client.session.save()
-            try:
-                me = client.get_me()
-                phone = me.phone or phone
-            except Exception:
-                pass
-            client.disconnect()
-            cat_name = _detect_country(phone)
-            cat = self.storage.ensure_category(cat_name)
-            if cat.get("price", 0) == 0:
-                new_data = {
-                    "step": "set_price", "phone": phone, "session_string": session_string,
-                    "proxy": proxy, "category_name": cat_name, "category_id": cat["id"],
-                }
-                if s:
-                    self.tg.set_state(chat_id, s["mid"], user_id, STATE_ADD_PHONE, new_data)
-                self.bot.send_message(
-                    chat_id,
-                    f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):",
-                    reply_markup=self._back_kb(CBA_MAIN),
-                )
-                return
-            self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
-            self.tg.clear_state(chat_id, user_id)
-            self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.", reply_markup=self._back_kb(CBA_MAIN))
-        except Exception:
-            logger.exception("admin login_phone_account error")
-            if client:
-                try:
-                    client.disconnect()
-                except Exception:
-                    pass
-            self.tg.clear_state(chat_id, user_id)
-            self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте код, пароль и прокси.", reply_markup=self._back_kb(CBA_MAIN))
 
 
 def register(cardinal: Any, storage: Any, shop_bot: Any, uuid: str) -> None:
