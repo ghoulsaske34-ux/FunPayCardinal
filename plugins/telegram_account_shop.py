@@ -208,6 +208,31 @@ def _parse_proxy(text: str | None) -> dict[str, Any] | None:
         return {"scheme": "socks5", "hostname": m.group(1), "port": int(m.group(2)), "username": None, "password": None}
     return None
 
+_NAME_TO_CODE: dict[str, str] = {v: k for k, v in _COUNTRY_FALLBACK.items()}
+
+def _country_code_from_name(name: str) -> str:
+    return _NAME_TO_CODE.get(name, "")
+
+def _flag_for_region(region: str) -> str:
+    region = region.upper()
+    if len(region) != 2 or not region.isalpha():
+        return ""
+    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in region)
+
+def _country_meta(name: str) -> tuple[str, str]:
+    """Return (phone_code, flag_emoji) for a country/category name."""
+    code = _country_code_from_name(name)
+    if not code:
+        return "", ""
+    if phonenumbers:
+        try:
+            region = phonenumbers.region_code_for_country_code(int(code))
+            if region:
+                return f"+{code}", _flag_for_region(region)
+        except Exception:
+            pass
+    return f"+{code}", ""
+
 # --- хранилище ---
 class AccountStorage:
     def __init__(self) -> None:
@@ -505,6 +530,46 @@ class AccountStorage:
                 (user_id, account_id, float(price), _now(), _now())
             )
             return cur.lastrowid
+
+    def purchase_accounts(self, user_id: int, category_id: int, qty: int) -> tuple[list[dict[str, Any]], Decimal] | tuple[None, None]:
+        """Atomically reserve up to `qty` accounts and charge the user."""
+        with self._lock, self._conn() as conn:
+            user = dict(conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone() or {})
+            cat = dict(conn.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone() or {})
+            if not cat:
+                return None, None
+            price = _to_dec(cat.get("price", 0))
+            total = _money_round(price * qty)
+            balance = _to_dec(user.get("balance", 0))
+            if balance < total:
+                return None, None
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE category_id=? AND status=? ORDER BY id LIMIT ?",
+                (category_id, STATUS_AVAILABLE, qty)
+            ).fetchall()
+            if len(rows) < qty:
+                return None, None
+            new_balance = float(balance - total)
+            conn.execute("UPDATE users SET balance=?, total_spent=total_spent+? WHERE user_id=?", (new_balance, float(total), user_id))
+            accounts = []
+            now = _now()
+            for row in rows:
+                acc = dict(row)
+                conn.execute(
+                    "UPDATE accounts SET status=?, buyer_id=?, purchased_at=? WHERE id=?",
+                    (STATUS_SOLD, user_id, now, acc["id"])
+                )
+                cur = conn.execute(
+                    "INSERT INTO purchases(user_id, account_id, price, created_at, delivered_at) VALUES(?, ?, ?, ?, ?)",
+                    (user_id, acc["id"], float(price), now, now)
+                )
+                acc["purchase_id"] = cur.lastrowid
+                try:
+                    acc["proxy"] = json.loads(acc["proxy"]) if acc.get("proxy") else None
+                except Exception:
+                    acc["proxy"] = None
+                accounts.append(acc)
+        return accounts, total
 
     def get_purchases(self, user_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock, self._conn() as conn:
@@ -967,6 +1032,78 @@ class AccountShopBot:
             except Exception:
                 pass
 
+    def _get_photo(self, key: str) -> str | None:
+        """Return local file path or URL for a configured photo (main/buy/deposit/category)."""
+        photo = self.storage.get_config(f"photo_{key}") or ""
+        if not photo:
+            return None
+        photo = photo.strip()
+        if photo.startswith(("http://", "https://")):
+            return photo
+        if os.path.isabs(photo) and os.path.exists(photo):
+            return photo
+        rel = os.path.join(os.path.dirname(DB_FILE), "photos", photo)
+        if os.path.exists(rel):
+            return rel
+        return photo
+
+    def _send_or_edit(
+        self,
+        chat_id: int,
+        text: str,
+        keyboard: InlineKeyboardMarkup | None,
+        message_id: int | None,
+        photo: str | None = None,
+        parse_mode: str = "HTML",
+    ) -> Message | None:
+        """Send a new message or edit existing. Supports both text and photo messages."""
+        # Try to edit existing message
+        if message_id:
+            try:
+                if photo:
+                    return self.bot.edit_message_caption(
+                        caption=text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=keyboard,
+                        parse_mode=parse_mode,
+                    )
+                return self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                    parse_mode=parse_mode,
+                )
+            except Exception:
+                # If the existing message type differs (e.g. text vs photo),
+                # delete it and send a new one.
+                try:
+                    self.bot.delete_message(chat_id, message_id)
+                except Exception:
+                    pass
+                message_id = None
+        if photo:
+            try:
+                photo_arg = photo
+                if not photo_arg.startswith(("http://", "https://")) and os.path.isfile(photo_arg):
+                    photo_arg = open(photo_arg, "rb")
+                return self.bot.send_photo(
+                    chat_id,
+                    photo=photo_arg,
+                    caption=text,
+                    reply_markup=keyboard,
+                    parse_mode=parse_mode,
+                )
+            except Exception:
+                pass
+        return self.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=keyboard,
+            parse_mode=parse_mode,
+        )
+
     # keyboards
     def _main_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
         kb = InlineKeyboardMarkup(row_width=1)
@@ -1051,7 +1188,7 @@ class AccountShopBot:
                     self._show_admin_menu(m.from_user.id, m.chat.id, None)
                 else:
                     text = self._main_text(m.from_user.id, m.from_user.first_name)
-                    self.bot.send_message(m.chat.id, text, reply_markup=self._main_keyboard(m.from_user.id), parse_mode="HTML")
+                    self._send_or_edit(m.chat.id, text, self._main_keyboard(m.from_user.id), None, photo=self._get_photo("main"))
             except Exception:
                 logger.exception("[TelegramAccountShop] Ошибка /start")
 
@@ -1067,7 +1204,7 @@ class AccountShopBot:
                 self.bot.send_message(m.chat.id, "❌ Неверный код настройки.")
                 return
             self.storage.set_admin(m.from_user.id)
-            self.bot.send_message(m.chat.id, "✅ Вы назначены администратором.", reply_markup=self._main_keyboard(m.from_user.id))
+            self._send_or_edit(m.chat.id, "✅ Вы назначены администратором.", self._main_keyboard(m.from_user.id), None, photo=self._get_photo("main"))
 
         @self.bot.message_handler(func=lambda m: self.user_states.get(m.from_user.id, {}).get("state") is not None)
         def on_state(m: Message) -> None:
@@ -1092,7 +1229,7 @@ class AccountShopBot:
                     fn(m)
                 except Exception:
                     logger.exception("[TelegramAccountShop] Ошибка state handler %s", handler)
-                    self.bot.send_message(m.chat.id, "❌ Произошла ошибка. Попробуйте снова.", reply_markup=self._main_keyboard(m.from_user.id))
+                    self._send_or_edit(m.chat.id, "❌ Произошла ошибка. Попробуйте снова.", self._main_keyboard(m.from_user.id), None, photo=self._get_photo("main"))
                     self.user_states.pop(m.from_user.id, None)
             else:
                 self.user_states.pop(m.from_user.id, None)
@@ -1135,10 +1272,11 @@ class AccountShopBot:
         support = self.storage.get_config("support_contact") or ""
         if support:
             username = support.lstrip("@")
-            self.bot.send_message(m.chat.id, f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>", parse_mode="HTML", reply_markup=self._main_keyboard(m.from_user.id))
+            text = f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>"
+            self._send_or_edit(m.chat.id, text, self._main_keyboard(m.from_user.id), None)
             return
         self._notify_admins(f"🆘 Поддержка от @{m.from_user.username or m.from_user.id} (ID {m.from_user.id}):\n{m.text}")
-        self.bot.send_message(m.chat.id, "✅ Сообщение отправлено администратору.", reply_markup=self._main_keyboard(m.from_user.id))
+        self._send_or_edit(m.chat.id, "✅ Сообщение отправлено администратору.", self._main_keyboard(m.from_user.id), None, photo=self._get_photo("main"))
 
     # callback dispatcher
     def _handle_callback(self, c: CallbackQuery) -> None:
@@ -1148,14 +1286,16 @@ class AccountShopBot:
 
         if action == "main":
             text = self._main_text(c.from_user.id, c.from_user.first_name)
-            self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=self._main_keyboard(c.from_user.id), parse_mode="HTML")
+            self._send_or_edit(c.message.chat.id, text, self._main_keyboard(c.from_user.id), c.message.message_id, photo=self._get_photo("main"))
 
         elif action == "buy":
             self._show_categories(c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "category":
-            self._show_category(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._show_quantity_selector(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "qty":
+            self._handle_quantity(c)
         elif action == "purchase":
-            self._purchase(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id)
+            self._purchase(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id, qty=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1)
         elif action == "my_purchases":
             self._show_my_purchases(c.from_user.id, c.message.chat.id, c.message.message_id)
         elif action == "get_code":
@@ -1171,10 +1311,11 @@ class AccountShopBot:
             support = self.storage.get_config("support_contact") or ""
             if support:
                 username = support.lstrip("@")
-                self.bot.send_message(c.message.chat.id, f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>", parse_mode="HTML", reply_markup=self._main_keyboard(c.from_user.id))
+                text = f"🆘 Напишите в поддержку: <a href=\"https://t.me/{username}\">@{username}</a>"
+                self._send_or_edit(c.message.chat.id, text, self._main_keyboard(c.from_user.id), c.message.message_id)
             else:
                 self.user_states[c.from_user.id] = {"state": "support"}
-                self.bot.edit_message_text("🆘 Опишите проблему. Мы ответим в ближайшее время.", c.message.chat.id, c.message.message_id)
+                self._send_or_edit(c.message.chat.id, "🆘 Опишите проблему. Мы ответим в ближайшее время.", None, c.message.message_id)
 
         elif action == "deposit":
             self._show_deposit_menu(c.from_user.id, c.message.chat.id, c.message.message_id)
@@ -1289,10 +1430,7 @@ class AccountShopBot:
         kb.add(InlineKeyboardButton("💳 Пополнить баланс", callback_data=f"{CB}deposit"))
         kb.add(InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}buy"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("profile"))
 
     def _show_deposit_menu(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         text = "💳 Выберите сумму пополнения:"
@@ -1301,10 +1439,12 @@ class AccountShopBot:
         kb.add(*[InlineKeyboardButton(f"{a}₽", callback_data=f"{CB}deposit_amount:{a}") for a in amounts])
         kb.add(InlineKeyboardButton("📝 Своя сумма", callback_data=f"{CB}deposit_custom"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("deposit"))
+
+    def _category_button_text(self, cat: dict[str, Any], available: int) -> str:
+        code, flag = _country_meta(cat["name"])
+        name = " ".join(part for part in (code, flag, cat["name"]) if part)
+        return f"{name} – {_money_str(cat['price'])}₽ ({available} шт.)"
 
     def _show_categories(self, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         categories = self.storage.get_categories()
@@ -1312,78 +1452,145 @@ class AccountShopBot:
         if not categories:
             text = "😔 Пока нет доступных аккаунтов. Зайдите позже."
             kb = self._back_keyboard(f"{CB}main")
-        else:
-            text = f"🗂 Выберите страну/категорию:\n💰 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
-            kb = InlineKeyboardMarkup(row_width=1)
-            for cat in categories:
-                available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
-                kb.add(InlineKeyboardButton(
-                    f"{cat['name']} — {_money_str(cat['price'])}₽ ({available} шт)",
-                    callback_data=f"{CB}category:{cat['id']}"
-                ))
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+            self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("buy"))
+            return
+        text = f"🗂 Выберите страну/категорию:\n💰 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
+        kb = InlineKeyboardMarkup(row_width=1)
+        for cat in categories:
+            available = len(self.storage.get_accounts(cat["id"], STATUS_AVAILABLE))
+            kb.add(InlineKeyboardButton(
+                self._category_button_text(cat, available),
+                callback_data=f"{CB}category:{cat['id']}"
+            ))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("buy"))
 
-    def _show_category(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+    def _quantity_text(self, cat: dict[str, Any], qty: str, available: int, user: dict[str, Any]) -> str:
+        code, flag = _country_meta(cat["name"])
+        name = " ".join(part for part in (code, flag, cat["name"]) if part)
+        try:
+            q = max(1, int(qty or "0"))
+        except Exception:
+            q = 0
+        total = _money_round(_to_dec(cat["price"]) * q) if q else _to_dec(0)
+        return (
+            "➖ Покупка ➖\n\n"
+            f"📦 Товар: {name}\n"
+            f"💰 Цена: {_money_str(cat['price'])}₽\n"
+            f"🛒 Доступно: {available} шт\n\n"
+            f"📊 Количество: {q}\n"
+            f"💸 Итого: {_money_str(total)}₽\n\n"
+            "Введите количество товаров для покупки:"
+        )
+
+    def _quantity_keyboard(self, category_id: int, qty: str, available: int) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardMarkup(row_width=3)
+        for row in (("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9")):
+            kb.add(*[InlineKeyboardButton(n, callback_data=f"{CB}qty:{category_id}:{n}") for n in row])
+        kb.add(
+            InlineKeyboardButton("CLEAR", callback_data=f"{CB}qty:{category_id}:clear"),
+            InlineKeyboardButton("0", callback_data=f"{CB}qty:{category_id}:0"),
+            InlineKeyboardButton("✅ OK", callback_data=f"{CB}qty:{category_id}:ok"),
+        )
+        kb.add(
+            InlineKeyboardButton("🌍 К категориям", callback_data=f"{CB}buy"),
+            InlineKeyboardButton("❌ Закрыть", callback_data=f"{CB}main"),
+        )
+        return kb
+
+    def _show_quantity_selector(self, category_id: int, user_id: int, chat_id: int, message_id: int, qty: str = "0") -> None:
         cat = self.storage.get_category(category_id)
         if not cat:
-            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            self._send_or_edit(chat_id, "❌ Категория не найдена.", self._back_keyboard(f"{CB}buy"), message_id, photo=self._get_photo("buy"))
             return
         available = len(self.storage.get_accounts(category_id, STATUS_AVAILABLE))
         user = self.storage.get_user(user_id)
-        text = (
-            f"📱 {cat['name']}\n"
-            f"💰 Цена: {_money_str(cat['price'])}₽\n"
-            f"📦 Доступно: {available} шт\n"
-            f"💳 Ваш баланс: {_money_str(user.get('balance', 0))}₽"
-        )
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("🟢 Купить аккаунт", callback_data=f"{CB}purchase:{category_id}"))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}buy"))
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        self.user_states[user_id] = {"state": "select_quantity", "category_id": category_id, "qty": qty}
+        text = self._quantity_text(cat, qty, available, user)
+        kb = self._quantity_keyboard(category_id, qty, available)
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("category"))
 
-    def _purchase(self, category_id: int, user_id: int, chat_id: int, message_id: int) -> None:
+    def _handle_quantity(self, c: CallbackQuery) -> None:
+        data = c.data[len(CB):]
+        parts = data.split(":", 3)
+        if len(parts) < 3:
+            self.bot.answer_callback_query(c.id, "Ошибка")
+            return
+        category_id = int(parts[1])
+        cmd = parts[2]
+        state = self.user_states.get(c.from_user.id, {})
+        if state.get("state") != "select_quantity" or state.get("category_id") != category_id:
+            self.bot.answer_callback_query(c.id, "Сессия устарела")
+            return
+        qty = str(state.get("qty", "0"))
+        if cmd == "clear":
+            qty = "0"
+        elif cmd == "ok":
+            try:
+                q = max(1, int(qty or "0"))
+            except Exception:
+                q = 1
+            self.bot.answer_callback_query(c.id, "Обрабатываю...")
+            self._purchase(category_id, c.from_user.id, c.message.chat.id, c.message.message_id, qty=q)
+            return
+        else:
+            if not cmd.isdigit():
+                self.bot.answer_callback_query(c.id, "Некорректный ввод")
+                return
+            qty = (qty + cmd) if qty != "0" else cmd
+            # limit length to avoid overflow
+            if len(qty) > 5:
+                qty = qty[-5:]
+        state["qty"] = qty
+        self._show_quantity_selector(category_id, c.from_user.id, c.message.chat.id, c.message.message_id, qty=qty)
+
+    def _purchase(self, category_id: int, user_id: int, chat_id: int, message_id: int, qty: int = 1) -> None:
+        self.user_states.pop(user_id, None)
         cat = self.storage.get_category(category_id)
         if not cat:
-            self.bot.edit_message_text("❌ Категория не найдена.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
+            self._send_or_edit(chat_id, "❌ Категория не найдена.", self._back_keyboard(f"{CB}buy"), message_id, photo=self._get_photo("buy"))
             return
-        user = self.storage.get_user(user_id)
-        balance = _to_dec(user.get("balance", 0))
-        price = _to_dec(cat["price"])
-        if balance < price:
-            self.bot.edit_message_text(
-                f"❌ Недостаточно средств.\n💰 Нужно: {_money_str(price)}₽",
-                chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy")
+        if qty < 1:
+            self._send_or_edit(chat_id, "❌ Некорректное количество.", self._back_keyboard(f"{CB}buy"), message_id, photo=self._get_photo("buy"))
+            return
+        available = len(self.storage.get_accounts(category_id, STATUS_AVAILABLE))
+        if qty > available:
+            text = f"😔 Недостаточно аккаунтов. Доступно: {available} шт."
+            self._send_or_edit(chat_id, text, self._back_keyboard(f"{CB}buy"), message_id, photo=self._get_photo("buy"))
+            return
+
+        accounts, total = self.storage.purchase_accounts(user_id, category_id, qty)
+        if not accounts:
+            text = "😔 Не удалось совершить покупку. Проверьте баланс или наличие аккаунтов."
+            self._send_or_edit(chat_id, text, self._back_keyboard(f"{CB}buy"), message_id, photo=self._get_photo("buy"))
+            return
+
+        if qty == 1:
+            account = accounts[0]
+            text = (
+                f"✅ Вы купили аккаунт!\n\n"
+                f"📞 Номер: <code>{account['phone']}</code>\n"
+                f"🆔 ID: <code>{account['id']}</code>\n\n"
+                "Используйте кнопки ниже для получения кодов."
             )
-            return
-        account = self.storage.get_available_account(category_id)
-        if not account:
-            self.bot.edit_message_text("😔 В этой категории закончились аккаунты.", chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}buy"))
-            return
+            kb = InlineKeyboardMarkup(row_width=1)
+            kb.add(
+                InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account['id']}"),
+                InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account['id']}"),
+                InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
+            )
+        else:
+            text = f"✅ Вы купили {qty} аккаунтов на {_money_str(total)}₽!\n\n"
+            for account in accounts:
+                text += f"📞 <code>{account['phone']}</code>\n"
+            kb = InlineKeyboardMarkup(row_width=1)
+            for account in accounts[:10]:
+                kb.add(InlineKeyboardButton(f"🔄 {account['phone']}", callback_data=f"{CB}get_code:{account['id']}"))
+            kb.add(InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"))
 
-        self.storage.update_balance(user_id, -price)
-        self.storage.add_spent(user_id, price)
-        self.storage.update_account_status(account["id"], STATUS_SOLD, user_id, _now())
-        purchase_id = self.storage.add_purchase(user_id, account["id"], float(price))
-
-        text = (
-            f"✅ Вы купили аккаунт!\n\n"
-            f"📞 Номер: <code>{account['phone']}</code>\n"
-            f"🆔 ID: <code>{account['id']}</code>\n\n"
-            "Используйте кнопки ниже для получения кодов."
-        )
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account['id']}"),
-            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account['id']}"),
-            InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
-        )
-        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        if purchase_id:
-            threading.Timer(120.0, self._ask_for_review, args=(user_id, purchase_id)).start()
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("buy"))
+        for account in accounts:
+            threading.Timer(120.0, self._ask_for_review, args=(user_id, account["purchase_id"] if "purchase_id" in account else None)).start()
 
     def _ask_for_review(self, user_id: int, purchase_id: int) -> None:
         try:
@@ -1415,10 +1622,7 @@ class AccountShopBot:
                     InlineKeyboardButton(f"👂 {acc['phone']}", callback_data=f"{CB}listen:{acc['id']}"),
                 )
             kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
-        if message_id:
-            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
-        else:
-            self.bot.send_message(chat_id, text, reply_markup=kb)
+        self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("purchases"))
 
     def _start_review(self, request_id: int, user_id: int, chat_id: int, message_id: int | None = None) -> None:
         req = self.storage.get_review_request(request_id)
