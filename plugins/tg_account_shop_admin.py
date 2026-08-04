@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import queue
@@ -214,6 +215,13 @@ def _proxy_for_telethon(proxy: dict[str, Any] | None) -> dict[str, Any] | tuple[
         "password": proxy.get("password"),
         "rdns": True,
     }
+
+
+def _ensure_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 class ShopAdminPanel:
@@ -669,6 +677,7 @@ class ShopAdminPanel:
         return TelegramClient(StringSession(), **kwargs)
 
     def _login_worker(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        _ensure_event_loop()
         client = None
         try:
             client = self._login_client(proxy, api_id, api_hash)

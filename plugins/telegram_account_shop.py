@@ -650,6 +650,12 @@ def _proxy_for_telethon(proxy: dict[str, Any] | None) -> dict[str, Any] | tuple[
 def _get_default_proxy() -> dict[str, Any] | None:
     return _parse_proxy(_storage.get_config("default_proxy")) if _storage else None
 
+def _ensure_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
 def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot):
     async def handler(event):
         msg = event.message
@@ -720,6 +726,7 @@ def _login_worker(
     storage: AccountStorage,
     user_states: dict[int, dict[str, Any]],
 ) -> None:
+    _ensure_event_loop()
     client = None
     try:
         client = _login_client(proxy, api_id, api_hash)
@@ -793,6 +800,7 @@ def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
             timer.cancel()
 
     def run_client() -> None:
+        _ensure_event_loop()
         client = _telethon_client(account, api_id, api_hash)
         client.add_event_handler(_build_handler(account_id, buyer_id, bot), events.NewMessage(incoming=True))
         with _listener_lock:
@@ -863,6 +871,7 @@ def get_latest_code(account_id: int) -> str | None:
 
     result: list[str | None] = [None]
     def run() -> None:
+        _ensure_event_loop()
         result[0] = fetch()
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -2311,6 +2320,7 @@ class AccountShopBot:
             self.bot.send_message(m.chat.id, f"✅ Категория {cat['name']} создана.", reply_markup=self._admin_keyboard())
 
     def _handle_upload_session(self, m: Message) -> None:
+        _ensure_event_loop()
         state = self.user_states.get(m.from_user.id, {})
         if not m.document:
             self.bot.send_message(m.chat.id, "❌ Отправьте файл.")
