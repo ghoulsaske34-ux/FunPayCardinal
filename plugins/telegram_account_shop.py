@@ -399,11 +399,11 @@ class AccountStorage:
             existing = conn.execute("SELECT * FROM categories WHERE name=?", (name,)).fetchone()
             if existing:
                 return dict(existing)
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO categories(name, price, created_at) VALUES(?, ?, ?)",
                 (name, float(price), _now())
             )
-            row = conn.execute("SELECT * FROM categories WHERE id=?", (conn.lastrowid,)).fetchone()
+            row = conn.execute("SELECT * FROM categories WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
     def update_category_price(self, category_id: int, price: float) -> None:
