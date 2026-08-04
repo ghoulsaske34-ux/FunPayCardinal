@@ -377,6 +377,20 @@ class AccountStorage:
                 """)
             except Exception:
                 pass
+            # Восстановить buyer_id/purchased_at из purchases, если были сброшены
+            try:
+                conn.execute("""
+                    UPDATE accounts
+                    SET buyer_id = (
+                        SELECT user_id FROM purchases WHERE purchases.account_id = accounts.id ORDER BY id DESC LIMIT 1
+                    ),
+                    purchased_at = (
+                        SELECT created_at FROM purchases WHERE purchases.account_id = accounts.id ORDER BY id DESC LIMIT 1
+                    )
+                    WHERE buyer_id IS NULL AND status IN ('sold', 'listening')
+                """)
+            except Exception:
+                pass
 
     # config
     def get_config(self, key: str, default: Any = None) -> Any:
@@ -1345,6 +1359,8 @@ class AccountShopBot:
             self._purchase(int(parts[1]), c.from_user.id, c.message.chat.id, c.message.message_id, qty=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1)
         elif action == "my_purchases":
             self._show_my_purchases(c.from_user.id, c.message.chat.id, c.message.message_id)
+        elif action == "account":
+            self._show_purchase_account(int(parts[1]), c)
         elif action == "get_code":
             self._get_code(int(parts[1]), c)
         elif action == "listen":
@@ -1620,12 +1636,7 @@ class AccountShopBot:
 
         if qty == 1:
             account = accounts[0]
-            text = (
-                f"✅ Вы купили аккаунт!\n\n"
-                f"📞 Номер: <code>{account['phone']}</code>\n"
-                f"🆔 ID: <code>{account['id']}</code>\n\n"
-                "Используйте кнопки ниже для получения кодов."
-            )
+            text = "✅ Вы купили аккаунт!\n\n" + self._purchase_account_text(account)
             kb = InlineKeyboardMarkup(row_width=1)
             kb.add(
                 InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account['id']}"),
@@ -1660,22 +1671,41 @@ class AccountShopBot:
             text = "📭 У вас пока нет купленных аккаунтов."
             kb = self._back_keyboard(f"{CB}main")
         else:
-            text = "📱 Ваши покупки:\n\n"
-            for acc in accounts:
-                text += f"📞 <code>{acc['phone']}</code> — {acc['status']}"
-                if acc.get("last_code"):
-                    text += f"\n   Последний код: <code>{acc['last_code']}</code> ({_fmt_ts(acc.get('last_code_at'))})"
-                text += "\n\n"
+            text = "📱 Ваши покупки. Нажмите на номер, чтобы получить код или включить прослушку."
             kb = InlineKeyboardMarkup(row_width=1)
             for acc in accounts:
-                kb.add(
-                    InlineKeyboardButton(f"🔄 {acc['phone']}", callback_data=f"{CB}get_code:{acc['id']}"),
-                )
-                kb.add(
-                    InlineKeyboardButton(f"👂 {acc['phone']}", callback_data=f"{CB}listen:{acc['id']}"),
-                )
+                kb.add(InlineKeyboardButton(f"📞 {acc['phone']}", callback_data=f"{CB}account:{acc['id']}"))
             kb.add(InlineKeyboardButton("🔙 Назад", callback_data=f"{CB}main"))
         self._send_or_edit(chat_id, text, kb, message_id, photo=self._get_photo("purchases"))
+
+    def _purchase_account_text(self, account: dict[str, Any]) -> str:
+        cat = self.storage.get_category(account.get("category_id")) or {}
+        cat_name = cat.get("name", "—")
+        price = cat.get("price", 0)
+        code, flag = _country_meta(cat_name)
+        country = " ".join(part for part in (code, flag, cat_name) if part)
+        return (
+            "📱 Ваш аккаунт\n\n"
+            f"📞 Номер: <code>{account['phone']}</code>\n"
+            f"🌍 Страна: {country}\n"
+            f"💰 Цена: {_money_str(price)}₽\n"
+            f"📊 Статус: {account['status']}"
+        )
+
+    def _show_purchase_account(self, account_id: int, c: CallbackQuery) -> None:
+        account = self.storage.get_account(account_id)
+        if not account or account.get("buyer_id") != c.from_user.id:
+            self.bot.answer_callback_query(c.id, "Аккаунт не найден")
+            return
+        text = self._purchase_account_text(account)
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account_id}"),
+            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account_id}"),
+            InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
+        )
+        self.bot.answer_callback_query(c.id)
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb, parse_mode="HTML")
 
     def _start_review(self, request_id: int, c: CallbackQuery) -> None:
         req = self.storage.get_review_request(request_id)
@@ -1774,6 +1804,7 @@ class AccountShopBot:
         kb.add(
             InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB}get_code:{account_id}"),
             InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account_id}"),
+            InlineKeyboardButton("🔙 К аккаунту", callback_data=f"{CB}account:{account_id}"),
             InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
         )
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
@@ -1799,6 +1830,7 @@ class AccountShopBot:
             text = "❌ Не удалось запустить прослушку."
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(InlineKeyboardButton("🛑 Остановить", callback_data=f"{CB}stop_listen:{account_id}"))
+        kb.add(InlineKeyboardButton("🔙 К аккаунту", callback_data=f"{CB}account:{account_id}"))
         kb.add(InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"))
         self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
@@ -1811,10 +1843,14 @@ class AccountShopBot:
             return
         self.bot.answer_callback_query(c.id, "⏳ Останавливаю...")
         stop_listener(account_id)
-        self.bot.edit_message_text(
-            f"🛑 Прослушка аккаунта <code>{account['phone']}</code> остановлена.",
-            chat_id, message_id, reply_markup=self._back_keyboard(f"{CB}my_purchases")
+        text = f"🛑 Прослушка аккаунта <code>{account['phone']}</code> остановлена.\n\n" + self._purchase_account_text(account)
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔄 Получить код", callback_data=f"{CB}get_code:{account_id}"),
+            InlineKeyboardButton(f"👂 Прослушка {LISTEN_MINUTES} мин", callback_data=f"{CB}listen:{account_id}"),
+            InlineKeyboardButton("🔙 Мои покупки", callback_data=f"{CB}my_purchases"),
         )
+        self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
 
     # deposit flows
     def _on_deposit_amount(self, c: CallbackQuery) -> None:
