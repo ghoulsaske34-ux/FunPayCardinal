@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -665,6 +666,15 @@ def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot):
             logger.exception("Ошибка отправки кода покупателю %s", buyer_id)
     return handler
 
+def _disconnect_client(client: TelegramClient) -> None:
+    try:
+        if client.loop and client.loop.is_running():
+            asyncio.run_coroutine_threadsafe(client.disconnect(), client.loop)
+        else:
+            client.disconnect()
+    except Exception:
+        pass
+
 def _stop_listener(account_id: int, account_id_int: int) -> None:
     with _listener_lock:
         client = _active_clients.pop(account_id_int, None)
@@ -672,10 +682,7 @@ def _stop_listener(account_id: int, account_id_int: int) -> None:
     if timer:
         timer.cancel()
     if client:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        _disconnect_client(client)
     if _storage:
         _storage.update_account_status(account_id_int, STATUS_SOLD)
         account = _storage.get_account(account_id_int)
@@ -2509,10 +2516,7 @@ def start_plugin(cardinal: Any) -> None:
 def stop_plugin(cardinal: Any) -> None:
     global _shop_bot
     for client in list(_active_clients.values()):
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        _disconnect_client(client)
     _active_clients.clear()
     if _shop_bot:
         _shop_bot.stop()
