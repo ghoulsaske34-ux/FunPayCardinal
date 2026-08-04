@@ -644,6 +644,9 @@ def _proxy_for_pyrogram(proxy: dict[str, Any] | None) -> dict[str, Any] | None:
         pyro_proxy.pop("password", None)
     return pyro_proxy
 
+def _get_default_proxy() -> dict[str, Any] | None:
+    return _parse_proxy(_storage.get_config("default_proxy")) if _storage else None
+
 def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> Any:
     def handler(client: Client, message: Any) -> None:
         codes = _extract_codes(message.text or message.caption or "")
@@ -1110,7 +1113,7 @@ class AccountShopBot:
                 c.message.chat.id, c.message.message_id
             )
         elif action == "admin_add_session_text":
-            self.user_states[c.from_user.id] = {"state": "admin_add_session_text", "step": "input"}
+            self.user_states[c.from_user.id] = {"state": "admin_add_session_text", "step": "input", "proxy": _get_default_proxy()}
             self.bot.edit_message_text(
                 "📋 Введите аккаунты по одному на строке.\n"
                 "Формат: <code>phone|session_string</code>\n"
@@ -1119,13 +1122,13 @@ class AccountShopBot:
                 c.message.chat.id, c.message.message_id, parse_mode="HTML"
             )
         elif action == "admin_upload_session":
-            self.user_states[c.from_user.id] = {"state": "admin_upload_session", "step": "file"}
+            self.user_states[c.from_user.id] = {"state": "admin_upload_session", "step": "file", "proxy": _get_default_proxy()}
             self.bot.edit_message_text(
                 "📎 Отправьте .session файл или ZIP архив с .session файлами.",
                 c.message.chat.id, c.message.message_id
             )
         elif action == "admin_add_custom":
-            self.user_states[c.from_user.id] = {"state": "admin_add_custom", "step": "category"}
+            self.user_states[c.from_user.id] = {"state": "admin_add_custom", "step": "category", "proxy": _get_default_proxy()}
             self.bot.edit_message_text(
                 "🗂 Введите название существующей или новой категории:",
                 c.message.chat.id, c.message.message_id
@@ -2075,7 +2078,9 @@ class AccountShopBot:
                 phone, proxy_text = phone.split("|", 1)
                 phone = phone.strip()
                 proxy_text = proxy_text.strip()
-            proxy = _parse_proxy(proxy_text)
+            proxy = _parse_proxy(proxy_text) or _get_default_proxy()
+            if proxy and (proxy.get("scheme") or "").lower() == "mtproto":
+                self.bot.send_message(m.chat.id, "⚠️ Pyrogram не поддерживает MTProto-прокси. Авторизация будет попытана без прокси.")
             self.user_states[m.from_user.id] = {"state": "admin_add_phone", "step": "code", "phone": phone, "proxy": proxy}
             # send code in thread to avoid blocking
             threading.Thread(
@@ -2131,6 +2136,7 @@ class AccountShopBot:
             self.user_states.pop(m.from_user.id, None)
 
     def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        client = None
         try:
             client = Client(
                 f"login_{user_id}_{_now()}",
@@ -2145,11 +2151,17 @@ class AccountShopBot:
             sent = client.send_code(phone)
             state = self.user_states.get(user_id, {})
             state["phone_code_hash"] = sent.phone_code_hash
+            state["client"] = client
             self.user_states[user_id] = state
             self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
             client.disconnect()
         except Exception:
             logger.exception("send_code error")
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
             self.bot.send_message(chat_id, "❌ Не удалось отправить код. Проверьте номер и прокси.")
             self.user_states.pop(user_id, None)
 
@@ -2157,17 +2169,19 @@ class AccountShopBot:
                              proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
         client = None
         try:
-            client = Client(
-                f"login_{user_id}_{_now()}",
-                api_id=api_id,
-                api_hash=api_hash,
-                phone_number=phone,
-                proxy=_proxy_for_pyrogram(proxy),
-                in_memory=True,
-                no_updates=True,
-            )
-            client.connect()
             state = self.user_states.get(user_id, {})
+            client = state.get("client")
+            if not client:
+                client = Client(
+                    f"login_{user_id}_{_now()}",
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    phone_number=phone,
+                    proxy=_proxy_for_pyrogram(proxy),
+                    in_memory=True,
+                    no_updates=True,
+                )
+            client.connect()
             phone_code_hash = state.get("phone_code_hash")
             try:
                 client.sign_in(phone, phone_code_hash, code)

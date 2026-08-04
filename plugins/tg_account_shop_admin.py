@@ -8,6 +8,8 @@ from __future__ import annotations
 import html
 import logging
 import re
+import threading
+import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
@@ -17,6 +19,13 @@ try:
     PHONENUMBERS = True
 except Exception:
     PHONENUMBERS = False
+
+try:
+    from pyrogram import Client
+    from pyrogram.errors import SessionPasswordNeeded
+except Exception:
+    Client = None
+    SessionPasswordNeeded = None
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
@@ -37,6 +46,7 @@ CBA_DEL_CAT = f"{CB_ADMIN}del_cat:"
 CBA_CONFIRM_DEL_CAT = f"{CB_ADMIN}confirm_del:"
 CBA_ADD_CATEGORY = f"{CB_ADMIN}add_category"
 CBA_ADD_ACCOUNTS = f"{CB_ADMIN}add_accounts"
+CBA_ADD_PHONE = f"{CB_ADMIN}add_phone"
 CBA_LIST_ACCOUNTS = f"{CB_ADMIN}list_accounts"
 CBA_ACCOUNTS_BY_CAT = f"{CB_ADMIN}acc_by_cat:"
 CBA_DEPOSITS = f"{CB_ADMIN}deposits"
@@ -50,6 +60,7 @@ STATE_ADD_CATEGORY_NAME = f"{STATE_PREFIX}add_cat_name"
 STATE_ADD_CATEGORY_PRICE = f"{STATE_PREFIX}add_cat_price"
 STATE_ADD_ACCOUNTS = f"{STATE_PREFIX}add_accounts"
 STATE_ADD_ACCOUNTS_PRICE = f"{STATE_PREFIX}add_accounts_price"
+STATE_ADD_PHONE = f"{STATE_PREFIX}add_phone"
 STATE_EDIT_CFG = f"{STATE_PREFIX}edit_cfg"
 
 STATUS_AVAILABLE = "available"
@@ -147,6 +158,57 @@ def _detect_country(phone: str) -> str:
     return "Другое"
 
 
+def _parse_proxy(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    text = text.strip()
+    if text.lower() in ("нет", "не", "no", "none", "-", "пропустить"):
+        return None
+    # t.me/proxy?server=...&port=...&secret=...
+    m = re.search(r"[?&]server=([^&]+).*?port=(\d+).*?secret=([A-Za-z0-9+/=]+)", text)
+    if m:
+        return {"scheme": "mtproto", "hostname": m.group(1), "port": int(m.group(2)), "secret": m.group(3)}
+    # mtproto://server:port/secret
+    m = re.match(r"mtproto://([^:/]+):(\d+)(?:/([A-Za-z0-9+/=]+))?", text, re.I)
+    if m:
+        return {"scheme": "mtproto", "hostname": m.group(1), "port": int(m.group(2)), "secret": m.group(3) or ""}
+    # socks5://user:pass@host:port, http://host:port, etc.
+    m = re.match(r"(socks4|socks5|http|https)://(?:(?:([^:@]+):([^:@]+))@)?([^:/\s]+):(\d+)", text, re.I)
+    if m:
+        return {
+            "scheme": m.group(1).lower().replace("https", "http"),
+            "username": m.group(2) or None,
+            "password": m.group(3) or None,
+            "hostname": m.group(4),
+            "port": int(m.group(5)),
+        }
+    # host:port scheme
+    m = re.match(r"(socks4|socks5|http)\s+([^:/\s]+):(\d+)", text, re.I)
+    if m:
+        return {"scheme": m.group(1).lower(), "hostname": m.group(2), "port": int(m.group(3)), "username": None, "password": None}
+    # IPv4 host:port without scheme -> assume socks5
+    m = re.match(r"([^:/\s]+):(\d+)", text)
+    if m:
+        return {"scheme": "socks5", "hostname": m.group(1), "port": int(m.group(2)), "username": None, "password": None}
+    return None
+
+
+def _proxy_for_pyrogram(proxy: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not proxy:
+        return None
+    scheme = (proxy.get("scheme") or "").upper()
+    if scheme == "MTPROTO":
+        logger.warning("MTProto-прокси не поддерживается Pyrogram, подключение будет без прокси")
+        return None
+    pyro_proxy = dict(proxy)
+    pyro_proxy["scheme"] = scheme
+    if pyro_proxy.get("username") is None:
+        pyro_proxy.pop("username", None)
+    if pyro_proxy.get("password") is None:
+        pyro_proxy.pop("password", None)
+    return pyro_proxy
+
+
 class ShopAdminPanel:
     def __init__(self, cardinal: Any, storage: Any, shop_bot: Any, uuid: str) -> None:
         self.cardinal = cardinal
@@ -206,6 +268,7 @@ class ShopAdminPanel:
         kb.add(
             InlineKeyboardButton("📁 Категории и цены", callback_data=CBA_CATEGORIES),
             InlineKeyboardButton("➕ Добавить аккаунты", callback_data=CBA_ADD_ACCOUNTS),
+            InlineKeyboardButton("📞 Добавить по номеру", callback_data=CBA_ADD_PHONE),
             InlineKeyboardButton("📦 Список аккаунтов", callback_data=CBA_LIST_ACCOUNTS),
             InlineKeyboardButton("💰 Пополнения", callback_data=CBA_DEPOSITS),
             InlineKeyboardButton("📊 Статистика", callback_data=CBA_STATS),
@@ -259,6 +322,8 @@ class ShopAdminPanel:
                 self.add_category_start(c)
             elif action == "add_accounts":
                 self.add_accounts_start(c)
+            elif action == "add_phone":
+                self.add_phone_start(c)
             elif action == "list_accounts":
                 self.list_categories_for_accounts(c)
             elif action == "acc_by_cat":
@@ -299,6 +364,8 @@ class ShopAdminPanel:
                 self.add_accounts_text(m)
             elif state == STATE_ADD_ACCOUNTS_PRICE:
                 self.add_accounts_price(m)
+            elif state == STATE_ADD_PHONE:
+                self.add_phone_text(m)
             elif state == STATE_EDIT_CFG:
                 self.save_config(m)
         except Exception:
@@ -539,6 +606,9 @@ class ShopAdminPanel:
         "reviews_channel": "Канал отзывов",
         "reviews_moderation_chat_id": "ID чата модерации",
         "bot_token": "Токен бота",
+        "api_id": "App api_id",
+        "api_hash": "App api_hash",
+        "default_proxy": "Общий прокси (SOCKS/HTTP/MTProto)",
         "crypto_bot_token": "Токен Crypto Bot",
         "crypto_bot_name": "Юзернейм Crypto Bot",
         "platega_merchant_id": "Platega merchant ID",
@@ -553,6 +623,10 @@ class ShopAdminPanel:
                 val = val[:8] + "..." + val[-4:]
             if key == "platega_merchant_id" and val and isinstance(val, str) and len(val) > 12:
                 val = val[:8] + "..." + val[-8:]
+            if key == "api_hash" and val and isinstance(val, str) and len(val) > 12:
+                val = val[:8] + "..." + val[-4:]
+            if key == "default_proxy" and val and isinstance(val, str) and len(val) > 30:
+                val = val[:27] + "..."
             text += f"{label}: <code>{html.escape(str(val))}</code>\n"
             kb.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"{CBA_EDIT_CFG}{key}"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_MAIN))
@@ -575,6 +649,198 @@ class ShopAdminPanel:
         self.tg.clear_state(m.chat.id, m.from_user.id)
         label = self.CFG_LABELS.get(key, key)
         self.bot.send_message(m.chat.id, f"✅ <b>{html.escape(label)}</b> обновлено.", parse_mode="HTML", reply_markup=self._back_kb(CBA_SETTINGS))
+
+    # --- pyrogram login helpers ---
+    def _pyrogram_config(self) -> tuple[int, str]:
+        api_id = self.storage.get_config("api_id")
+        api_hash = self.storage.get_config("api_hash")
+        if not api_id or not api_hash:
+            return 0, ""
+        return int(api_id), str(api_hash)
+
+    def _get_default_proxy(self) -> dict[str, Any] | None:
+        return _parse_proxy(self.storage.get_config("default_proxy"))
+
+    # --- add account by phone + code ---
+    def add_phone_start(self, c: CallbackQuery) -> None:
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_PHONE, {"step": "phone"})
+        text = "📞 Введите номер телефона аккаунта (международный формат, например +79001234567).\n\nМожно сразу указать прокси через |: <code>+79001234567|socks5 1.2.3.4:1080</code>\nЕсли прокси не указан, используется общий из настроек."
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=CBA_MAIN))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def add_phone_text(self, m: Message) -> None:
+        s = self.tg.get_state(m.chat.id, m.from_user.id)
+        if not s:
+            return
+        data = s["data"]
+        step = data.get("step")
+        api_id, api_hash = self._pyrogram_config()
+        if not api_id or not api_hash:
+            self.bot.send_message(m.chat.id, "❌ Сначала задайте api_id и api_hash в настройках плагина.", reply_markup=self._back_kb(CBA_MAIN))
+            self.tg.clear_state(m.chat.id, m.from_user.id)
+            return
+        if not Client:
+            self.bot.send_message(m.chat.id, "❌ Pyrogram не установлен.", reply_markup=self._back_kb(CBA_MAIN))
+            self.tg.clear_state(m.chat.id, m.from_user.id)
+            return
+
+        if step == "phone":
+            phone = (m.text or "").strip()
+            if not phone:
+                self.bot.send_message(m.chat.id, "❌ Введите номер телефона.")
+                return
+            proxy_text = None
+            if "|" in phone:
+                phone, proxy_text = phone.split("|", 1)
+                phone = phone.strip()
+                proxy_text = proxy_text.strip()
+            proxy = _parse_proxy(proxy_text) or self._get_default_proxy()
+            if proxy and (proxy.get("scheme") or "").lower() == "mtproto":
+                self.bot.send_message(m.chat.id, "⚠️ Pyrogram не поддерживает MTProto-прокси. Авторизация будет попытана без прокси.")
+            self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
+                **data, "step": "code", "phone": phone, "proxy": proxy,
+            })
+            threading.Thread(
+                target=self._send_phone_code,
+                args=(m.chat.id, m.from_user.id, phone, proxy, api_id, api_hash),
+                daemon=True,
+            ).start()
+            return
+
+        if step == "code":
+            code = (m.text or "").strip()
+            self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
+                **data, "step": "password", "code": code,
+            })
+            self.bot.send_message(m.chat.id, "🔐 Если есть облачный пароль — введите его.\nЕсли нет — отправьте '-' или 'нет'.")
+            return
+
+        if step == "password":
+            password = (m.text or "").strip()
+            if password.lower() in ("", "-", "нет", "no", "none"):
+                password = None
+            phone = data.get("phone")
+            code = data.get("code")
+            proxy = data.get("proxy")
+            self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
+                **data, "step": "login", "password": password,
+            })
+            threading.Thread(
+                target=self._login_phone_account,
+                args=(m.chat.id, m.from_user.id, phone, code, password, proxy, api_id, api_hash),
+                daemon=True,
+            ).start()
+            return
+
+        if step == "set_price":
+            try:
+                price = _to_dec(m.text)
+            except Exception:
+                self.bot.send_message(m.chat.id, "❌ Введите число.")
+                return
+            category_id = data.get("category_id")
+            if category_id:
+                self.storage.update_category_price(category_id, float(price))
+            phone = data.get("phone")
+            session_string = data.get("session_string")
+            proxy = data.get("proxy")
+            if phone and session_string and category_id:
+                self.storage.add_account(category_id, phone, session_string, proxy=proxy)
+                self.bot.send_message(m.chat.id, f"✅ Аккаунт {phone} добавлен. Цена {price}₽ установлена.", reply_markup=self._back_kb(CBA_MAIN))
+            else:
+                self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._back_kb(CBA_MAIN))
+            self.tg.clear_state(m.chat.id, m.from_user.id)
+
+    def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        client = None
+        try:
+            client = Client(
+                f"admin_login_{user_id}_{int(time.time())}",
+                api_id=api_id,
+                api_hash=api_hash,
+                phone_number=phone,
+                proxy=_proxy_for_pyrogram(proxy),
+                in_memory=True,
+                no_updates=True,
+            )
+            client.connect()
+            sent = client.send_code(phone)
+            s = self.tg.get_state(chat_id, user_id)
+            if s:
+                data = s["data"]
+                data["phone_code_hash"] = sent.phone_code_hash
+                data["client"] = client
+                self.tg.set_state(chat_id, s["mid"], user_id, STATE_ADD_PHONE, data)
+            self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
+            client.disconnect()
+        except Exception:
+            logger.exception("admin send_code error")
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+            self.bot.send_message(chat_id, "❌ Не удалось отправить код. Проверьте номер и прокси.")
+            self.tg.clear_state(chat_id, user_id)
+
+    def _login_phone_account(self, chat_id: int, user_id: int, phone: str, code: str, password: str | None,
+                             proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+        client = None
+        try:
+            s = self.tg.get_state(chat_id, user_id)
+            client = s["data"].get("client") if s else None
+            if not client:
+                client = Client(
+                    f"admin_login_{user_id}_{int(time.time())}",
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    phone_number=phone,
+                    proxy=_proxy_for_pyrogram(proxy),
+                    in_memory=True,
+                    no_updates=True,
+                )
+            client.connect()
+            phone_code_hash = s["data"].get("phone_code_hash") if s else None
+            try:
+                client.sign_in(phone, phone_code_hash, code)
+            except SessionPasswordNeeded:
+                if not password:
+                    raise
+                client.check_password(password)
+            session_string = client.export_session_string()
+            try:
+                me = client.get_me()
+                phone = me.phone_number or phone
+            except Exception:
+                pass
+            client.disconnect()
+            cat_name = _detect_country(phone)
+            cat = self.storage.ensure_category(cat_name)
+            if cat.get("price", 0) == 0:
+                new_data = {
+                    "step": "set_price", "phone": phone, "session_string": session_string,
+                    "proxy": proxy, "category_name": cat_name, "category_id": cat["id"],
+                }
+                if s:
+                    self.tg.set_state(chat_id, s["mid"], user_id, STATE_ADD_PHONE, new_data)
+                self.bot.send_message(
+                    chat_id,
+                    f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):",
+                    reply_markup=self._back_kb(CBA_MAIN),
+                )
+                return
+            self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
+            self.tg.clear_state(chat_id, user_id)
+            self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.", reply_markup=self._back_kb(CBA_MAIN))
+        except Exception:
+            logger.exception("admin login_phone_account error")
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+            self.tg.clear_state(chat_id, user_id)
+            self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте код, пароль и прокси.", reply_markup=self._back_kb(CBA_MAIN))
 
 
 def register(cardinal: Any, storage: Any, shop_bot: Any, uuid: str) -> None:
