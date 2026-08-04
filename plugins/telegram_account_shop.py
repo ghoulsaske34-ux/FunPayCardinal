@@ -19,9 +19,10 @@ from typing import Any
 
 import requests
 import telebot
-from pyrogram import Client, filters
-from pyrogram.errors import BadRequest, SessionPasswordNeeded
-from pyrogram.handlers import MessageHandler
+from telethon.sync import TelegramClient
+from telethon import events, connection
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, LabeledPrice, BotCommand
 
 try:
@@ -37,7 +38,7 @@ except Exception:
 # --- метаданные плагина ---
 NAME = "Telegram Account Shop"
 VERSION = "2.1.0"
-DESCRIPTION = "Telegram-магазин аккаунтов с автовыдачей SMS/кодов через Pyrogram"
+DESCRIPTION = "Telegram-магазин аккаунтов с автовыдачей SMS/кодов через Telethon"
 CREDITS = "@ghoulsaske34"
 UUID = "85d48499-79da-462e-af82-9feb2c399d7c"
 SETTINGS_PAGE = True
@@ -616,40 +617,42 @@ class AccountStorage:
 _storage: AccountStorage | None = None
 _shop_bot: "AccountShopBot" | None = None
 
-# --- прослушка кодов через Pyrogram ---
-_active_clients: dict[int, Client] = {}
+# --- прослушка кодов через Telethon ---
+_active_clients: dict[int, TelegramClient] = {}
 _active_timers: dict[int, threading.Timer] = {}
 _listener_lock = threading.Lock()
 
-def _pyrogram_config() -> tuple[int, str]:
+def _api_config() -> tuple[int, str]:
     api_id = _storage.get_config("api_id") if _storage else None
     api_hash = _storage.get_config("api_hash") if _storage else None
     if not api_id or not api_hash:
         return 0, ""
     return int(api_id), str(api_hash)
 
-def _proxy_for_pyrogram(proxy: dict[str, Any] | None) -> dict[str, Any] | None:
+def _proxy_for_telethon(proxy: dict[str, Any] | None) -> dict[str, Any] | tuple[str, int, str] | None:
     if not proxy:
         return None
-    scheme = (proxy.get("scheme") or "").upper()
-    if scheme == "MTProto":
-        logger.warning("MTProto-прокси не поддерживается Pyrogram, подключение будет без прокси")
-        return None
-    pyro_proxy = dict(proxy)
-    # pyrogram ожидает scheme в верхнем регистре
-    pyro_proxy["scheme"] = scheme
-    if pyro_proxy.get("username") is None:
-        pyro_proxy.pop("username", None)
-    if pyro_proxy.get("password") is None:
-        pyro_proxy.pop("password", None)
-    return pyro_proxy
+    scheme = (proxy.get("scheme") or "").lower()
+    if scheme == "mtproto":
+        secret = proxy.get("secret") or ""
+        return (proxy["hostname"], proxy["port"], secret)
+    return {
+        "proxy_type": scheme,
+        "addr": proxy["hostname"],
+        "port": proxy["port"],
+        "username": proxy.get("username"),
+        "password": proxy.get("password"),
+        "rdns": True,
+    }
 
 def _get_default_proxy() -> dict[str, Any] | None:
     return _parse_proxy(_storage.get_config("default_proxy")) if _storage else None
 
-def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> Any:
-    def handler(client: Client, message: Any) -> None:
-        codes = _extract_codes(message.text or message.caption or "")
+def _build_handler(account_id: int, buyer_id: int, bot: telebot.TeleBot):
+    def handler(event):
+        msg = event.message
+        text = getattr(msg, "message", None) or getattr(msg, "caption", None) or ""
+        codes = _extract_codes(text)
         if not codes:
             return
         code = codes[0]
@@ -669,7 +672,7 @@ def _stop_listener(account_id: int, account_id_int: int) -> None:
         timer.cancel()
     if client:
         try:
-            client.stop()
+            client.disconnect()
         except Exception:
             pass
     if _storage:
@@ -678,13 +681,33 @@ def _stop_listener(account_id: int, account_id_int: int) -> None:
         if account:
             _storage.cleanup_empty_category(account["category_id"])
 
+def _telethon_client(account: dict[str, Any], api_id: int, api_hash: str) -> TelegramClient:
+    proxy = _proxy_for_telethon(account.get("proxy"))
+    kwargs: dict[str, Any] = {"api_id": api_id, "api_hash": api_hash}
+    if proxy and isinstance(proxy, tuple):
+        kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+        kwargs["proxy"] = proxy
+    elif proxy:
+        kwargs["proxy"] = proxy
+    return TelegramClient(StringSession(account["session_string"]), **kwargs)
+
+def _login_client(proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> TelegramClient:
+    proxy_t = _proxy_for_telethon(proxy)
+    kwargs: dict[str, Any] = {"api_id": api_id, "api_hash": api_hash}
+    if proxy_t and isinstance(proxy_t, tuple):
+        kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+        kwargs["proxy"] = proxy_t
+    elif proxy_t:
+        kwargs["proxy"] = proxy_t
+    return TelegramClient(StringSession(), **kwargs)
+
 def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
     if _storage is None:
         return "storage_not_ready"
     account = _storage.get_account(account_id)
     if not account:
         return "account_not_found"
-    api_id, api_hash = _pyrogram_config()
+    api_id, api_hash = _api_config()
     if not api_id or not api_hash:
         return "no_api_config"
 
@@ -693,7 +716,7 @@ def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
         old = _active_clients.pop(account_id, None)
         if old:
             try:
-                old.stop()
+                old.disconnect()
             except Exception:
                 pass
         timer = _active_timers.pop(account_id, None)
@@ -701,21 +724,13 @@ def start_listener(account_id: int, buyer_id: int, bot: telebot.TeleBot) -> str:
             timer.cancel()
 
     def run_client() -> None:
-        client = Client(
-            f"acc_{account_id}",
-            api_id=api_id,
-            api_hash=api_hash,
-            session_string=account["session_string"],
-            proxy=_proxy_for_pyrogram(account.get("proxy")),
-            in_memory=True,
-            no_updates=False,
-            skip_updates=True,
-        )
-        client.add_handler(MessageHandler(_build_handler(account_id, buyer_id, bot), filters.text))
+        client = _telethon_client(account, api_id, api_hash)
+        client.add_event_handler(_build_handler(account_id, buyer_id, bot), events.NewMessage(incoming=True))
         with _listener_lock:
             _active_clients[account_id] = client
         try:
-            client.run()
+            client.start()
+            client.run_until_disconnected()
         except Exception:
             logger.exception("Ошибка прослушки аккаунта %s", account_id)
         finally:
@@ -748,43 +763,35 @@ def get_latest_code(account_id: int) -> str | None:
     if cached and cached_at and (_now() - cached_at) < 300:
         return cached
 
-    api_id, api_hash = _pyrogram_config()
+    api_id, api_hash = _api_config()
     if not api_id or not api_hash:
         return cached
 
     def fetch() -> str | None:
-        client = Client(
-            f"acc_{account_id}_fetch",
-            api_id=api_id,
-            api_hash=api_hash,
-            session_string=account["session_string"],
-            proxy=_proxy_for_pyrogram(account.get("proxy")),
-            in_memory=True,
-            no_updates=True,
-        )
+        client = _telethon_client(account, api_id, api_hash)
         best_code: str | None = None
         best_time: float = 0
         try:
             client.start()
-            for dialog in client.get_dialogs(limit=30):
-                msg = dialog.top_message
+            for dialog in client.iter_dialogs(limit=30):
+                msg = dialog.message
                 if not msg or not msg.date:
                     continue
                 ts = msg.date.timestamp()
-                codes = _extract_codes(msg.text or msg.caption or "")
+                text = getattr(msg, "message", None) or getattr(msg, "caption", None) or ""
+                codes = _extract_codes(text)
                 if codes and ts > best_time:
                     best_code = codes[0]
                     best_time = ts
-            client.stop()
+            client.disconnect()
         except Exception:
             logger.exception("Ошибка получения кода для аккаунта %s", account_id)
             try:
-                client.stop()
+                client.disconnect()
             except Exception:
                 pass
         return best_code
 
-    thread = threading.Thread(target=lambda: None, daemon=True)
     result: list[str | None] = [None]
     def run() -> None:
         result[0] = fetch()
@@ -2062,7 +2069,7 @@ class AccountShopBot:
     def _handle_admin_add_phone(self, m: Message) -> None:
         state = self.user_states.get(m.from_user.id, {})
         step = state.get("step")
-        api_id, api_hash = _pyrogram_config()
+        api_id, api_hash = _api_config()
         if not api_id or not api_hash:
             self.bot.send_message(m.chat.id, "❌ API ID/API Hash не настроены.")
             self.user_states.pop(m.from_user.id, None)
@@ -2079,8 +2086,6 @@ class AccountShopBot:
                 phone = phone.strip()
                 proxy_text = proxy_text.strip()
             proxy = _parse_proxy(proxy_text) or _get_default_proxy()
-            if proxy and (proxy.get("scheme") or "").lower() == "mtproto":
-                self.bot.send_message(m.chat.id, "⚠️ Pyrogram не поддерживает MTProto-прокси. Авторизация будет попытана без прокси.")
             self.user_states[m.from_user.id] = {"state": "admin_add_phone", "step": "code", "phone": phone, "proxy": proxy}
             # send code in thread to avoid blocking
             threading.Thread(
@@ -2138,23 +2143,14 @@ class AccountShopBot:
     def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
         client = None
         try:
-            client = Client(
-                f"login_{user_id}_{_now()}",
-                api_id=api_id,
-                api_hash=api_hash,
-                phone_number=phone,
-                proxy=_proxy_for_pyrogram(proxy),
-                in_memory=True,
-                no_updates=True,
-            )
+            client = _login_client(proxy, api_id, api_hash)
             client.connect()
-            sent = client.send_code(phone)
+            sent = client.send_code_request(phone)
             state = self.user_states.get(user_id, {})
             state["phone_code_hash"] = sent.phone_code_hash
             state["client"] = client
             self.user_states[user_id] = state
             self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
-            client.disconnect()
         except Exception:
             logger.exception("send_code error")
             if client:
@@ -2172,35 +2168,26 @@ class AccountShopBot:
             state = self.user_states.get(user_id, {})
             client = state.get("client")
             if not client:
-                client = Client(
-                    f"login_{user_id}_{_now()}",
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    phone_number=phone,
-                    proxy=_proxy_for_pyrogram(proxy),
-                    in_memory=True,
-                    no_updates=True,
-                )
-            client.connect()
+                client = _login_client(proxy, api_id, api_hash)
+            if not client.is_connected():
+                client.connect()
             phone_code_hash = state.get("phone_code_hash")
             try:
-                client.sign_in(phone, phone_code_hash, code)
-            except SessionPasswordNeeded:
+                client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            except SessionPasswordNeededError:
                 if not password:
                     raise
-                client.check_password(password)
-            session_string = client.export_session_string()
-            # detect phone from me if possible
+                client.sign_in(password=password)
+            session_string = client.session.save()
             try:
                 me = client.get_me()
-                phone = me.phone_number or phone
+                phone = me.phone or phone
             except Exception:
                 pass
             client.disconnect()
             cat_name = _detect_country(phone)
             cat = self.storage.ensure_category(cat_name)
             if cat.get("price", 0) == 0:
-                # prompt admin for price
                 self.user_states[user_id] = {
                     "state": "admin_add_phone", "step": "set_price",
                     "phone": phone, "session_string": session_string, "proxy": proxy,
@@ -2217,11 +2204,11 @@ class AccountShopBot:
             self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.", reply_markup=self._admin_keyboard())
         except Exception:
             logger.exception("login_phone_account error")
-            try:
-                if client:
+            if client:
+                try:
                     client.disconnect()
-            except Exception:
-                pass
+                except Exception:
+                    pass
             self.user_states.pop(user_id, None)
             self.bot.send_message(chat_id, "❌ Ошибка авторизации. Проверьте код, пароль и прокси.", reply_markup=self._admin_keyboard())
 
@@ -2366,7 +2353,7 @@ class AccountShopBot:
             self.bot.send_message(m.chat.id, "❌ Нужен .session файл или ZIP.")
             return
 
-        api_id, api_hash = _pyrogram_config()
+        api_id, api_hash = _api_config()
         if not api_id or not api_hash:
             self.bot.send_message(m.chat.id, "❌ API ID/API Hash не настроены.")
             self.user_states.pop(m.from_user.id, None)
@@ -2381,19 +2368,14 @@ class AccountShopBot:
                 session_name = f"sess_{path.stem}_{int(_now())}"
                 target = SESSIONS_DIR / f"{session_name}.session"
                 shutil.copy(path, target)
-                client = Client(
-                    session_name,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    workdir=SESSIONS_DIR,
-                    proxy=_proxy_for_pyrogram(proxy),
-                    no_updates=True,
-                )
+                client = TelegramClient(str(target), api_id=api_id, api_hash=api_hash, proxy=_proxy_for_telethon(proxy))
                 client.connect()
-                session_string = client.export_session_string()
+                if not client.is_user_authorized():
+                    raise RuntimeError("session not authorized")
+                session_string = StringSession.save(client.session)
                 try:
                     me = client.get_me()
-                    phone = me.phone_number or path.stem
+                    phone = me.phone or path.stem
                 except Exception:
                     phone = path.stem
                 client.disconnect()
@@ -2542,7 +2524,7 @@ def stop_plugin(cardinal: Any) -> None:
     global _shop_bot
     for client in list(_active_clients.values()):
         try:
-            client.stop()
+            client.disconnect()
         except Exception:
             pass
     _active_clients.clear()

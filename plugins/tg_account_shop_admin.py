@@ -21,11 +21,16 @@ except Exception:
     PHONENUMBERS = False
 
 try:
-    from pyrogram import Client
-    from pyrogram.errors import SessionPasswordNeeded
+    from telethon.sync import TelegramClient
+    from telethon import connection, events
+    from telethon.errors import SessionPasswordNeededError
+    from telethon.sessions import StringSession
 except Exception:
-    Client = None
-    SessionPasswordNeeded = None
+    TelegramClient = None
+    SessionPasswordNeededError = None
+    connection = None
+    events = None
+    StringSession = None
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
@@ -193,20 +198,21 @@ def _parse_proxy(text: str | None) -> dict[str, Any] | None:
     return None
 
 
-def _proxy_for_pyrogram(proxy: dict[str, Any] | None) -> dict[str, Any] | None:
+def _proxy_for_telethon(proxy: dict[str, Any] | None) -> dict[str, Any] | tuple[str, int, str] | None:
     if not proxy:
         return None
-    scheme = (proxy.get("scheme") or "").upper()
-    if scheme == "MTPROTO":
-        logger.warning("MTProto-прокси не поддерживается Pyrogram, подключение будет без прокси")
-        return None
-    pyro_proxy = dict(proxy)
-    pyro_proxy["scheme"] = scheme
-    if pyro_proxy.get("username") is None:
-        pyro_proxy.pop("username", None)
-    if pyro_proxy.get("password") is None:
-        pyro_proxy.pop("password", None)
-    return pyro_proxy
+    scheme = (proxy.get("scheme") or "").lower()
+    if scheme == "mtproto":
+        secret = proxy.get("secret") or ""
+        return (proxy["hostname"], proxy["port"], secret)
+    return {
+        "proxy_type": scheme,
+        "addr": proxy["hostname"],
+        "port": proxy["port"],
+        "username": proxy.get("username"),
+        "password": proxy.get("password"),
+        "rdns": True,
+    }
 
 
 class ShopAdminPanel:
@@ -650,8 +656,18 @@ class ShopAdminPanel:
         label = self.CFG_LABELS.get(key, key)
         self.bot.send_message(m.chat.id, f"✅ <b>{html.escape(label)}</b> обновлено.", parse_mode="HTML", reply_markup=self._back_kb(CBA_SETTINGS))
 
-    # --- pyrogram login helpers ---
-    def _pyrogram_config(self) -> tuple[int, str]:
+    def _login_client(self, proxy: dict[str, Any] | None, api_id: int, api_hash: str):
+        proxy_t = _proxy_for_telethon(proxy)
+        kwargs: dict[str, Any] = {"api_id": api_id, "api_hash": api_hash}
+        if proxy_t and isinstance(proxy_t, tuple):
+            kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
+            kwargs["proxy"] = proxy_t
+        elif proxy_t:
+            kwargs["proxy"] = proxy_t
+        return TelegramClient(StringSession(), **kwargs)
+
+    # --- telethon login helpers ---
+    def _api_config(self) -> tuple[int, str]:
         api_id = self.storage.get_config("api_id")
         api_hash = self.storage.get_config("api_hash")
         if not api_id or not api_hash:
@@ -674,13 +690,13 @@ class ShopAdminPanel:
             return
         data = s["data"]
         step = data.get("step")
-        api_id, api_hash = self._pyrogram_config()
+        api_id, api_hash = self._api_config()
         if not api_id or not api_hash:
             self.bot.send_message(m.chat.id, "❌ Сначала задайте api_id и api_hash в настройках плагина.", reply_markup=self._back_kb(CBA_MAIN))
             self.tg.clear_state(m.chat.id, m.from_user.id)
             return
-        if not Client:
-            self.bot.send_message(m.chat.id, "❌ Pyrogram не установлен.", reply_markup=self._back_kb(CBA_MAIN))
+        if not TelegramClient:
+            self.bot.send_message(m.chat.id, "❌ Telethon не установлен.", reply_markup=self._back_kb(CBA_MAIN))
             self.tg.clear_state(m.chat.id, m.from_user.id)
             return
 
@@ -695,8 +711,6 @@ class ShopAdminPanel:
                 phone = phone.strip()
                 proxy_text = proxy_text.strip()
             proxy = _parse_proxy(proxy_text) or self._get_default_proxy()
-            if proxy and (proxy.get("scheme") or "").lower() == "mtproto":
-                self.bot.send_message(m.chat.id, "⚠️ Pyrogram не поддерживает MTProto-прокси. Авторизация будет попытана без прокси.")
             self.tg.set_state(m.chat.id, s["mid"], m.from_user.id, STATE_ADD_PHONE, {
                 **data, "step": "code", "phone": phone, "proxy": proxy,
             })
@@ -754,17 +768,9 @@ class ShopAdminPanel:
     def _send_phone_code(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
         client = None
         try:
-            client = Client(
-                f"admin_login_{user_id}_{int(time.time())}",
-                api_id=api_id,
-                api_hash=api_hash,
-                phone_number=phone,
-                proxy=_proxy_for_pyrogram(proxy),
-                in_memory=True,
-                no_updates=True,
-            )
+            client = self._login_client(proxy, api_id, api_hash)
             client.connect()
-            sent = client.send_code(phone)
+            sent = client.send_code_request(phone)
             s = self.tg.get_state(chat_id, user_id)
             if s:
                 data = s["data"]
@@ -772,7 +778,6 @@ class ShopAdminPanel:
                 data["client"] = client
                 self.tg.set_state(chat_id, s["mid"], user_id, STATE_ADD_PHONE, data)
             self.bot.send_message(chat_id, "📩 Код отправлен на номер. Введите его:")
-            client.disconnect()
         except Exception:
             logger.exception("admin send_code error")
             if client:
@@ -790,27 +795,20 @@ class ShopAdminPanel:
             s = self.tg.get_state(chat_id, user_id)
             client = s["data"].get("client") if s else None
             if not client:
-                client = Client(
-                    f"admin_login_{user_id}_{int(time.time())}",
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    phone_number=phone,
-                    proxy=_proxy_for_pyrogram(proxy),
-                    in_memory=True,
-                    no_updates=True,
-                )
-            client.connect()
+                client = self._login_client(proxy, api_id, api_hash)
+            if not client.is_connected():
+                client.connect()
             phone_code_hash = s["data"].get("phone_code_hash") if s else None
             try:
-                client.sign_in(phone, phone_code_hash, code)
-            except SessionPasswordNeeded:
+                client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            except SessionPasswordNeededError:
                 if not password:
                     raise
-                client.check_password(password)
-            session_string = client.export_session_string()
+                client.sign_in(password=password)
+            session_string = client.session.save()
             try:
                 me = client.get_me()
-                phone = me.phone_number or phone
+                phone = me.phone or phone
             except Exception:
                 pass
             client.disconnect()
