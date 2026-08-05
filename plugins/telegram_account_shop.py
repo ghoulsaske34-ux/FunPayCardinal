@@ -459,9 +459,10 @@ class AccountStorage:
             row = conn.execute("SELECT * FROM categories WHERE name=?", (name,)).fetchone()
         return dict(row) if row else None
 
-    def get_categories(self) -> list[dict[str, Any]]:
+    def get_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order, id" if active_only else "SELECT * FROM categories ORDER BY sort_order, id"
         with self._lock, self._conn() as conn:
-            rows = conn.execute("SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order, id").fetchall()
+            rows = conn.execute(query).fetchall()
         return [dict(r) for r in rows]
 
     def ensure_category(self, name: str, price: float = 0.0) -> dict[str, Any]:

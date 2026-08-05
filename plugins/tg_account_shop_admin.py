@@ -68,6 +68,7 @@ CBA_GET_CODE = f"{CB_ADMIN}get_code:"
 CBA_ADD_TO_CAT = f"{CB_ADMIN}add_to_cat:"
 CBA_ADD_PHONE_TO_CAT = f"{CB_ADMIN}add_phone_to_cat:"
 CBA_TOGGLE_CAT = f"{CB_ADMIN}toggle_cat:"
+CBA_CAT_DETAIL = f"{CB_ADMIN}cat_detail:"
 CBA_DEPOSITS = f"{CB_ADMIN}deposits"
 CBA_STATS = f"{CB_ADMIN}stats"
 CBA_BALANCE = f"{CB_ADMIN}balance"
@@ -368,6 +369,8 @@ class ShopAdminPanel:
                 self.add_phone_start(c)
             elif action == "add_phone_to_cat":
                 self.add_phone_to_cat_start(c, int(arg1))
+            elif action == "cat_detail":
+                self.show_category_detail(c, int(arg1))
             elif action == "list_accounts":
                 self.list_categories_for_accounts(c)
             elif action == "acc_by_cat":
@@ -432,17 +435,36 @@ class ShopAdminPanel:
 
     # --- categories ---
     def show_categories(self, c: CallbackQuery) -> None:
-        cats = self.storage.get_categories()
+        cats = self.storage.get_categories(active_only=False)
         text = "<b>📁 Категории и цены</b>\n\n"
         if not cats:
             text += "Пока нет категорий."
         kb = InlineKeyboardMarkup(row_width=1)
         for cat in cats:
-            text += f"• {html.escape(cat['name'])} — {cat['price']}₽\n"
-            kb.add(InlineKeyboardButton(f"✏️ {html.escape(cat['name'])} — {cat['price']}₽", callback_data=f"{CBA_SET_PRICE}{cat['id']}"))
-            kb.add(InlineKeyboardButton(f"🗑 {html.escape(cat['name'])}", callback_data=f"{CBA_DEL_CAT}{cat['id']}"))
+            active_mark = "🙈 " if cat.get("is_active") == 0 else ""
+            text += f"• {active_mark}{html.escape(cat['name'])} — {cat['price']}₽\n"
+            kb.add(InlineKeyboardButton(
+                f"{active_mark}{html.escape(cat['name'])} — {cat['price']}₽",
+                callback_data=f"{CBA_CAT_DETAIL}{cat['id']}"
+            ))
         kb.add(InlineKeyboardButton("➕ Создать категорию", callback_data=CBA_ADD_CATEGORY))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_MAIN))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def show_category_detail(self, c: CallbackQuery, cat_id: int) -> None:
+        cat = self.storage.get_category(cat_id)
+        if not cat:
+            return
+        active_text = "✅ В каталоге" if cat.get("is_active") else "👁 Скрыта"
+        text = (
+            f"<b>📁 {html.escape(cat['name'])}</b>\n"
+            f"💰 Цена: {cat['price']}₽\n"
+            f"👁 Статус: {active_text}"
+        )
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("💰 Изменить цену", callback_data=f"{CBA_SET_PRICE}{cat_id}:detail"))
+        kb.add(InlineKeyboardButton("🗑 Удалить категорию", callback_data=f"{CBA_DEL_CAT}{cat_id}:detail"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_CATEGORIES))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
     def set_price_start(self, c: CallbackQuery, cat_id: int, back: str = "categories") -> None:
@@ -451,7 +473,12 @@ class ShopAdminPanel:
             return
         self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_SET_PRICE, {"category_id": cat_id, "back": back})
         text = f"✏️ {html.escape(cat['name'])}\nВведите новую цену (₽):"
-        back_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
+        if back == "detail":
+            back_target = f"{CBA_CAT_DETAIL}{cat_id}"
+        elif back == "list":
+            back_target = CBA_LIST_ACCOUNTS
+        else:
+            back_target = CBA_CATEGORIES
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=back_target))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
@@ -468,7 +495,12 @@ class ShopAdminPanel:
             return
         self.storage.update_category_price(cat_id, float(price))
         self.tg.clear_state(m.chat.id, m.from_user.id)
-        back_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
+        if back == "detail":
+            back_target = f"{CBA_CAT_DETAIL}{cat_id}"
+        elif back == "list":
+            back_target = CBA_LIST_ACCOUNTS
+        else:
+            back_target = CBA_CATEGORIES
         self.bot.send_message(m.chat.id, "✅ Цена обновлена.", reply_markup=self._back_kb(back_target))
 
     def del_cat_start(self, c: CallbackQuery, cat_id: int, back: str = "categories") -> None:
@@ -476,7 +508,12 @@ class ShopAdminPanel:
         if not cat:
             return
         text = f"🗑 Удалить категорию <b>{html.escape(cat['name'])}</b> и все её аккаунты?"
-        no_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
+        if back == "detail":
+            no_target = f"{CBA_CAT_DETAIL}{cat_id}"
+        elif back == "list":
+            no_target = CBA_LIST_ACCOUNTS
+        else:
+            no_target = CBA_CATEGORIES
         kb = InlineKeyboardMarkup(row_width=2).add(
             InlineKeyboardButton("✅ Да", callback_data=f"{CBA_CONFIRM_DEL_CAT}{cat_id}:{back}"),
             InlineKeyboardButton("❌ Нет", callback_data=no_target),
@@ -619,7 +656,7 @@ class ShopAdminPanel:
         return added
 
     def list_categories_for_accounts(self, c: CallbackQuery) -> None:
-        cats = self.storage.get_categories()
+        cats = self.storage.get_categories(active_only=False)
         text = "<b>📦 Аккаунты по категориям</b>\n\n"
         if not cats:
             text += "Нет категорий."
@@ -627,8 +664,9 @@ class ShopAdminPanel:
         for cat in cats:
             accounts = self.storage.get_accounts(category_id=cat["id"])
             available = sum(1 for a in accounts if a["status"] == STATUS_AVAILABLE)
-            text += f"• {html.escape(cat['name'])}: {available} свободно / {len(accounts)} всего\n"
-            kb.add(InlineKeyboardButton(f"{html.escape(cat['name'])} ({available}/{len(accounts)})", callback_data=f"{CBA_ACCOUNTS_BY_CAT}{cat['id']}"))
+            active_mark = "🙈 " if cat.get("is_active") == 0 else ""
+            text += f"• {active_mark}{html.escape(cat['name'])}: {available} свободно / {len(accounts)} всего\n"
+            kb.add(InlineKeyboardButton(f"{active_mark}{html.escape(cat['name'])} ({available}/{len(accounts)})", callback_data=f"{CBA_ACCOUNTS_BY_CAT}{cat['id']}"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_MAIN))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
@@ -648,10 +686,8 @@ class ShopAdminPanel:
         if not accounts:
             text += "Нет аккаунтов."
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("💰 Изменить цену", callback_data=f"{CBA_SET_PRICE}{cat_id}:list"))
         toggle_label = "👁 Вернуть в каталог" if cat.get("is_active") == 0 else "🙈 Скрыть из каталога"
         kb.add(InlineKeyboardButton(toggle_label, callback_data=f"{CBA_TOGGLE_CAT}{cat_id}"))
-        kb.add(InlineKeyboardButton("🗑 Удалить категорию", callback_data=f"{CBA_DEL_CAT}{cat_id}:list"))
         kb.add(InlineKeyboardButton("📞 Добавить по номеру", callback_data=f"{CBA_ADD_PHONE_TO_CAT}{cat_id}"))
         kb.add(InlineKeyboardButton("➕ Добавить session", callback_data=f"{CBA_ADD_TO_CAT}{cat_id}"))
         for a in accounts[:50]:
