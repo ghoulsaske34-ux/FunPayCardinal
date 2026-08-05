@@ -66,6 +66,8 @@ CBA_LIST_ACCOUNTS = f"{CB_ADMIN}list_accounts"
 CBA_ACCOUNTS_BY_CAT = f"{CB_ADMIN}acc_by_cat:"
 CBA_GET_CODE = f"{CB_ADMIN}get_code:"
 CBA_ADD_TO_CAT = f"{CB_ADMIN}add_to_cat:"
+CBA_ADD_PHONE_TO_CAT = f"{CB_ADMIN}add_phone_to_cat:"
+CBA_TOGGLE_CAT = f"{CB_ADMIN}toggle_cat:"
 CBA_DEPOSITS = f"{CB_ADMIN}deposits"
 CBA_STATS = f"{CB_ADMIN}stats"
 CBA_BALANCE = f"{CB_ADMIN}balance"
@@ -351,17 +353,21 @@ class ShopAdminPanel:
             elif action == "categories":
                 self.show_categories(c)
             elif action == "set_price":
-                self.set_price_start(c, int(arg1))
+                self.set_price_start(c, int(arg1), back=arg2 or "categories")
             elif action == "del_cat":
-                self.del_cat_start(c, int(arg1))
+                self.del_cat_start(c, int(arg1), back=arg2 or "categories")
             elif action == "confirm_del":
-                self.confirm_del_cat(c, int(arg1))
+                self.confirm_del_cat(c, int(arg1), back=arg2 or "categories")
+            elif action == "toggle_cat":
+                self.toggle_category(c, int(arg1))
             elif action == "add_category":
                 self.add_category_start(c)
             elif action == "add_accounts":
                 self.add_accounts_start(c)
             elif action == "add_phone":
                 self.add_phone_start(c)
+            elif action == "add_phone_to_cat":
+                self.add_phone_to_cat_start(c, int(arg1))
             elif action == "list_accounts":
                 self.list_categories_for_accounts(c)
             elif action == "acc_by_cat":
@@ -439,13 +445,14 @@ class ShopAdminPanel:
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_MAIN))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
-    def set_price_start(self, c: CallbackQuery, cat_id: int) -> None:
+    def set_price_start(self, c: CallbackQuery, cat_id: int, back: str = "categories") -> None:
         cat = self.storage.get_category(cat_id)
         if not cat:
             return
-        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_SET_PRICE, {"category_id": cat_id})
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_SET_PRICE, {"category_id": cat_id, "back": back})
         text = f"✏️ {html.escape(cat['name'])}\nВведите новую цену (₽):"
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=CBA_CATEGORIES))
+        back_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=back_target))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
     def save_set_price(self, m: Message) -> None:
@@ -453,6 +460,7 @@ class ShopAdminPanel:
         if not s:
             return
         cat_id = s["data"]["category_id"]
+        back = s["data"].get("back", "categories")
         try:
             price = _to_dec(m.text)
         except Exception:
@@ -460,24 +468,29 @@ class ShopAdminPanel:
             return
         self.storage.update_category_price(cat_id, float(price))
         self.tg.clear_state(m.chat.id, m.from_user.id)
-        self.bot.send_message(m.chat.id, "✅ Цена обновлена.", reply_markup=self._back_kb(CBA_CATEGORIES))
+        back_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
+        self.bot.send_message(m.chat.id, "✅ Цена обновлена.", reply_markup=self._back_kb(back_target))
 
-    def del_cat_start(self, c: CallbackQuery, cat_id: int) -> None:
+    def del_cat_start(self, c: CallbackQuery, cat_id: int, back: str = "categories") -> None:
         cat = self.storage.get_category(cat_id)
         if not cat:
             return
         text = f"🗑 Удалить категорию <b>{html.escape(cat['name'])}</b> и все её аккаунты?"
+        no_target = CBA_LIST_ACCOUNTS if back == "list" else CBA_CATEGORIES
         kb = InlineKeyboardMarkup(row_width=2).add(
-            InlineKeyboardButton("✅ Да", callback_data=f"{CBA_CONFIRM_DEL_CAT}{cat_id}"),
-            InlineKeyboardButton("❌ Нет", callback_data=CBA_CATEGORIES),
+            InlineKeyboardButton("✅ Да", callback_data=f"{CBA_CONFIRM_DEL_CAT}{cat_id}:{back}"),
+            InlineKeyboardButton("❌ Нет", callback_data=no_target),
         )
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
-    def confirm_del_cat(self, c: CallbackQuery, cat_id: int) -> None:
+    def confirm_del_cat(self, c: CallbackQuery, cat_id: int, back: str = "categories") -> None:
         for acc in self.storage.get_accounts(category_id=cat_id):
             self.storage.delete_account(acc["id"])
         self.storage.delete_category(cat_id)
-        self.show_categories(c)
+        if back == "list":
+            self.list_categories_for_accounts(c)
+        else:
+            self.show_categories(c)
 
     def add_category_start(self, c: CallbackQuery) -> None:
         self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_CATEGORY_NAME, {})
@@ -624,10 +637,23 @@ class ShopAdminPanel:
         if not cat:
             return
         accounts = self.storage.get_accounts(category_id=cat_id)
-        text = f"<b>{html.escape(cat['name'])}</b>\n\n"
+        available = sum(1 for a in accounts if a["status"] == STATUS_AVAILABLE)
+        active_text = "✅ В каталоге" if cat.get("is_active") else "👁 Скрыта"
+        text = (
+            f"<b>{html.escape(cat['name'])}</b>\n"
+            f"💰 Цена: {cat['price']}₽\n"
+            f"📦 Аккаунтов: {available} свободно / {len(accounts)} всего\n"
+            f"👁 Статус: {active_text}\n\n"
+        )
         if not accounts:
             text += "Нет аккаунтов."
         kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("💰 Изменить цену", callback_data=f"{CBA_SET_PRICE}{cat_id}:list"))
+        toggle_label = "👁 Вернуть в каталог" if cat.get("is_active") == 0 else "🙈 Скрыть из каталога"
+        kb.add(InlineKeyboardButton(toggle_label, callback_data=f"{CBA_TOGGLE_CAT}{cat_id}"))
+        kb.add(InlineKeyboardButton("🗑 Удалить категорию", callback_data=f"{CBA_DEL_CAT}{cat_id}:list"))
+        kb.add(InlineKeyboardButton("📞 Добавить по номеру", callback_data=f"{CBA_ADD_PHONE_TO_CAT}{cat_id}"))
+        kb.add(InlineKeyboardButton("➕ Добавить session", callback_data=f"{CBA_ADD_TO_CAT}{cat_id}"))
         for a in accounts[:50]:
             text += f"ID {a['id']} | <code>{a['phone']}</code> | {a['status']}\n"
             kb.add(InlineKeyboardButton(
@@ -636,9 +662,12 @@ class ShopAdminPanel:
             ))
         if len(accounts) > 50:
             text += f"... и ещё {len(accounts) - 50}\n"
-        kb.add(InlineKeyboardButton("➕ Добавить аккаунт в эту категорию", callback_data=f"{CBA_ADD_TO_CAT}{cat_id}"))
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data=CBA_LIST_ACCOUNTS))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def toggle_category(self, c: CallbackQuery, cat_id: int) -> None:
+        self.storage.toggle_category_active(cat_id)
+        self.show_accounts_by_cat(c, cat_id)
 
     def add_to_category_start(self, c: CallbackQuery, cat_id: int) -> None:
         cat = self.storage.get_category(cat_id)
@@ -931,7 +960,8 @@ class ShopAdminPanel:
             kwargs["proxy"] = proxy_t
         return TelegramClient(StringSession(), **kwargs)
 
-    def _login_worker(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str) -> None:
+    def _login_worker(self, chat_id: int, user_id: int, phone: str, proxy: dict[str, Any] | None, api_id: int, api_hash: str,
+                      category_id: int | None = None, category_name: str | None = None, back: str | None = None) -> None:
         _ensure_event_loop()
         client = None
         try:
@@ -968,18 +998,34 @@ class ShopAdminPanel:
             except Exception:
                 pass
             client.disconnect()
-            cat_name = _detect_country(phone)
-            cat = self.storage.ensure_category(cat_name)
-            if cat.get("price", 0) == 0:
-                self.tg.set_state(chat_id, None, user_id, STATE_ADD_PHONE, {
-                    "step": "set_price", "phone": phone, "session_string": session_string,
-                    "proxy": proxy, "category_name": cat_name, "category_id": cat["id"],
-                })
-                self.bot.send_message(chat_id, f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):")
-            else:
+            if category_id:
+                cat = self.storage.get_category(category_id)
+                if not cat:
+                    raise RuntimeError("Категория не найдена")
                 self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
                 self.tg.clear_state(chat_id, user_id)
-                self.bot.send_message(chat_id, f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.")
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ Аккаунт {phone} добавлен в категорию {cat['name']}.",
+                    reply_markup=self._back_kb(back or CBA_MAIN),
+                )
+            else:
+                cat_name = _detect_country(phone)
+                cat = self.storage.ensure_category(cat_name)
+                if cat.get("price", 0) == 0:
+                    self.tg.set_state(chat_id, None, user_id, STATE_ADD_PHONE, {
+                        "step": "set_price", "phone": phone, "session_string": session_string,
+                        "proxy": proxy, "category_name": cat_name, "category_id": cat["id"], "back": back or CBA_MAIN,
+                    })
+                    self.bot.send_message(chat_id, f"🆕 Новая категория: {cat_name}.\n💰 Введите цену (₽):")
+                else:
+                    self.storage.add_account(cat["id"], phone, session_string, proxy=proxy)
+                    self.tg.clear_state(chat_id, user_id)
+                    self.bot.send_message(
+                        chat_id,
+                        f"✅ Аккаунт {phone} добавлен в категорию {cat_name}.",
+                        reply_markup=self._back_kb(back or CBA_MAIN),
+                    )
         except Exception as e:
             err_text = f"{type(e).__name__}: {e}"
             logger.exception("admin login worker error")
@@ -1005,9 +1051,25 @@ class ShopAdminPanel:
 
     # --- add account by phone + code ---
     def add_phone_start(self, c: CallbackQuery) -> None:
-        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_PHONE, {"step": "phone"})
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_PHONE, {"step": "phone", "back": "main"})
         text = "📞 Введите номер телефона аккаунта (международный формат, например +79001234567).\n\nМожно сразу указать прокси через |: <code>+79001234567|socks5 1.2.3.4:1080</code>\nЕсли прокси не указан, используется общий из настроек."
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=CBA_MAIN))
+        self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
+
+    def add_phone_to_cat_start(self, c: CallbackQuery, cat_id: int) -> None:
+        cat = self.storage.get_category(cat_id)
+        if not cat:
+            return
+        self.tg.set_state(c.message.chat.id, c.message.id, c.from_user.id, STATE_ADD_PHONE, {
+            "step": "phone", "category_id": cat_id, "category_name": cat["name"], "back": f"{CBA_ACCOUNTS_BY_CAT}{cat_id}",
+        })
+        text = (
+            f"📞 Добавление в <b>{html.escape(cat['name'])}</b>\n\n"
+            "Введите номер телефона аккаунта (международный формат, например +79001234567).\n\n"
+            "Можно сразу указать прокси через |: <code>+79001234567|socks5 1.2.3.4:1080</code>\n"
+            "Если прокси не указан, используется общий из настроек."
+        )
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data=f"{CBA_ACCOUNTS_BY_CAT}{cat_id}"))
         self.bot.edit_message_text(text, c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML")
 
     def add_phone_text(self, m: Message) -> None:
@@ -1066,6 +1128,11 @@ class ShopAdminPanel:
             threading.Thread(
                 target=self._login_worker,
                 args=(m.chat.id, m.from_user.id, phone, proxy, api_id, api_hash),
+                kwargs={
+                    "category_id": data.get("category_id"),
+                    "category_name": data.get("category_name"),
+                    "back": data.get("back", CBA_MAIN),
+                },
                 daemon=True,
             ).start()
             return
@@ -1077,6 +1144,7 @@ class ShopAdminPanel:
                 self.bot.send_message(m.chat.id, "❌ Введите число.")
                 return
             category_id = data.get("category_id")
+            back = data.get("back", CBA_MAIN)
             if category_id:
                 self.storage.update_category_price(category_id, float(price))
             phone = data.get("phone")
@@ -1084,9 +1152,9 @@ class ShopAdminPanel:
             proxy = data.get("proxy")
             if phone and session_string and category_id:
                 self.storage.add_account(category_id, phone, session_string, proxy=proxy)
-                self.bot.send_message(m.chat.id, f"✅ Аккаунт {phone} добавлен. Цена {price}₽ установлена.", reply_markup=self._back_kb(CBA_MAIN))
+                self.bot.send_message(m.chat.id, f"✅ Аккаунт {phone} добавлен. Цена {price}₽ установлена.", reply_markup=self._back_kb(back))
             else:
-                self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._back_kb(CBA_MAIN))
+                self.bot.send_message(m.chat.id, f"✅ Цена {price}₽ установлена.", reply_markup=self._back_kb(back))
             self.tg.clear_state(m.chat.id, m.from_user.id)
 
 

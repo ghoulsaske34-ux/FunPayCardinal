@@ -487,6 +487,13 @@ class AccountStorage:
         with self._lock, self._conn() as conn:
             conn.execute("UPDATE categories SET price=? WHERE id=?", (float(price), category_id))
 
+    def toggle_category_active(self, category_id: int) -> bool:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT is_active FROM categories WHERE id=?", (category_id,)).fetchone()
+            new_state = 0 if row and row[0] else 1
+            conn.execute("UPDATE categories SET is_active=? WHERE id=?", (new_state, category_id))
+        return new_state == 1
+
     def delete_category(self, category_id: int) -> None:
         with self._lock, self._conn() as conn:
             conn.execute("DELETE FROM categories WHERE id=?", (category_id,))
