@@ -7,4 +7,6 @@ pillow>=9.3.0
 requests_toolbelt==0.10.1
 lxml>=5.3.0
 bcrypt>=4.2.0
-pysocks>=1.7.1
+python-socks[asyncio]==2.4.0
+telethon>=1.40.0
+phonenumbers>=8.13.0
