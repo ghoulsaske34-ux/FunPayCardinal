@@ -1,0 +1,20505 @@
+from __future__ import annotations
+
+import copy
+import difflib
+from collections import OrderedDict
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import random
+import re
+import shutil
+import sqlite3
+import threading
+import time
+import uuid
+import html
+import secrets
+import string
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+from logging.handlers import RotatingFileHandler
+from types import SimpleNamespace as _SimpleNamespace
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+
+import requests
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent, OrderStatusChangedEvent
+from FunPayAPI import types as fp_types
+from FunPayAPI import exceptions as fp_exceptions
+from FunPayAPI.common import enums as fp_enums
+
+if TYPE_CHECKING:
+    from cardinal import Cardinal
+
+
+NAME = "FazerCards Reseller"
+VERSION = "3.22.1"
+DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.22.1: giftcards-коды читаются из поля cards; изменение "
+               "наценки сразу пересчитывает цены привязанных лотов, а импорт "
+               "включает синхронизацию цен по умолчанию.\n"
+               "v3.22: сопоставление лотов по названию исправлено — FunPay "
+               "отдаёт название вместе с доп. полями, и раньше ни один лот "
+               "не находился. Отмена заказа из панели теперь возвращает деньги "
+               "покупателю. «Удалить все привязки» — в списке привязок.")
+CREDITS = "@Devin"
+UUID = "550ee630-3f0e-41c1-9811-29b83b981083"
+SETTINGS_PAGE = True
+
+CB_PREFIX = "fzr"
+
+BASE_CACHE_DIR = os.path.join("storage", "cache", "fzr_gifts")
+LOG_DIR = os.path.join("storage", "logs")
+
+# initial legacy paths; rebind to per-account dir in init_plugin
+CONFIG_FILE = os.path.join(BASE_CACHE_DIR, "config.json")
+MAPPINGS_FILE = os.path.join(BASE_CACHE_DIR, "mappings.json")
+PROCESSED_FILE = os.path.join(BASE_CACHE_DIR, "processed.json")
+CATALOG_CACHE_FILE = os.path.join(BASE_CACHE_DIR, "catalog_cache.json")
+DB_PATH = os.path.join(BASE_CACHE_DIR, "fzr_gifts.db")
+
+logger = logging.getLogger("FPC.fzr_gifts")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+class _JsonLogFormatter(logging.Formatter):
+    _STANDARD_FIELDS = {
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "message", "asctime", "taskName",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for k, v in record.__dict__.items():
+            if k in self._STANDARD_FIELDS or k.startswith("_"):
+                continue
+            try:
+                json.dumps(v)
+                payload[k] = v
+            except TypeError:
+                payload[k] = repr(v)
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _setup_logging() -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, "fzr_gifts.log")
+    if any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(log_path)
+        for h in logger.handlers
+    ):
+        return
+    handler = RotatingFileHandler(log_path, maxBytes=20 * 1024 * 1024, backupCount=10, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(_JsonLogFormatter())
+    logger.addHandler(handler)
+
+
+_setup_logging()
+
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "api_key": "",
+    "base_url": "https://api.fzr.cards/api/v2",
+    "settings": {
+        "auto_delivery": True,
+        "poll_interval": 5,
+        "poll_timeout": 300,
+        "ask_metadata": True,
+        "notify_on_error": True,
+        # v3.14: с поэтапным подтверждением шагов в диалоге стало больше,
+        # 5 минут покупателю не хватало — заказ отменялся посреди переписки
+        "dialog_timeout": 900,
+        "dialog_reminder": 180,
+        "max_quantity": 100,
+        "exchange_rate": 0.0,
+        "auto_update_exchange_rate": True,
+        "auto_cancel_fzr_order": True,
+        "auto_disable_lot": False,
+        # v3.1
+        "validate_player_id": True,     # проверять Player ID через API до заказа
+        "auto_select_single": True,     # не спрашивать выбор, если вариант один
+        "fresh_options": True,          # тянуть options из API в момент диалога
+        "markup_percent": 0.0,          # наценка к цене лота, %
+        "markup_fixed": 0.0,            # наценка к цене лота, ₽ (после процента)
+        "price_round": 2,               # знаков после запятой в цене лота
+        # v3.2
+        "max_topup_amount": 0.0,        # потолок суммы пополнения Steam (0 = без лимита)
+        "show_field_hints": True,       # подсказки покупателю о формате (s.team/p/…)
+        # v3.4: чат с исполнителем по ручным услугам
+        "manual_chat_watch": True,      # следить за перепиской и уведомлять продавца
+        "manual_chat_interval": 60,     # базовый интервал опроса чата, сек
+        "manual_chat_autorelay": False, # пересылать сообщения исполнителя покупателю
+        # v3.5: подписка FazerCards
+        "sub_alert": True,              # предупреждать об истечении подписки
+        "sub_alert_days": 5,            # за сколько дней начать предупреждать
+        "low_balance_threshold": 0.0,   # алерт при балансе ниже (0 = выключено)
+        # v3.5: синхронизация цен лотов
+        "price_sync": False,            # включить пересчёт цен лотов
+        "price_sync_interval": 21600,   # как часто проверять, сек (6 ч)
+        "price_sync_threshold": 1.0,    # менять цену при отклонении больше, %
+        "price_sync_max_step": 30.0,    # защита: не менять цену разом больше, %
+        "price_sync_dry_run": False,    # только считать и сообщать, лоты не трогать
+        # v3.5: общение с покупателем
+        "greeting": True,               # приветствие при создании заказа
+        "progress_notice": True,        # сообщение «заказ в обработке» после сбора данных
+        # v3.6: нехватка баланса на закупку
+        "funds_auto_retry": True,       # сам повторять заказ, когда баланс пополнили
+        "funds_retry_interval": 1800,   # как часто проверять баланс, сек (30 мин)
+        # v3.7: автовозврат, если баланс так и не пополнили
+        "funds_auto_refund": False,     # оформлять возврат покупателю автоматически
+        "funds_refund_after": 120,      # через сколько минут ждать перестаём
+        "funds_refund_warn_buyer": True,  # предупредить покупателя перед возвратом
+        # v3.7: как часто обновлять курс RUB/USD (минуты, 0 = стандарт 6 ч)
+        "exchange_rate_interval": 360,
+        # v3.14: поэтапное подтверждение данных покупателем (+ / -)
+        "confirm_metadata": True,        # спрашивать «всё верно?» после каждого значения
+        "confirm_summary": True,        # финальная сводка всех данных перед закупкой
+        # v3.14: болтовня покупателя («привет», «спасибо») не считается ответом
+        "smalltalk_filter": True,
+        # v3.14: ускорение опроса статуса заказа
+        "poll_interval_fast": 2,        # первые попытки — с этим интервалом, сек
+        "poll_fast_attempts": 12,       # сколько попыток считать «быстрыми»
+        "poll_parallel": True,          # опрашивать заказы параллельно
+        # v3.14: сколько ещё следить за чатом ручной услуги после закрытия, часов
+        "manual_chat_grace_hours": 24,
+        # v3.17: просьба подтвердить заказ и оставить отзыв — отдельным
+        # сообщением сразу после выдачи
+        "review_request": True,
+        "review_request_delay": 3,      # пауза перед просьбой, сек (0 = сразу)
+        # v3.18: отчёт продавцу о прибыли по каждому созданному заказу
+        "profit_report": True,
+        # комиссия вывода с FunPay, % (продавец получает цену минус этот процент)
+        "withdraw_fee_percent": 3.0,
+        # v3.20: поставщик вернул деньги (статус «Возврат») — оформляем возврат
+        # покупателю на FunPay и пишем ему об отмене. Товара нет, держать
+        # оплату нельзя: это прямой путь к спору и блокировке лота.
+        "refund_on_fzr_refund": True,
+        # v3.19: локальный баланс — свой учёт денег внутри общего API-ключа.
+        # Заказы НЕ блокирует: уходит в минус и присылает уведомление.
+        "local_balance": True,
+        "local_balance_low": 10.0,       # предупредить, когда осталось меньше, USD (0 = только минус)
+        "balance_alert_cooldown": 60,    # не чаще одного повторного алерта в N минут
+    },
+    "templates": {
+        "delivery": (
+            "Спасибо за покупку!\n\n"
+            "Ваш товар:\n{code}\n\n"
+            "Номер заказа: {order_number}"
+        ),
+        "error": (
+            "Извините, при выдаче заказа возникла ошибка. "
+            "Обратитесь к продавцу.\nПричина: {error}"
+        ),
+        "ask_metadata": (
+            "Для выдачи заказа укажите, пожалуйста: {prompt}"
+        ),
+        # v3.5: приветствие сразу после оплаты — покупатель видит, что заказ принят
+        "greeting": (
+            "Здравствуйте! Заказ принят: {sku_name}.\n"
+            "Выдача автоматическая, сейчас всё оформлю."
+        ),
+        # v3.5: данные собраны, идёт покупка
+        "progress": (
+            "Спасибо, данные получены. Оформляю заказ — обычно это занимает "
+            "до пары минут. Пожалуйста, не закрывайте чат."
+        ),
+        # v3.6: закупка отложена (у продавца не хватило баланса на FazerCards).
+        # Покупателю про баланс не пишем — это внутренняя причина; ему важны
+        # факты: заказ принят, деньги целы, что будет дальше.
+        "awaiting_funds": (
+            "Спасибо за заказ: {sku_name}!\n\n"
+            "Оформляю выдачу — сейчас это занимает больше времени, чем обычно. "
+            "Как только всё будет готово, сразу пришлю сюда, ничего делать "
+            "не нужно.\n"
+            "Данные, которые вы указали, сохранены — повторять не придётся.\n\n"
+            "Если ждать не хотите — напишите, оформлю возврат."
+        ),
+        # v3.7: возврат оформлен автоматически (баланс так и не пополнили)
+        "refunded": (
+            "К сожалению, выдать заказ «{sku_name}» сейчас не получается — "
+            "товар оказался недоступен.\n\n"
+            "Я оформил полный возврат средств: деньги вернутся на ваш баланс "
+            "FunPay автоматически.\n"
+            "Извините за задержку. Если нужен этот товар — напишите, подскажу "
+            "альтернативу."
+        ),
+        # v3.17: отдельное сообщение сразу после выдачи — просьба подтвердить
+        # заказ и оставить отзыв, со ссылкой на сам заказ. Отдельным сообщением,
+        # а не в конце выдачи: код покупатель копирует, и просьба в том же
+        # сообщении мешает — её либо не замечают, либо копируют вместе с кодом.
+        "review_request": (
+            "Подтвердите пожалуйста заказ и оставьте отзыв\U0001F64F\n"
+            "это очень мне помогает:\n"
+            "{order_link}"
+        ),
+        # v3.20: поставщик вернул деньги за заказ (статус «Возврат»/refunded).
+        # Товара не будет, поэтому покупателю нужен не «ошибка», а понятный
+        # текст: заказ отменён, деньги возвращены на FunPay. Свой текст можно
+        # задать для каждой привязки (карточка товара → «Текст при возврате»).
+        "refund_notice": (
+            "К сожалению, заказ «{sku_name}» выполнить не получилось — "
+            "товар оказался недоступен.\n\n"
+            "Заказ отменён, деньги возвращены вам на FunPay в полном объёме.\n"
+            "Извините за неудобства! Если нужен этот товар — напишите, "
+            "подскажу альтернативу."
+        ),
+    },
+    "mappings": [],
+}
+
+
+_FILES_LOCK = threading.RLock()
+_DB_LOCK = threading.RLock()
+_CONFIG_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "cfg": None}
+_SHUTDOWN_EVENT = threading.Event()
+
+_HTTP_SESSION_TLS = threading.local()
+
+_FZR_CLIENTS: Dict[str, "FazerCardsAPI"] = {}
+_FZR_CLIENTS_LOCK = threading.RLock()
+
+_USER_STATES: Dict[int, Dict[str, Any]] = {}
+_STATES_LOCK = threading.RLock()
+
+_POLL_LOCK = threading.RLock()
+_POLL_QUEUE: Dict[str, Dict[str, Any]] = {}
+_POLL_THREAD: Optional[threading.Thread] = None
+POLL_TICK = 1.0
+# v3.14: новый job — будим воркер сразу, а не ждём конца тика
+_POLL_WAKE = threading.Event()
+# v3.14: заказы, которые прямо сейчас опрашиваются (защита от двойного опроса
+# при параллельной обработке)
+_POLL_INFLIGHT: Set[str] = set()
+_MAX_DELIVERY_ATTEMPTS = 5
+_MAX_POLL_JOB_ERRORS = 5
+_DELIVERY_RETRY_DELAY = 30.0
+
+_DIALOG_WATCHER_THREAD: Optional[threading.Thread] = None
+DIALOG_WATCHER_INTERVAL = 30.0
+# v3.14: во сколько раз скользящее окно может продлить диалог относительно
+# dialog_timeout. Защита от «вечного» диалога с болтливым покупателем.
+_DIALOG_MAX_EXTENSION = 4
+
+# v3.4: наблюдатель за чатом ручных услуг
+_MANUAL_CHAT_THREAD: Optional[threading.Thread] = None
+_MANUAL_CHAT_TICK = 5.0           # как часто просыпаемся (v3.14: было 15)
+_MANUAL_CHAT_MAX_AGE = 7 * 86400  # заказы старше недели не опрашиваем
+_MANUAL_CHAT_STATE: Dict[str, Dict[str, Any]] = {}
+_MANUAL_CHAT_LOCK = threading.RLock()
+# заказы, у которых чата нет (API ответил 400) — больше не опрашиваем.
+# v3.14: 404 сюда НЕ попадает сразу — у ручной услуги чат создаётся не мгновенно,
+# и вечный скип по первому 404 был причиной «сообщения вообще не приходят».
+_MANUAL_CHAT_SKIP: Set[str] = set()
+_MANUAL_CHAT_404: Dict[str, int] = {}   # order_id -> сколько раз ответили 404
+_MANUAL_CHAT_404_MAX = 20               # после этого считаем, что чата нет
+
+_DB_CONN: Optional[sqlite3.Connection] = None
+_DB_CONN_PATH: Optional[str] = None
+_DB_INITIALIZED = False
+
+_CB_TOKENS: Dict[str, Tuple[float, str]] = {}
+_CB_TOKENS_LOCK = threading.Lock()
+_CB_TOKEN_MAX_AGE = 3600.0
+_CB_TOKENS_MAX_SIZE = 1000
+_CATALOG_CACHE: "OrderedDict[Tuple[str, Optional[str], Optional[str]], Tuple[float, Any]]" = OrderedDict()
+_CATALOG_CACHE_LOCK = threading.RLock()
+_CATALOG_CACHE_MAX_SIZE = 200
+_CATALOG_CACHE_TTL = 300.0
+
+_STEAM_GIFTS_FULL_CATALOG: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+_STEAM_GIFTS_FULL_LOCK = threading.Lock()
+_STEAM_GIFTS_FULL_TTL = 3600.0
+
+_REGISTERED_HANDLERS: List[Tuple[str, Any]] = []
+_MAX_QUANTITY = 100
+# Сколько отдельных заказов FazerCards максимум создаём на один заказ FunPay
+# (topups/manual-services не принимают quantity — см. _create_order_batch)
+_MAX_BATCH_ORDERS = 50
+_MAPPINGS_PER_PAGE = 10
+_ORDERS_PER_PAGE = 8
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_EXECUTOR_LOCK = threading.RLock()
+_EXECUTOR_MAX_WORKERS = 10
+
+_EXCHANGE_RATE_THREAD: Optional[threading.Thread] = None
+_EXCHANGE_RATE_LOCK = threading.Lock()
+_EXCHANGE_RATE_INTERVAL_DEFAULT = 6 * 3600.0  # 6 часов, если в настройках не задано
+_EXCHANGE_RATE_WAKE = threading.Event()        # разбудить поток при смене интервала
+# v3.15: «обновить прямо сейчас» — ставится при включении тумблера «Автокурс».
+# Отдельный флаг нужен, чтобы отличить «настройки изменились, пересчитай срок»
+# от «пользователь только что включил автокурс, тяни курс немедленно».
+_EXCHANGE_RATE_FORCE = threading.Event()
+# v3.15: диагностика курса для ПУ — когда обновляли, откуда взяли, что сломалось.
+# Без этого «курс не обновляется» проверяется только чтением логов FPC.
+_EXCHANGE_RATE_STATUS: Dict[str, Any] = {
+    "last_ok_ts": 0.0,        # когда курс успешно обновился
+    "last_try_ts": 0.0,       # когда пытались в последний раз
+    "last_error": "",         # почему не получилось
+    "source": "",             # какой источник ответил
+    "errors": [],             # что сказали остальные источники
+    "rate": 0.0,              # какой курс получили
+}
+
+# Действия ПУ, которые НЕЛЬЗЯ обрабатывать со сбросом состояния диалога.
+# Диспетчер по умолчанию чистит state на каждый callback (защита от «залипших»
+# диалогов), но шаги мастера создания лота и навигация по каталогу живут именно
+# в state — без этого списка выбор SKU из каталога отвечал «Сессия истекла».
+_STATE_PRESERVING_ACTIONS = frozenset({
+    "lotcustom", "lotcustom_page", "lotcustom_back", "lotcustom_goto",
+    "search_page", "catalog", "catalog_select",
+    # v3.15: сам вход в поиск НЕ должен убивать мастер создания лота.
+    # Раньше "search" не было в этом списке, диспетчер делал clear_state ещё
+    # до вызова _fzr_search_prompt, и после выбора товара плагин «забывал»,
+    # что создаёт лот, и спрашивал ID лота FunPay.
+    "search",
+    "create_lot_sku_catalog",   # переход в каталог из мастера создания лота
+    "create_lot_skip_sku",      # «создать без привязки»
+    "create_lot_psync",         # тумблер синхронизации цены в мастере
+    "create_lot_useprice",      # «взять расчётную цену»
+    "create_lot_skip_title",    # пропуск названия
+    "create_lot_amount",        # выбор наличия кнопкой
+    "create_lot_amount_edit",   # правка наличия с экрана подтверждения
+    "create_lot_go",            # подтверждение создания (state читаем внутри)
+    "create_lot_back",          # v3.15: «Назад» на предыдущий шаг мастера
+    "create_lot_back_to_wizard",  # v3.15: возврат в мастер из каталога/поиска
+    "create_lot_fix",           # v3.16.1: доп. поле после отказа FunPay
+    # импорт: состояние «ждём файл» живёт до присылки документа
+    "import", "import_apply", "import_lots", "import_key",
+    "import_backups", "import_undo",
+    "noop",
+})
+
+# -----------------------------------------------------------------------------
+# v3.15: мастер создания лота — шаги и навигация «Назад»
+#
+# Шаги мастера идут цепочкой, но часть из них пропускается (нет доп. полей,
+# нет поля «Наличие» в подкатегории, продавец пропустил название). Поэтому
+# «назад» — не просто предыдущий элемент словаря: непройденные шаги нужно
+# перепрыгивать, иначе кнопка ведёт на экран, которого в этом сценарии не было.
+# -----------------------------------------------------------------------------
+_WIZARD_STATES = frozenset({
+    "create_lot_custom", "create_lot_title_ru", "create_lot_title_en",
+    "create_lot_desc_ru", "create_lot_desc_en", "create_lot_price",
+    "create_lot_amount", "create_lot_sku", "create_lot_confirm",
+})
+
+_WIZARD_PREV = {
+    "create_lot_title_ru": "create_lot_custom",
+    "create_lot_title_en": "create_lot_title_ru",
+    "create_lot_desc_ru": "create_lot_title_en",
+    "create_lot_desc_en": "create_lot_desc_ru",
+    "create_lot_price": "create_lot_desc_en",
+    "create_lot_amount": "create_lot_price",
+    "create_lot_sku": "create_lot_amount",
+    "create_lot_confirm": "create_lot_sku",
+}
+
+
+# =============================================================================
+# order status state machine
+# =============================================================================
+
+class OrderStatus(str, Enum):
+    RESERVING = "reserving"
+    AWAITING_METADATA = "awaiting_metadata"
+    PROCESSING = "processing"
+    # v3.6: данные покупателя собраны, но не хватило баланса FazerCards.
+    # Отдельный статус, а не failed: заказ живой, его можно докупить кнопкой
+    # или автоматически, как только баланс пополнят.
+    AWAITING_FUNDS = "awaiting_funds"
+    PENDING = "pending"
+    COMPLETED = "completed"
+    DELIVERY_FAILED = "delivery_failed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    NO_MAPPING = "no_mapping"
+    NEEDS_REVIEW = "needs_review"
+    REFUNDED = "refunded"
+
+
+class MappingKind(str, Enum):
+    GIFTCARDS = "giftcards"
+    GAMEKEYS = "gamekeys"
+    TOPUPS = "topups"
+    MANUAL_SERVICES = "manual-services"
+    STEAM_GIFTS = "steam-gifts"
+    STEAM_TOPUP = "steam-topup"
+    TELEGRAM_STARS = "telegram-stars"
+    TELEGRAM_PREMIUM = "telegram-premium"
+
+
+_ORDER_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
+    OrderStatus.RESERVING: {
+        OrderStatus.PROCESSING,
+        OrderStatus.PENDING,
+        OrderStatus.AWAITING_METADATA,
+        OrderStatus.AWAITING_FUNDS,
+        OrderStatus.FAILED,
+        OrderStatus.NO_MAPPING,
+        OrderStatus.NEEDS_REVIEW,
+        OrderStatus.COMPLETED,
+    },
+    OrderStatus.AWAITING_METADATA: {
+        OrderStatus.PROCESSING,
+        OrderStatus.AWAITING_FUNDS,
+        OrderStatus.FAILED,
+        OrderStatus.TIMEOUT,
+        OrderStatus.NEEDS_REVIEW,
+    },
+    OrderStatus.PROCESSING: {
+        OrderStatus.PENDING,
+        OrderStatus.AWAITING_FUNDS,
+        OrderStatus.FAILED,
+        OrderStatus.NEEDS_REVIEW,
+        OrderStatus.COMPLETED,
+        OrderStatus.TIMEOUT,
+        OrderStatus.NO_MAPPING,
+    },
+    # ждём пополнения баланса: назад в работу, либо отмена/возврат
+    OrderStatus.AWAITING_FUNDS: {
+        OrderStatus.PROCESSING,
+        OrderStatus.PENDING,
+        OrderStatus.COMPLETED,
+        OrderStatus.FAILED,
+        OrderStatus.TIMEOUT,
+        OrderStatus.NEEDS_REVIEW,
+        OrderStatus.REFUNDED,
+    },
+    OrderStatus.PENDING: {
+        OrderStatus.COMPLETED,
+        OrderStatus.FAILED,
+        OrderStatus.TIMEOUT,
+        OrderStatus.DELIVERY_FAILED,
+        OrderStatus.NEEDS_REVIEW,
+    },
+    OrderStatus.COMPLETED: {OrderStatus.DELIVERY_FAILED},
+    OrderStatus.DELIVERY_FAILED: set(),
+    OrderStatus.FAILED: set(),
+    OrderStatus.TIMEOUT: set(),
+    OrderStatus.NO_MAPPING: set(),
+    OrderStatus.NEEDS_REVIEW: {OrderStatus.PROCESSING, OrderStatus.PENDING},
+    OrderStatus.REFUNDED: set(),
+}
+
+_TERMINAL_STATUSES: Set[OrderStatus] = {
+    OrderStatus.COMPLETED,
+    OrderStatus.DELIVERY_FAILED,
+    OrderStatus.FAILED,
+    OrderStatus.TIMEOUT,
+    OrderStatus.NO_MAPPING,
+    OrderStatus.NEEDS_REVIEW,
+    OrderStatus.REFUNDED,
+}
+
+
+def _is_order_status_transition_allowed(old_status: Optional[str], new_status: str) -> bool:
+    if old_status == new_status:
+        return True
+    try:
+        old = OrderStatus(old_status) if old_status else None
+        new = OrderStatus(new_status)
+    except ValueError:
+        logger.warning("unknown order status", extra={"old_status": old_status, "new_status": new_status})
+        return True
+    if old is None:
+        return True
+    allowed = _ORDER_TRANSITIONS.get(old, set())
+    if new in allowed:
+        return True
+    logger.warning("invalid order status transition", extra={"old_status": old_status, "new_status": new_status})
+    return False
+
+
+def _is_order_terminal(status: Optional[str]) -> bool:
+    try:
+        return OrderStatus(status) in _TERMINAL_STATUSES if status else False
+    except ValueError:
+        return False
+
+
+def _start_executor() -> None:
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = ThreadPoolExecutor(
+                max_workers=_EXECUTOR_MAX_WORKERS,
+                thread_name_prefix="fzr_worker",
+            )
+
+
+def _log_future_exception(future: Any) -> None:
+    try:
+        exc = future.exception()
+        if exc:
+            logger.exception("worker task failed", exc_info=exc)
+    except Exception:
+        pass
+
+
+def _submit_task(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None:
+            _start_executor()
+        future = _EXECUTOR.submit(fn, *args, **kwargs)
+        future.add_done_callback(_log_future_exception)
+        return future
+
+
+def _stop_executor(wait: bool = True) -> None:
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is not None:
+            try:
+                _EXECUTOR.shutdown(wait=wait, cancel_futures=True)
+            except TypeError:
+                _EXECUTOR.shutdown(wait=wait)
+            _EXECUTOR = None
+
+
+# =============================================================================
+# paths & per-account isolation
+# =============================================================================
+
+def _rebind_paths_for_account(account_id: Optional[int]) -> None:
+    global CONFIG_FILE, MAPPINGS_FILE, PROCESSED_FILE, CATALOG_CACHE_FILE, DB_PATH
+    if not account_id:
+        return
+    base = os.path.join("storage", "cache", "fzr_gifts", str(account_id))
+    os.makedirs(base, exist_ok=True)
+    new_paths = {
+        "CONFIG_FILE": os.path.join(base, "config.json"),
+        "MAPPINGS_FILE": os.path.join(base, "mappings.json"),
+        "PROCESSED_FILE": os.path.join(base, "processed.json"),
+        "CATALOG_CACHE_FILE": os.path.join(base, "catalog_cache.json"),
+        "DB_PATH": os.path.join(base, "fzr_gifts.db"),
+    }
+    backup_dir = os.path.join(base, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    marker = os.path.join(BASE_CACHE_DIR, ".fzr_migrated")
+    migrated_account = None
+    if os.path.exists(marker):
+        try:
+            with open(marker, "r", encoding="utf-8") as f:
+                migrated_account = f.read().strip()
+        except Exception:
+            pass
+    legacy_pairs = [
+        (CONFIG_FILE, new_paths["CONFIG_FILE"]),
+        (MAPPINGS_FILE, new_paths["MAPPINGS_FILE"]),
+        (PROCESSED_FILE, new_paths["PROCESSED_FILE"]),
+        (CATALOG_CACHE_FILE, new_paths["CATALOG_CACHE_FILE"]),
+        (DB_PATH, new_paths["DB_PATH"]),
+    ]
+    migrated = 0
+    if migrated_account is None or str(migrated_account) == str(account_id):
+        for legacy, new in legacy_pairs:
+            if os.path.exists(legacy) and not os.path.exists(new):
+                try:
+                    shutil.copy2(legacy, new)
+                    if legacy.endswith(".db"):
+                        for ext in (".db-wal", ".db-shm"):
+                            wal = legacy + ext
+                            if os.path.exists(wal):
+                                shutil.copy2(wal, new + ext)
+                    migrated += 1
+                except Exception as e:
+                    logger.error("_rebind_paths_for_account migrate copy failed", extra={"legacy": legacy, "new": new, "error": repr(e)})
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(str(account_id))
+        except Exception:
+            pass
+    CONFIG_FILE = new_paths["CONFIG_FILE"]
+    MAPPINGS_FILE = new_paths["MAPPINGS_FILE"]
+    PROCESSED_FILE = new_paths["PROCESSED_FILE"]
+    CATALOG_CACHE_FILE = new_paths["CATALOG_CACHE_FILE"]
+    DB_PATH = new_paths["DB_PATH"]
+    _config_cache_invalidate()
+    logger.info("_rebind_paths_for_account done", extra={"account_id": account_id, "migrated": migrated, "base": base})
+# =============================================================================
+# database
+# =============================================================================
+
+def _db_connect() -> sqlite3.Connection:
+    global _DB_CONN, _DB_CONN_PATH
+    if _DB_CONN is not None and _DB_CONN_PATH == DB_PATH:
+        return _DB_CONN
+    _db_close_conn()
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    _DB_CONN = conn
+    _DB_CONN_PATH = DB_PATH
+    return conn
+
+
+def _db_close_conn() -> None:
+    global _DB_CONN, _DB_CONN_PATH, _DB_INITIALIZED
+    if _DB_CONN is not None:
+        try:
+            _DB_CONN.close()
+        except Exception:
+            pass
+        _DB_CONN = None
+        _DB_CONN_PATH = None
+    _DB_INITIALIZED = False
+def _db_init() -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    with _DB_LOCK:
+        conn = _db_connect()
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            funpay_order_id TEXT PRIMARY KEY,
+            fzr_order_id TEXT,
+            status TEXT,
+            buyer_id INTEGER,
+            buyer_username TEXT,
+            chat_id TEXT,
+            sku_id TEXT,
+            mapping_id TEXT,
+            quantity INTEGER,
+            metadata_json TEXT,
+            order_json TEXT,
+            result_json TEXT,
+            error TEXT,
+            created_at REAL,
+            updated_at REAL,
+            completed_notification_sent INTEGER DEFAULT 0,
+            batch_json TEXT,
+            markup_json TEXT,
+            funds_json TEXT,
+            review_request_sent INTEGER DEFAULT 0,
+            profit_report_sent INTEGER DEFAULT 0,
+            profit_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+        CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);
+        CREATE INDEX IF NOT EXISTS idx_orders_updated ON orders(updated_at);
+
+        CREATE TABLE IF NOT EXISTS pending_dialogs (
+            funpay_order_id TEXT PRIMARY KEY,
+            buyer_id INTEGER,
+            chat_id TEXT,
+            mapping_id TEXT,
+            step TEXT,
+            created_at REAL,
+            reminded_at REAL,
+            data_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_buyer ON pending_dialogs(buyer_id);
+        CREATE INDEX IF NOT EXISTS idx_pending_step ON pending_dialogs(step);
+
+        CREATE TABLE IF NOT EXISTS mappings (
+            id TEXT PRIMARY KEY,
+            fzr_sku_id TEXT,
+            category_kind TEXT,
+            category_id TEXT,
+            offer_id TEXT,
+            offer_name TEXT,
+            price_usd TEXT,
+            stock INTEGER,
+            min_quantity INTEGER,
+            max_quantity INTEGER,
+            fields_json TEXT,
+            funpay_lot_id TEXT,
+            funpay_subcategory_id INTEGER,
+            funpay_title TEXT,
+            markup_percent REAL,
+            markup_fixed REAL,
+            metadata_key TEXT,
+            metadata_prompt TEXT,
+            metadata_validation TEXT,
+            metadata_fields_json TEXT,
+            delivery_template TEXT,
+            enabled INTEGER DEFAULT 1,
+            validate_id INTEGER DEFAULT 1,
+            units_per_item INTEGER DEFAULT 1,
+            price_sync INTEGER DEFAULT 0,
+            last_price_usd TEXT,
+            last_lot_price REAL,
+            price_synced_at REAL,
+            greeting_template TEXT,
+            ask_template TEXT,
+            refund_template TEXT,
+            created_at REAL,
+            updated_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mappings_enabled ON mappings(enabled);
+        CREATE INDEX IF NOT EXISTS idx_mappings_lot ON mappings(funpay_lot_id);
+
+        CREATE TABLE IF NOT EXISTS order_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            funpay_order_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            data_json TEXT,
+            created_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_order ON order_events(funpay_order_id);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON order_events(event_type);
+
+        CREATE TABLE IF NOT EXISTS callback_tokens (
+            token TEXT PRIMARY KEY,
+            callback_data TEXT NOT NULL,
+            expires_at REAL,
+            created_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_callback_tokens_expires ON callback_tokens(expires_at);
+
+        -- v3.4: переписка с исполнителем по ручным услугам.
+        -- msg_hash нужен для дедупликации: API отдаёт всю историю целиком,
+        -- поэтому без него после каждого опроса продавцу летели бы все сообщения.
+        CREATE TABLE IF NOT EXISTS manual_chat (
+            msg_hash TEXT PRIMARY KEY,
+            funpay_order_id TEXT NOT NULL,
+            fzr_order_id TEXT,
+            sender TEXT,
+            body TEXT,
+            image_urls_json TEXT,
+            created_at TEXT,
+            seen_at REAL,
+            outgoing INTEGER DEFAULT 0,
+            relayed_to_buyer INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_manual_chat_order ON manual_chat(funpay_order_id);
+        CREATE INDEX IF NOT EXISTS idx_manual_chat_seen ON manual_chat(seen_at);
+
+        -- v3.19: локальный баланс продавца.
+        -- Один API-ключ FazerCards делят несколько человек, и общий баланс ключа
+        -- не отвечает на вопрос «сколько осталось МОИХ денег». Поэтому ведём
+        -- свою книгу операций: каждое пополнение и каждая закупка — строка.
+        -- Баланс = SUM(amount_usd), отдельного счётчика нет, чтобы ему нечего
+        -- было рассинхронизировать.
+        -- op_key делает списание идемпотентным: повтор заказа после нехватки
+        -- баланса или второй проход выдачи не спишет деньги дважды.
+        CREATE TABLE IF NOT EXISTS balance_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_key TEXT UNIQUE,
+            kind TEXT NOT NULL,
+            amount_usd REAL NOT NULL,
+            balance_after REAL,
+            funpay_order_id TEXT,
+            fzr_order_id TEXT,
+            comment TEXT,
+            created_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_created ON balance_ledger(created_at);
+        CREATE INDEX IF NOT EXISTS idx_ledger_order ON balance_ledger(funpay_order_id);
+        """)
+        _DB_INITIALIZED = True
+        _db_ensure_schema_version(conn)
+        _db_load_callback_tokens()
+        logger.info("_db_init: schema ready", extra={"path": DB_PATH})
+        _set_private_file(DB_PATH)
+        for suffix in ("-wal", "-shm"):
+            ext_path = DB_PATH + suffix
+            if os.path.exists(ext_path):
+                _set_private_file(ext_path)
+
+
+def _db_ensure_schema_version(conn: sqlite3.Connection) -> None:
+    try:
+        row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
+    except Exception:
+        row = None
+    version = row[0] if row else 0
+    target = 5
+    _db_migrate_columns(conn)
+    if version < 4:
+        _db_migrate_markup_nulls(conn)
+    if version < 5:
+        _db_migrate_price_sync_defaults(conn)
+    if version < target:
+        conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (target,))
+
+
+def _db_migrate_markup_nulls(conn: sqlite3.Connection) -> None:
+    """
+    v3.8: 0 в наценке привязки раньше означал «наследовать глобальную».
+
+    Теперь 0 — это честный нуль, а «наследовать» хранится как NULL. Чтобы у
+    существующих привязок цена не поменялась после обновления, переводим
+    сохранённые нули в NULL. Смысл цен сохраняется 1:1.
+    """
+    try:
+        cur = conn.execute(
+            "UPDATE mappings SET markup_percent=NULL "
+            "WHERE markup_percent=0 OR markup_percent='0' OR markup_percent=''")
+        percent_changed = cur.rowcount
+        cur = conn.execute(
+            "UPDATE mappings SET markup_fixed=NULL "
+            "WHERE markup_fixed=0 OR markup_fixed='0' OR markup_fixed=''")
+        fixed_changed = cur.rowcount
+        if percent_changed or fixed_changed:
+            logger.info("markup zeros migrated to NULL (inherit)",
+                        extra={"percent": percent_changed, "fixed": fixed_changed})
+    except Exception as e:
+        logger.warning("markup null migration failed", extra={"error": repr(e)})
+
+
+def _db_migrate_price_sync_defaults(conn: sqlite3.Connection) -> None:
+    try:
+        cur = conn.execute(
+            "UPDATE mappings SET price_sync=1 "
+            "WHERE funpay_lot_id IS NOT NULL "
+            "AND TRIM(CAST(funpay_lot_id AS TEXT))<>'' "
+            "AND (price_sync IS NULL OR price_sync=0) "
+            "AND price_synced_at IS NULL "
+            "AND last_price_usd IS NULL "
+            "AND last_lot_price IS NULL"
+        )
+        if cur.rowcount:
+            logger.info("price sync enabled for linked mappings",
+                        extra={"mappings": cur.rowcount})
+    except Exception as e:
+        logger.warning("price sync defaults migration failed",
+                       extra={"error": repr(e)})
+
+
+# Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS не
+# обновляет существующие таблицы, поэтому при апгрейде плагина их нужно доливать
+# через ALTER TABLE, иначе запросы упадут на "no such column".
+_DB_ADDED_COLUMNS: Dict[str, List[Tuple[str, str]]] = {
+    "orders": [
+        ("batch_json", "TEXT"),          # v3.1: список FZR-заказов при quantity > 1
+        ("markup_json", "TEXT"),         # v3.1: расчёт цены с наценкой
+        ("funds_json", "TEXT"),          # v3.6: сколько не хватило баланса и попытки
+        ("review_request_sent", "INTEGER"),  # v3.17: просьба об отзыве отправлена
+        ("profit_report_sent", "INTEGER"),   # v3.18: отчёт о прибыли отправлен
+        ("profit_json", "TEXT"),             # v3.18: расчёт прибыли по заказу
+    ],
+    "mappings": [
+        ("validate_id", "INTEGER"),      # v3.1: проверять Player ID через API
+        ("units_per_item", "INTEGER"),   # v3.2: единиц товара за 1 штуку лота
+        ("price_sync", "INTEGER"),       # v3.5: синхронизировать цену лота
+        ("last_price_usd", "TEXT"),      # v3.5: закупка на момент последней синхронизации
+        ("last_lot_price", "REAL"),      # v3.5: цена, которую поставили на лот
+        ("price_synced_at", "REAL"),
+        ("greeting_template", "TEXT"),   # v3.5: приветствие покупателю
+        ("ask_template", "TEXT"),        # v3.5: свой запрос данных под категорию
+        ("review_template", "TEXT"),     # v3.17: своя просьба об отзыве
+        ("refund_template", "TEXT"),     # v3.20: свой текст при возврате товара
+    ],
+}
+
+
+def _db_migrate_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _DB_ADDED_COLUMNS.items():
+        try:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except Exception:
+            continue
+        if not existing:
+            continue
+        for name, coltype in columns:
+            if name in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
+                logger.info("db column added", extra={"table": table, "column": name})
+            except Exception as e:
+                logger.warning("db column add failed", extra={"table": table, "column": name, "error": repr(e)})
+
+
+def _db_load_callback_tokens() -> None:
+    if not _DB_INITIALIZED:
+        return
+    try:
+        now = time.time()
+        rows = _db_connect().execute("SELECT token, callback_data, expires_at, created_at FROM callback_tokens WHERE expires_at > ?", (now,)).fetchall()
+        with _CB_TOKENS_LOCK:
+            for row in rows:
+                _CB_TOKENS[row["token"]] = (row["created_at"], row["callback_data"])
+    except Exception as e:
+        logger.warning("load callback tokens failed", extra={"error": repr(e)})
+
+
+def _db_save_callback_token(token: str, data: str, created_at: float, expires_at: float) -> None:
+    if not _DB_INITIALIZED:
+        return
+    try:
+        _db_connect().execute(
+            "INSERT OR REPLACE INTO callback_tokens (token, callback_data, expires_at, created_at) VALUES (?, ?, ?, ?)",
+            (token, data, expires_at, created_at),
+        )
+    except Exception as e:
+        logger.warning("save callback token failed", extra={"error": repr(e)})
+
+
+def _db_prune_callback_tokens(now: float) -> None:
+    if not _DB_INITIALIZED:
+        return
+    try:
+        _db_connect().execute("DELETE FROM callback_tokens WHERE expires_at <= ?", (now,))
+    except Exception as e:
+        logger.warning("prune callback tokens failed", extra={"error": repr(e)})
+
+
+_ORDER_COLUMNS = [
+    "funpay_order_id", "fzr_order_id", "status", "buyer_id", "buyer_username",
+    "chat_id", "sku_id", "mapping_id", "quantity", "metadata_json",
+    "order_json", "result_json", "error", "created_at", "updated_at",
+    "completed_notification_sent", "batch_json", "markup_json", "funds_json",
+    "review_request_sent", "profit_report_sent", "profit_json",
+]
+
+_PENDING_COLUMNS = [
+    "funpay_order_id", "buyer_id", "chat_id", "mapping_id", "step",
+    "created_at", "reminded_at", "data_json",
+]
+
+_MAPPING_COLUMNS = [
+    "id", "fzr_sku_id", "category_kind", "category_id", "offer_id", "offer_name",
+    "price_usd", "stock", "min_quantity", "max_quantity", "fields_json", "funpay_lot_id",
+    "funpay_subcategory_id", "funpay_title", "markup_percent", "markup_fixed",
+    "metadata_key", "metadata_prompt", "metadata_validation", "metadata_fields_json",
+    "delivery_template", "enabled", "validate_id", "units_per_item",
+    "price_sync", "last_price_usd", "last_lot_price", "price_synced_at",
+    "greeting_template", "ask_template", "review_template", "refund_template",
+    "created_at", "updated_at",
+]
+
+_EVENT_COLUMNS = ["funpay_order_id", "event_type", "data_json", "created_at"]
+
+
+def _to_json(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return None
+
+
+def _from_json(s: Optional[str]) -> Any:
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+
+
+class _SafeFormatter(string.Formatter):
+    def get_field(self, field_name, args, kwargs):
+        if not isinstance(field_name, str):
+            return "{" + str(field_name) + "}", field_name
+        if "." in field_name or "[" in field_name or "__" in field_name or field_name.isdigit():
+            return "{" + field_name + "}", field_name
+        try:
+            return kwargs[field_name], field_name
+        except KeyError:
+            return "{" + field_name + "}", field_name
+
+    def format_field(self, value, format_spec):
+        if format_spec:
+            try:
+                return format(value, format_spec)
+            except Exception:
+                return str(value)
+        return str(value)
+
+
+_TEMPLATE_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_template(tpl: str) -> None:
+    for _, field_name, _, _ in _SafeFormatter().parse(tpl):
+        if field_name is None:
+            continue
+        if not _TEMPLATE_FIELD_RE.match(field_name):
+            raise ValueError(f"invalid placeholder: {{{field_name}}}")
+
+
+def render_template(tpl: str, default: Optional[str] = None, **kw: Any) -> str:
+    try:
+        return _SafeFormatter().format(tpl, **kw)
+    except Exception as e:
+        logger.error("template render failed", extra={"tpl": tpl[:200], "error": repr(e)})
+        fallback = default or DEFAULT_CONFIG["templates"]["delivery"]
+        try:
+            return _SafeFormatter().format(fallback, **kw)
+        except Exception:
+            return str(kw.get("code", "")) or str(kw.get("error", "")) or "Ваш заказ готов."
+
+
+def _esc(s: Any) -> str:
+    if s is None:
+        return ""
+    return html.escape(str(s))
+
+
+def _validate_non_empty(text: str, field_name: str = "значение", max_len: int = 500, allow_html: bool = False) -> Optional[str]:
+    if not text:
+        return f"{field_name} не может быть пустым."
+    if len(text) > max_len:
+        return f"{field_name} слишком длинное (макс. {max_len} символов)."
+    if not allow_html and ("<" in text or ">" in text):
+        return f"{field_name} не должно содержать символы '<' или '>'."
+    return None
+
+
+def _validate_price(text: str) -> Tuple[Optional[float], Optional[str]]:
+    text = (text or "").strip().replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        return None, "Введите число (целое или дробное)."
+    if value < 0:
+        return None, "Цена не может быть отрицательной."
+    if value > 1000000:
+        return None, "Цена слишком велика."
+    return value, None
+
+
+def _validate_markup(text: str) -> Tuple[Optional[float], Optional[str]]:
+    text = (text or "").strip().replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        return None, "Введите число."
+    if value < -99 or value > 999:
+        return None, "Наценка должна быть от -99 до 999."
+    return value, None
+
+
+def _validate_lot_id(text: str) -> Tuple[Optional[int], Optional[str]]:
+    text = (text or "").strip()
+    if not text:
+        return None, "Введите ID лота."
+    try:
+        value = int(text)
+    except ValueError:
+        return None, "ID лота должен быть числом."
+    if value <= 0:
+        return None, "ID лота должен быть положительным."
+    return value, None
+
+
+class _InlineButton(InlineKeyboardButton):
+    # Subclass only to carry a local style attribute for internal grouping.
+    # Non-standard Telegram fields (style, icon_custom_emoji_id) are NOT
+    # serialized, so the JSON stays compatible with official Bot API.
+    pass
+
+
+def _inline_button(text: str, callback_data: str, style: Optional[str] = None) -> InlineKeyboardButton:
+    if style is None:
+        t = str(text).lower()
+        if any(w in t for w in ("закрыть", "отмена", "удалить", "назад", "выключить", "выкл", "❌", "🛑", "🗑")):
+            style = "danger"
+        elif any(w in t for w in ("включить", "да,", "добавить", "создать", "вкл", "✅", "🆕", "➕", "🟢")):
+            style = "success"
+        else:
+            style = "primary"
+    try:
+        b = _InlineButton(text, callback_data=callback_data, style=style)
+    except TypeError:
+        b = _InlineButton(text, callback_data=callback_data)
+    b.style = style
+    return b
+
+
+def _pack_callback_data(data: str) -> str:
+    if len(data.encode("utf-8")) <= 55:
+        return data
+    token = secrets.token_hex(4)
+    now = time.time()
+    expires = now + _CB_TOKEN_MAX_AGE
+    with _CB_TOKENS_LOCK:
+        _CB_TOKENS[token] = (now, data)
+        _cleanup_cb_tokens(now)
+    _db_save_callback_token(token, data, now, expires)
+    return f"{CB_PREFIX}:t:{token}"
+
+
+def _cleanup_cb_tokens(now: float) -> None:
+    while len(_CB_TOKENS) > _CB_TOKENS_MAX_SIZE:
+        oldest = next(iter(_CB_TOKENS))
+        _CB_TOKENS.pop(oldest, None)
+    expired = [k for k, (ts, _) in _CB_TOKENS.items() if now - ts > _CB_TOKEN_MAX_AGE]
+    for k in expired:
+        _CB_TOKENS.pop(k, None)
+    if expired or len(_CB_TOKENS) > _CB_TOKENS_MAX_SIZE - 50:
+        _db_prune_callback_tokens(now)
+
+
+def _unpack_callback_data(data: str) -> Optional[str]:
+    if not data.startswith(f"{CB_PREFIX}:t:"):
+        return data
+    parts = data.split(":")
+    if len(parts) < 3:
+        return None
+    token = parts[2]
+    with _CB_TOKENS_LOCK:
+        entry = _CB_TOKENS.get(token)
+        if entry:
+            _CB_TOKENS[token] = (time.time(), entry[1])
+            _db_save_callback_token(token, entry[1], time.time(), time.time() + _CB_TOKEN_MAX_AGE)
+            return entry[1]
+    # fallback to DB if not in memory (after restart)
+    if _DB_INITIALIZED:
+        try:
+            now = time.time()
+            row = _db_connect().execute("SELECT callback_data FROM callback_tokens WHERE token=? AND expires_at > ?", (token, now)).fetchone()
+            if row:
+                with _CB_TOKENS_LOCK:
+                    _CB_TOKENS[token] = (now, row["callback_data"])
+                _db_save_callback_token(token, row["callback_data"], now, now + _CB_TOKEN_MAX_AGE)
+                return row["callback_data"]
+        except Exception as e:
+            logger.warning("callback token db lookup failed", extra={"error": repr(e)})
+    return None
+
+
+def _db_status_counts() -> Dict[str, int]:
+    """Сводка заказов по статусам одним запросом — для главного меню."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    try:
+        with _DB_LOCK:
+            rows = _db_connect().execute(
+                "SELECT status, COUNT(*) FROM orders GROUP BY status").fetchall()
+        return {str(r[0] or "unknown"): int(r[1]) for r in rows}
+    except Exception as e:
+        logger.warning("status counts failed", extra={"error": repr(e)})
+        return {}
+
+
+_ACTIVE_STATUSES = ("reserving", "awaiting_metadata", "processing", "pending")
+# awaiting_funds — не терминальный статус, но требует действия продавца
+# (пополнить баланс), поэтому показываем его в «требуют внимания».
+# no_mapping здесь НЕТ намеренно: продавец торгует не только через FazerCards,
+# и чужие заказы не являются проблемой плагина — они бы только зашумляли раздел.
+_PROBLEM_STATUSES = ("failed", "timeout", "needs_review", "delivery_failed",
+                     "awaiting_funds")
+
+# Заказы, которые вообще не про этот плагин: лот не привязан к FazerCards.
+# Их держим в базе только чтобы можно было понять «почему не выдалось», но
+# из общих списков и счётчиков убираем — иначе торговля другими товарами
+# превращает раздел заказов в свалку.
+_FOREIGN_STATUSES = ("no_mapping",)
+_FOREIGN_KEEP_DAYS = 3
+
+
+def _main_menu_text() -> str:
+    cfg = load_config()
+    s = cfg.get("settings", {})
+    mappings = get_mappings()
+    enabled = sum(1 for m in mappings if m.get("enabled", True))
+    counts = _db_status_counts()
+    active = sum(counts.get(k, 0) for k in _ACTIVE_STATUSES)
+    problems = sum(counts.get(k, 0) for k in _PROBLEM_STATUSES)
+    delivered = counts.get("completed", 0)
+
+    key_set = bool(cfg.get("api_key"))
+    lines = [
+        "<b>🎁 FazerCards Reseller</b>",
+        "",
+        "<blockquote>Автовыдача цифровых товаров через FazerCards API.</blockquote>",
+        "",
+        f"{'🟢' if s.get('auto_delivery') else '🔴'} Автовыдача: <b>{'ON' if s.get('auto_delivery') else 'OFF'}</b>"
+        f"   {'🔑 ключ задан' if key_set else '⚠️ <b>ключ не задан</b>'}",
+        f"🔗 Привязки: <b>{enabled}</b> вкл. из <b>{len(mappings)}</b>",
+    ]
+    status_bits = []
+    if active:
+        status_bits.append(f"⏳ в работе <b>{active}</b>")
+    if delivered:
+        status_bits.append(f"✅ выдано <b>{delivered}</b>")
+    if problems:
+        status_bits.append(f"⚠️ проблемных <b>{problems}</b>")
+    lines.append("📋 Заказы: " + (" · ".join(status_bits) if status_bits else "<i>пока нет</i>"))
+
+    # заказы, ждущие пополнения баланса — самое срочное: покупатель уже заплатил
+    awaiting_funds = counts.get(OrderStatus.AWAITING_FUNDS.value, 0)
+    if awaiting_funds:
+        lines.append(f"💸 <b>Ждут баланса: {awaiting_funds}</b> — "
+                     f"покупатели оплатили, нужна закупка")
+
+    rate = s.get("exchange_rate") or 0
+    markup = f"{s.get('markup_percent', 0)}% + {s.get('markup_fixed', 0)}₽"
+    lines.append(f"💱 Курс: <b>{_esc(rate) if rate else '—'}</b>   💰 Наценка: <b>{_esc(markup)}</b>")
+
+    warnings = []
+    if not key_set:
+        warnings.append("задайте API-ключ")
+    if not mappings:
+        warnings.append("добавьте привязку лота")
+    if not rate:
+        warnings.append("укажите курс RUB/USD для расчёта цен")
+    if problems:
+        warnings.append(f"разберите проблемные заказы ({problems})")
+    if warnings:
+        lines += ["", "⚠️ <b>Требует внимания:</b> " + "; ".join(warnings) + "."]
+
+    lines += ["", "<i>👇 Выберите раздел:</i>"]
+    return "\n".join(lines)
+
+
+
+def _public_buyer_error(error_text: str) -> str:
+    et = (error_text or "").lower()
+    st = str(error_text)
+    # Нехватку баланса в норме перехватывает InsufficientFundsError и заказ
+    # уходит в ожидание пополнения. Сюда попадаем только в редких случаях
+    # (например, часть батча уже куплена) — покупателю про баланс не пишем.
+    if _is_insufficient_funds_error(st):
+        return ("Заказ принят, но выдача задерживается. Я уже занимаюсь этим — "
+                "напишу здесь, как только всё будет готово.")
+    if "out of stock" in et or "нет в наличии" in et or "sold out" in et:
+        return "Товара временно нет в наличии, попробуйте позже."
+    if "401" in st or "invalid api key" in et:
+        return "Ошибка настройки продавца. Обратитесь к продавцу."
+    if "превышает лимит" in et or "exceeds the limit" in et or "max quantity" in et or "quantity exceeds" in et:
+        return "Превышен максимальный размер одного заказа. Оформите несколько заказов поменьше."
+    return "При выдаче заказа возникла ошибка, продавец уведомлён."
+
+
+# -----------------------------------------------------------------------------
+# metadata validation
+# -----------------------------------------------------------------------------
+_METADATA_VALIDATORS: Dict[str, Any] = {
+    "steam_id": re.compile(r"^7656119\d{10}$"),
+    "player_id": re.compile(r"^\d+$"),
+    "email": re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+    "phone": re.compile(r"^\+?\d{7,15}$"),
+    "telegram": re.compile(r"^[A-Za-z0-9_]{5,32}$"),
+    "url": re.compile(r"^(https?://.+|s\.team/p/.+)$"),
+    # Логин Steam: 2–64 символа, только латиница/цифры/_/-/. (правила Valve).
+    # Раньше сюда попадало "нет логина" и кириллица -> пополнение уходило в никуда.
+    "steam_login": re.compile(r"^[A-Za-z0-9_\-.]{2,64}$"),
+    # Ссылка-приглашение Steam. API принимает только s.team/p/<code> —
+    # ссылка на профиль (steamcommunity.com/id/...) НЕ подходит.
+    "steam_invite": re.compile(r"^https://s\.team/p/[A-Za-z0-9\-_]{3,}(/[A-Za-z0-9\-_]+)?$"),
+}
+
+# Ссылка-приглашение внутри произвольного текста: покупатели присылают её
+# с приписками («вот моя ссылка ...»), поэтому вытаскиваем и нормализуем.
+_STEAM_INVITE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?s\.team/p/([A-Za-z0-9\-_]{3,})(?:/([A-Za-z0-9\-_]+))?",
+    re.IGNORECASE)
+# Ссылка на профиль — частая ошибка, о ней нужно сказать отдельно
+_STEAM_PROFILE_RE = re.compile(
+    r"steamcommunity\.com/(?:id|profiles|user)/", re.IGNORECASE)
+
+
+# Подсказки покупателю: как выглядит правильное значение.
+# API их не отдаёт (в схеме нет placeholder/hint), поэтому держим свои —
+# как в веб-интерфейсе FazerCards («вставьте короткую ссылку s.team/p/…»).
+_FIELD_HINTS: Dict[str, str] = {
+    "steam_invite": ("Пришлите короткую ссылку-приглашение Steam вида "
+                     "s.team/p/abcd-1234\n"
+                     "Где взять: Steam → Друзья → Добавить друга → "
+                     "«Ссылка для приглашения» → Скопировать.\n"
+                     "Ссылка на профиль (steamcommunity.com/id/...) не подойдёт."),
+    "steam_login": ("Укажите логин аккаунта Steam — тот, которым вы входите "
+                    "(латиница, цифры, _ - .), например vasya_pupkin.\n"
+                    "Это не e-mail и не отображаемое имя в профиле."),
+    "steam_id": "Укажите SteamID64 — 17 цифр, начинается с 765, например 76561198000000000.",
+    "player_id": "Укажите числовой ID игрока из профиля в игре, например 123456789.",
+    "email": "Укажите email в формате name@example.com.",
+    "phone": "Укажите номер телефона с кодом страны, например +79001234567.",
+    "telegram": "Укажите username Telegram без @, например durov (5–32 символа).",
+    "url": "Пришлите ссылку целиком, начиная с https://",
+}
+
+
+def _field_hint(field: Optional[Dict[str, Any]]) -> str:
+    """Подсказка для поля: своя из привязки, иначе типовая по validation."""
+    if not isinstance(field, dict):
+        return ""
+    own = field.get("hint")
+    if own:
+        return str(own)
+    return _FIELD_HINTS.get(str(field.get("validation") or ""), "")
+
+
+# v3.14: покупатели пишут значение внутри фразы («мой логин vasya_pupkin»,
+# «логин: vasya»). Вытаскиваем латинский токен, но ТОЛЬКО если он однозначен:
+# если латинских слов несколько, угадывать нельзя — пополнение необратимо.
+_LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]{2,64}")
+# служебные слова, которые сами по себе не являются значением
+_LATIN_STOPWORDS = {"login", "steam", "id", "my", "nick", "account", "acc",
+                    "logi", "log", "user", "username", "the", "is", "http",
+                    "https", "www", "com", "ru"}
+
+
+def _extract_latin_token(text: str) -> Optional[str]:
+    """
+    Единственный латинский токен из фразы или None.
+
+    «Привет, мой логин vasya_pupkin» -> vasya_pupkin
+    «vasya или petya»                -> None (не угадываем)
+    «vasya_pupkin»                   -> vasya_pupkin
+    «vasyа_pupkin» (русская «а»)     -> None  ← ВАЖНО
+
+    Последний случай — источник тихой потери денег: если вырезать латинскую
+    часть из слова со случайной кириллицей, получится ДРУГОЙ существующий
+    логин, и пополнение уйдёт чужому человеку. Поэтому токен принимаем
+    только как отдельное слово: символы вокруг него не должны быть буквами.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    candidates: List[str] = []
+    for m in _LATIN_TOKEN_RE.finditer(raw):
+        token = m.group(0)
+        if token.lower() in _LATIN_STOPWORDS or token.isdigit():
+            continue
+        before = raw[m.start() - 1] if m.start() else ""
+        after = raw[m.end()] if m.end() < len(raw) else ""
+        # смешанное слово (латиница + кириллица) — не наш случай
+        if before.isalpha() or after.isalpha():
+            return None
+        candidates.append(token)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _normalize_metadata_value(validation: Optional[str], value: str) -> str:
+    """
+    Приводит ввод покупателя к формату, который ждёт API.
+
+    Люди присылают ссылку с текстом вокруг, ник с @, лишние пробелы —
+    вместо отказа чиним то, что однозначно чинится.
+    """
+    text = (value or "").strip()
+    if not text:
+        return text
+    if validation == "steam_invite":
+        m = _STEAM_INVITE_RE.search(text)
+        if m:
+            code = m.group(1)
+            tail = f"/{m.group(2)}" if m.group(2) else ""
+            return f"https://s.team/p/{code}{tail}"
+        return text
+    if validation == "telegram":
+        return _extract_latin_token(text.lstrip("@").strip()) or text.lstrip("@").strip()
+    if validation == "steam_login":
+        # иногда присылают ссылку на профиль вместо логина — вытащим логин
+        m = re.search(r"steamcommunity\.com/id/([A-Za-z0-9_\-.]+)", text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # v3.14: «Привет, мой логин vasya_pupkin» — вытаскиваем сам логин, если
+        # в тексте ровно один латинский токен. Несколько — не угадываем:
+        # пополнение на чужой аккаунт вернуть нельзя.
+        token = _extract_latin_token(text)
+        if token:
+            return token
+        # «@nick» НЕ чиним: в логинах Steam «@» не бывает, это скорее ник из
+        # Telegram — пусть покупатель увидит ошибку и пришлёт настоящий логин
+        return text
+    if validation in ("player_id", "steam_id"):
+        digits = re.sub(r"[^\d]", "", text)
+        return digits or text
+    if validation == "phone":
+        cleaned = re.sub(r"[^\d+]", "", text)
+        return cleaned or text
+    return text
+
+
+def _infer_validation(key: str, label: Optional[str] = None) -> str:
+    k = (key or "").lower()
+    l = (label or "").lower()
+    # ссылка-приглашение Steam: API принимает только s.team/p/... (не профиль)
+    if (re.search(r"invite", k) or "invite" in l
+            or "приглашен" in l or "s.team" in l or "s.team" in k):
+        return "steam_invite"
+    # логин Steam проверяем строже обычного username (см. _METADATA_VALIDATORS)
+    if re.search(r"steam[_\s]?login|steamlogin", k) or "логин steam" in l or "steam login" in l:
+        return "steam_login"
+    if "url" in k or "url" in l or "ссылка" in l or "link" in k or "link" in l:
+        return "url"
+    if "login" in k or "login" in l or "логин" in l:
+        return "username"
+    if "steam" in k or "steam" in l:
+        return "steam_id"
+    if re.search(r"player[_\s]?id|userid|user[_\s]?id|игрок", k) or re.search(r"player|userid|игрок", l):
+        return "player_id"
+    if "email" in k or "email" in l or "почта" in l or "e-mail" in l:
+        return "email"
+    if "phone" in k or "phone" in l or "телефон" in l or "номер" in l:
+        return "phone"
+    if re.search(r"telegram|tg\s?[@\s]?username|телеграм", k) or re.search(r"telegram|телеграм|tg username", l):
+        return "telegram"
+    if "username" in k or "ник" in l or "name" in k or "имя" in l:
+        return "username"
+    return "nonempty"
+
+
+# -----------------------------------------------------------------------------
+# v3.14: кириллица в полях, где её быть не может
+#
+# Идея «игнорировать все сообщения с кириллицей» вредна: покупатели русские,
+# они пишут по-русски и отвечают на select названиями вариантов («Европа»,
+# «По логину»). Полный игнор кириллицы сломал бы половину диалогов.
+#
+# А вот в полях с латинским форматом кириллица — реальная и очень дорогая
+# ошибка: у «vasyа» с русской «а» правильная длина и вид, регулярка
+# [A-Za-z0-9_.-] его отсекает, но покупатель не понимает, что не так, и
+# присылает то же самое. Поэтому объясняем причину отдельным текстом.
+# -----------------------------------------------------------------------------
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF\u0500-\u052F]")
+# поля, где допустима только латиница
+_LATIN_ONLY_VALIDATIONS = {"steam_login", "steam_invite", "url", "email", "telegram"}
+# похожие по виду буквы: показываем покупателю, что именно заменить
+_HOMOGLYPHS = {
+    "а": "a", "А": "A", "е": "e", "Е": "E", "о": "o", "О": "O",
+    "р": "p", "Р": "P", "с": "c", "С": "C", "у": "y", "У": "Y",
+    "х": "x", "Х": "X", "к": "k", "К": "K", "м": "m", "М": "M",
+    "т": "t", "Т": "T", "в": "b", "В": "B", "н": "h", "Н": "H",
+    "і": "i", "І": "I", "ѕ": "s",
+}
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(_CYRILLIC_RE.search(text or ""))
+
+
+def _fix_homoglyphs(text: str) -> str:
+    """Меняет русские буквы-двойники на латинские (для подсказки, не для API)."""
+    return "".join(_HOMOGLYPHS.get(ch, ch) for ch in (text or ""))
+
+
+def _cyrillic_problem(value: str, validation: Optional[str]) -> Optional[str]:
+    """
+    Текст ошибки, если в латинском поле оказалась кириллица. Иначе None.
+
+    Значение НЕ исправляем автоматически: подмена букв в логине Steam может
+    указать на чужой существующий аккаунт, а пополнение необратимо. Предлагаем
+    исправленный вариант текстом и просим подтвердить.
+    """
+    if validation not in _LATIN_ONLY_VALIDATIONS:
+        return None
+    v = (value or "").strip()
+    if not _has_cyrillic(v):
+        return None
+    suggestion = _fix_homoglyphs(v)
+    base = ("В значении есть русские буквы — здесь нужна только латиница. "
+            "Часто это случайно: раскладка переключилась, а буквы выглядят одинаково.")
+    if suggestion != v and not _has_cyrillic(suggestion):
+        return f"{base}\nПохоже, вы имели в виду: {suggestion}\nПришлите значение латиницей."
+    return f"{base}\nПришлите значение латиницей."
+
+
+def _validate_metadata_value(key: str, value: str, validation: Optional[str]) -> Optional[str]:
+    v = (value or "").strip()
+    if not v:
+        return "Значение не может быть пустым."
+    # v3.14: кириллица там, где допустима только латиница. Проверяем ПОСЛЕ
+    # нормализации: покупатель пишет «вот моя ссылка https://s.team/p/ab-cd
+    # спасибо», и русские слова вокруг значения ошибкой не являются.
+    cyr = _cyrillic_problem(_normalize_metadata_value(validation, v), validation)
+    if cyr:
+        return cyr
+    if validation == "select":
+        # значения select проверяются через _resolve_select_value (нужен список options)
+        return None
+    if validation == "nonempty":
+        return None
+    if validation == "username":
+        if len(v) > 64:
+            return "Слишком длинное имя (максимум 64 символа)."
+        return None
+    pattern = _METADATA_VALIDATORS.get(validation)
+    if pattern:
+        test = _normalize_metadata_value(validation, v)
+        if not pattern.fullmatch(test):
+            messages = {
+                "steam_id": "Введите корректный SteamID64 (17 цифр, начинается с 765...).",
+                "player_id": "Введите числовой ID игрока.",
+                "email": "Введите корректный email.",
+                "phone": "Введите корректный номер телефона.",
+                "telegram": "Введите корректный Telegram-username (5–32 символа, A-Z, 0-9, _).",
+                "url": "Введите корректную ссылку (https://... или s.team/p/...).",
+                "steam_login": ("Введите логин аккаунта Steam (латиница, цифры, _ - . — "
+                                "например vasya_pupkin). Это не e-mail и не отображаемое имя."),
+                "steam_invite": ("Это не ссылка-приглашение Steam. "
+                                 "Нужна короткая ссылка вида s.team/p/abcd-1234."),
+            }
+            # частая ошибка: присылают ссылку на профиль вместо приглашения
+            if validation == "steam_invite" and _STEAM_PROFILE_RE.search(v):
+                return ("Это ссылка на профиль, а не приглашение. Нужна короткая ссылка "
+                        "вида s.team/p/abcd-1234 — Steam → Друзья → Добавить друга → "
+                        "«Ссылка для приглашения».")
+            return messages.get(validation, "Некорректное значение.")
+    return None
+
+
+# -----------------------------------------------------------------------------
+# select-поля (сервер / регион / платформа)
+#
+# FazerCards отдаёт в fields[] элементы вида
+#   {"key": "server", "label": "Server", "type": "select",
+#    "options": [{"label": "Europe", "value": "Europe"}, ...]}
+# и требует (POST /topups/order): "for `select` use listed `options`".
+# Поэтому options должны дожить до диалога с покупателем, а значение —
+# строго совпадать с одним из option["value"].
+# -----------------------------------------------------------------------------
+_SELECT_TYPES = {"select", "choice", "dropdown", "radio", "enum", "list"}
+
+
+def _normalize_options(raw: Any) -> List[Dict[str, str]]:
+    """Приводит options к [{'value': str, 'label': str}] из любых форм ответа API."""
+    result: List[Dict[str, str]] = []
+    if not isinstance(raw, (list, tuple)):
+        return result
+    seen: Set[str] = set()
+    for opt in raw:
+        if isinstance(opt, dict):
+            value = opt.get("value")
+            if value is None:
+                value = opt.get("id")
+            if value is None:
+                value = opt.get("key")
+            if value is None:
+                value = opt.get("code")
+            if value is None:
+                value = opt.get("name") or opt.get("label") or opt.get("text")
+            label = opt.get("label") or opt.get("text") or opt.get("name") or opt.get("title") or value
+        else:
+            value = label = opt
+        if value is None:
+            continue
+        value = _html_unescape(str(value)).strip()
+        label = _html_unescape(str(label or value)).strip() or value
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append({"value": value, "label": label})
+    return result
+
+
+def _field_options(field: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Достаёт options из поля, поддерживая альтернативные названия ключа."""
+    if not isinstance(field, dict):
+        return []
+    for key in ("options", "values", "choices", "variants", "items", "enum"):
+        opts = _normalize_options(field.get(key))
+        if opts:
+            return opts
+    return []
+
+
+def _is_select_field(field: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(field, dict):
+        return False
+    ftype = str(field.get("type") or "").strip().lower()
+    if ftype in _SELECT_TYPES:
+        return True
+    # некоторые категории не помечают type, но присылают options
+    return bool(_field_options(field))
+
+
+def _make_metadata_field(key: str, label: str, source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Строит запись metadata_field, СОХРАНЯЯ type/options для select-полей.
+    Раньше здесь терялись options -> покупателя спрашивали свободным текстом.
+    """
+    source = source or {}
+    field: Dict[str, Any] = {"key": key, "label": label}
+    options = _field_options(source)
+    if options and _is_select_field(source):
+        field["type"] = "select"
+        field["options"] = options
+        field["validation"] = "select"
+    else:
+        field["validation"] = source.get("validation") or _infer_validation(key, label)
+    # своя подсказка из каталога/привязки имеет приоритет над типовой
+    for hint_key in ("hint", "placeholder", "description", "help"):
+        if source.get(hint_key):
+            field["hint"] = str(source[hint_key])
+            break
+    if source.get("required") is not None:
+        field["required"] = bool(source.get("required"))
+    return field
+
+
+def _enrich_fields_with_options(fields: List[Dict[str, Any]], mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Восстанавливает type/options для уже сохранённых metadata_fields.
+
+    Привязки, созданные версиями <= 2.9.9, лежат в БД без options, но сырые
+    поля из API сохранены в mapping['fields'] (колонка fields_json), поэтому
+    список вариантов можно поднять оттуда без пересоздания привязок.
+    """
+    raw_by_key: Dict[str, Dict[str, Any]] = {}
+    for f in (mapping.get("fields") or []):
+        if not isinstance(f, dict):
+            continue
+        rkey = f.get("code") or f.get("key")
+        if rkey:
+            raw_by_key[str(rkey)] = f
+
+    result: List[Dict[str, Any]] = []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        key = str(f.get("key") or "")
+        if not key:
+            continue
+        # уже есть валидные options — оставляем как есть
+        if _field_options(f) and _is_select_field(f):
+            enriched = dict(f)
+            enriched["type"] = "select"
+            enriched["options"] = _field_options(f)
+            enriched["validation"] = "select"
+            result.append(enriched)
+            continue
+        raw = raw_by_key.get(key)
+        if raw is not None and _is_select_field(raw):
+            label = f.get("label") or raw.get("name") or raw.get("label") or key
+            result.append(_make_metadata_field(key, label, raw))
+            continue
+        result.append(f)
+    return result
+
+
+def _resolve_select_value(field: Dict[str, Any], text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Сопоставляет ответ покупателя со списком options.
+
+    Принимает номер из списка ("2"), точное значение или подпись варианта
+    (регистр и лишние пробелы игнорируются).
+    Возвращает (value, error): value — то, что уйдёт в API.
+    """
+    options = _field_options(field)
+    if not options:
+        return None, "Для этого поля не удалось получить список вариантов. Свяжитесь с продавцом."
+
+    raw = (text or "").strip()
+    if not raw:
+        return None, "Значение не может быть пустым."
+
+    # 1) номер варианта
+    candidate = raw.lstrip("#").strip().rstrip(".)")
+    if candidate.isdigit():
+        idx = int(candidate)
+        if 1 <= idx <= len(options):
+            return options[idx - 1]["value"], None
+        return None, f"Нет варианта с номером {idx}. Доступны 1–{len(options)}."
+
+    # 2) точное совпадение value / label (без учёта регистра)
+    low = raw.casefold()
+    for opt in options:
+        if low == str(opt["value"]).casefold() or low == str(opt["label"]).casefold():
+            return opt["value"], None
+
+    return None, "Не понял вариант. Отправьте номер из списка выше."
+
+
+def _format_select_options(field: Dict[str, Any]) -> str:
+    """
+    Нумерованный список вариантов для сообщения ПОКУПАТЕЛЮ (чат FunPay).
+
+    Ограничения канала:
+      * чат FunPay — plain text, HTML-теги не рендерятся;
+      * Cardinal.send_message (split_text) режет текст каждые 20 строк, поэтому
+        весь список должен уместиться в ~16 строк вместе с шапкой и подсказкой,
+        иначе варианты уедут во второе сообщение.
+    Поэтому варианты пакуются по несколько в строку (жадно, по ширине).
+    Проверено на lineage_w — 72 сервера.
+    """
+    options = _field_options(field)
+    if not options:
+        return ""
+    numbered = [f"{i}. {opt['label']}" for i, opt in enumerate(options, 1)]
+    if len(numbered) <= 12:
+        return "\n".join(numbered)
+
+    max_lines = 16
+    lines: List[str] = []
+    for width in (56, 72, 96, 128, 200):
+        lines = []
+        current = ""
+        for item in numbered:
+            if not current:
+                current = item
+            elif len(current) + 3 + len(item) <= width:
+                current = f"{current}   {item}"
+            else:
+                lines.append(current)
+                current = item
+        if current:
+            lines.append(current)
+        if len(lines) <= max_lines:
+            break
+    return "\n".join(lines)
+
+
+def _format_select_options_html(field: Dict[str, Any], limit: int = 10) -> str:
+    """Короткий превью-список вариантов для Telegram-ПУ продавца (HTML)."""
+    options = _field_options(field)
+    preview = ", ".join(o["label"] for o in options[:limit])
+    if len(options) > limit:
+        preview += f", …(+{len(options) - limit})"
+    return _esc(preview)
+
+
+# Поля, которые обязательны для типа товара, но не приходят в `fields` каталога.
+# Нужны привязкам, созданным вручную по SKU: без них payload уходит с пустым
+# логином/ником и API отвечает 400.
+_IMPLICIT_KIND_FIELDS: Dict[str, List[Dict[str, str]]] = {
+    "steam-topup": [{"key": "steam_login", "label": "Логин Steam", "validation": "steam_login"}],
+    "telegram-stars": [{"key": "telegram_username", "label": "Username Telegram (без @)",
+                        "validation": "telegram"}],
+    "telegram-premium": [{"key": "telegram_username", "label": "Username Telegram (без @)",
+                          "validation": "telegram"}],
+    "steam-gifts": [{"key": "invite_url", "label": "Ссылка-приглашение Steam (s.team/p/...)",
+                     "validation": "steam_invite"}],
+}
+
+
+def _implicit_fields_for_kind(kind: Optional[str]) -> List[Dict[str, Any]]:
+    return [dict(f) for f in _IMPLICIT_KIND_FIELDS.get(str(kind or ""), [])]
+
+
+# -----------------------------------------------------------------------------
+# профили категорий (v3.5): под каждый тип товара — свои тексты покупателю
+#
+# Раньше все категории общались одинаково: «укажите данные» и «ваш товар: код».
+# Для пополнения это бессмысленно (кода нет, важен факт зачисления), для
+# гифт-карты нужно объяснить, где активировать, для Steam-подарка — что заявку
+# надо принять. Профиль задаёт: как называется товар, сколько ждать,
+# что сказать после выдачи и о чём предупредить заранее.
+# -----------------------------------------------------------------------------
+_KIND_PROFILES: Dict[str, Dict[str, Any]] = {
+    "giftcards": {
+        "name": "подарочная карта",
+        "eta": "обычно сразу после оплаты",
+        "delivery_note": ("Код активируется на официальном сайте/в приложении сервиса. "
+                          "Проверьте регион карты перед активацией."),
+        "wait_note": "",
+    },
+    "gamekeys": {
+        "name": "ключ игры",
+        "eta": "обычно сразу после оплаты",
+        "delivery_note": ("Активируйте ключ в клиенте (Steam: «Добавить игру» → "
+                          "«Активировать в Steam»). Ключ одноразовый."),
+        "wait_note": "",
+    },
+    "topups": {
+        "name": "пополнение игрового аккаунта",
+        "eta": "от пары минут",
+        "delivery_note": ("Средства зачисляются на указанный аккаунт. "
+                          "Если в игре не видно сразу — перезайдите в неё."),
+        "wait_note": "Проверьте, что ID и сервер указаны верно: отменить пополнение нельзя.",
+    },
+    "steam-topup": {
+        "name": "пополнение Steam",
+        "eta": "от пары минут",
+        "delivery_note": ("Баланс зачислен на указанный аккаунт Steam. "
+                          "Проверьте в клиенте: Steam → имя аккаунта → «Об аккаунте»."),
+        "wait_note": ("Логин Steam должен быть именно логином для входа. "
+                      "Пополнение на чужой аккаунт вернуть нельзя."),
+    },
+    "steam-gifts": {
+        "name": "игра подарком в Steam",
+        "eta": "до нескольких минут",
+        "delivery_note": ("Подарок отправлен по вашей ссылке-приглашению. "
+                          "Примите заявку в друзья и подарок в Steam → «Инвентарь»."),
+        "wait_note": ("Ссылка-приглашение должна быть активна, а в аккаунте — "
+                      "свободное место в списке друзей."),
+    },
+    "telegram-stars": {
+        "name": "звёзды Telegram",
+        "eta": "обычно сразу после оплаты",
+        "delivery_note": "Звёзды зачислены на указанный аккаунт Telegram.",
+        "wait_note": "Username указывайте без @ и проверьте, что он открыт для получения звёзд.",
+    },
+    "telegram-premium": {
+        "name": "Telegram Premium",
+        "eta": "до нескольких минут",
+        "delivery_note": "Подписка активирована на указанном аккаунте Telegram.",
+        "wait_note": "На аккаунте не должно быть активной подписки Premium.",
+    },
+    "manual-services": {
+        "name": "услуга с ручным выполнением",
+        "eta": "выполняется вручную, обычно в течение часа",
+        "delivery_note": "Услуга выполнена. Проверьте результат и напишите, если есть вопросы.",
+        "wait_note": ("Это ручная услуга: исполнитель может уточнить детали, "
+                      "поэтому не закрывайте чат."),
+    },
+}
+
+_KIND_PROFILE_DEFAULT: Dict[str, Any] = {
+    "name": "цифровой товар",
+    "eta": "обычно в течение нескольких минут",
+    "delivery_note": "",
+    "wait_note": "",
+}
+
+
+def _kind_profile(kind: Optional[str]) -> Dict[str, Any]:
+    return _KIND_PROFILES.get(str(kind or ""), _KIND_PROFILE_DEFAULT)
+
+
+def _mapping_display_name(mapping: Optional[Dict[str, Any]]) -> str:
+    """Человеческое название товара для сообщений покупателю."""
+    if not mapping:
+        return "ваш заказ"
+    for key in ("offer_name", "funpay_title"):
+        value = str(mapping.get(key) or "").strip()
+        if value:
+            return value
+    sku = str(mapping.get("fzr_sku_id") or "").strip()
+    return sku or "ваш заказ"
+
+
+def _build_metadata_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
+    kind = mapping.get("category_kind")
+    if not kind:
+        sku = str(mapping.get("fzr_sku_id") or "")
+        kind = sku.split(":", 1)[0] if ":" in sku else ""
+    implicit = _implicit_fields_for_kind(kind)
+
+    def _with_implicit(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Добавляет обязательные для типа поля, если их ещё не спрашивают."""
+        if not implicit:
+            return fields
+        have = {str(f.get("key") or "").lower() for f in fields}
+        missing = [f for f in implicit if f["key"].lower() not in have]
+        # логин мог быть заведён под другим ключом — не дублируем по validation
+        validations = {str(f.get("validation") or "") for f in fields}
+        missing = [f for f in missing if f["validation"] not in validations]
+        return (missing + fields) if missing else fields
+
+    fields = mapping.get("metadata_fields")
+    if fields and isinstance(fields, list):
+        return _with_implicit(_enrich_fields_with_options(fields, mapping))
+    if mapping.get("metadata_key"):
+        key = mapping["metadata_key"]
+        label = mapping.get("metadata_prompt") or key
+        return _with_implicit(_enrich_fields_with_options(
+            [{"key": key, "label": label, "validation": mapping.get("metadata_validation") or _infer_validation(key, label)}],
+            mapping,
+        ))
+    offer_fields = mapping.get("fields") or []
+    if offer_fields and isinstance(offer_fields, list):
+        result: List[Dict[str, Any]] = []
+        for f in offer_fields:
+            key = f.get("code") or f.get("key") or ""
+            label = f.get("name") or f.get("label") or key
+            if not key:
+                continue
+            result.append(_make_metadata_field(key, label, f))
+        return _with_implicit(result)
+    # привязка добавлена вручную по SKU: полей нет, но тип требует логин/ник
+    return [_make_metadata_field(f["key"], f["label"], f) for f in implicit]
+
+
+def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
+                            mapping: Optional[Dict[str, Any]] = None,
+                            index: Optional[int] = None,
+                            total: Optional[int] = None) -> str:
+    """
+    Приглашение покупателю в чат FunPay.
+
+    Кроме названия поля добавляем подсказку про формат («вставьте короткую
+    ссылку s.team/p/…», как в веб-интерфейсе FazerCards) — без неё покупатели
+    присылают ссылку на профиль или e-mail вместо логина, и заказ висит.
+
+    v3.5: если у привязки задан свой шаблон (ask_template), берём его — так
+    для каждой категории можно свой текст. Когда полей несколько, показываем
+    «Шаг 1 из 2» — покупателю видно, что вопрос не последний.
+
+    Осторожно с длиной: Cardinal.split_text режет текст каждые 20 строк, поэтому
+    у select-полей (там уже до 16 строк вариантов) подсказку не добавляем,
+    а счётчик шагов встраиваем в ту же строку.
+    """
+    label = field.get("label") or field.get("key") or "данные"
+    tpl = (mapping or {}).get("ask_template") or cfg["templates"]["ask_metadata"]
+    try:
+        base = render_template(tpl, default=DEFAULT_CONFIG["templates"]["ask_metadata"],
+                               prompt=label,
+                               sku_name=_mapping_display_name(mapping) if mapping else "",
+                               kind_name=_kind_profile((mapping or {}).get("category_kind"))["name"])
+    except Exception:
+        base = f"Для выдачи заказа укажите, пожалуйста: {label}."
+    # несколько полей — показываем прогресс, чтобы покупатель не думал, что всё
+    if index is not None and total and total > 1:
+        base = f"[{index + 1}/{total}] {base}"
+    # select-поле: показываем нумерованный список вариантов, ответ — номер
+    if _is_select_field(field):
+        options_text = _format_select_options(field)
+        if options_text:
+            return (f"{base}\n\n{options_text}\n\n"
+                    f"Отправьте номер нужного варианта (например: 1).")
+        return base
+    hint = _field_hint(field)
+    if hint and cfg["settings"].get("show_field_hints", True):
+        return f"{base}\n\n{hint}"
+    return base
+
+
+def _greeting_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
+                   quantity: int = 1, will_ask: bool = False) -> str:
+    """
+    Приветствие сразу после оплаты.
+
+    Покупатель должен сразу понять три вещи: заказ принят, что именно куплено,
+    сколько ждать. Плюс предупреждение под тип товара (wait_note) — там, где
+    ошибка покупателя необратима (пополнение не на тот аккаунт и т. п.).
+    """
+    profile = _kind_profile((mapping or {}).get("category_kind"))
+    tpl = (mapping or {}).get("greeting_template") or cfg["templates"].get("greeting") or ""
+    if not tpl:
+        return ""
+    name = _mapping_display_name(mapping)
+    try:
+        text = render_template(
+            tpl, default=DEFAULT_CONFIG["templates"]["greeting"],
+            sku_name=name, kind_name=profile["name"], eta=profile["eta"],
+            quantity=quantity, buyer="")
+    except Exception:
+        text = f"Здравствуйте! Заказ принят: {name}."
+    parts = [text]
+    if quantity > 1:
+        parts.append(f"Количество: {quantity} шт.")
+    if will_ask:
+        parts.append("Сейчас задам пару вопросов — ответьте, и я всё оформлю.")
+    note = profile.get("wait_note")
+    if note:
+        parts.append(note)
+    return "\n".join(p for p in parts if p)
+
+
+def _progress_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]]) -> str:
+    """Сообщение «данные получены, оформляю» — чтобы покупатель не ждал молча."""
+    if not cfg["settings"].get("progress_notice", True):
+        return ""
+    profile = _kind_profile((mapping or {}).get("category_kind"))
+    tpl = cfg["templates"].get("progress") or ""
+    if not tpl:
+        return ""
+    try:
+        return render_template(tpl, default=DEFAULT_CONFIG["templates"]["progress"],
+                               eta=profile["eta"], kind_name=profile["name"],
+                               sku_name=_mapping_display_name(mapping))
+    except Exception:
+        return "Спасибо, данные получены. Оформляю заказ."
+
+
+def _delivery_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
+                   codes: List[str], *, fzr_order_id: str = "", funpay_order_id: str = "",
+                   buyer: str = "", sku: str = "",
+                   metadata: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Сообщение о выдаче — с учётом типа товара.
+
+    Ключевое отличие от прежней версии: у пополнений и подписок КОДА НЕТ,
+    и шаблон «Ваш товар: {code}» показывал покупателю прочерк. Теперь:
+      * есть коды  -> отдаём коды + как их активировать (профиль категории);
+      * кодов нет  -> подтверждаем зачисление и куда смотреть,
+                      плюс напоминаем, на какой аккаунт всё ушло.
+    Свой шаблон привязки (delivery_template) всегда в приоритете.
+    """
+    kind = (mapping or {}).get("category_kind")
+    profile = _kind_profile(kind)
+    codes = [str(x) for x in (codes or []) if str(x).strip()]
+    code = "\n".join(codes) if codes else ""
+    own_tpl = (mapping or {}).get("delivery_template")
+
+    if own_tpl:
+        try:
+            return render_template(
+                own_tpl, default=DEFAULT_CONFIG["templates"]["delivery"],
+                code=code or "—", codes=code, fzr_order_id=fzr_order_id,
+                order_number=fzr_order_id,
+                funpay_order_id=funpay_order_id, buyer=buyer, sku=sku,
+                sku_name=_mapping_display_name(mapping), kind_name=profile["name"])
+        except Exception:
+            pass
+
+    parts: List[str] = []
+    if codes:
+        # товар с кодом: код — главное, остальное после
+        try:
+            parts.append(render_template(
+                cfg["templates"]["delivery"],
+                default=DEFAULT_CONFIG["templates"]["delivery"],
+                code=code, codes=code, fzr_order_id=fzr_order_id,
+                order_number=fzr_order_id,
+                funpay_order_id=funpay_order_id, buyer=buyer, sku=sku,
+                sku_name=_mapping_display_name(mapping), kind_name=profile["name"]))
+        except Exception:
+            parts.append(f"Спасибо за покупку!\n\nВаш товар:\n{code}")
+        note = profile.get("delivery_note")
+        if note:
+            parts.append(note)
+    else:
+        # пополнение / подписка / подарок: кода нет, важен факт выполнения
+        parts.append(f"Готово! {_mapping_display_name(mapping)} — выполнено.")
+        note = profile.get("delivery_note")
+        if note:
+            parts.append(note)
+        # на какой аккаунт ушло — снимает половину вопросов «а точно зачислили?»
+        target = _delivered_target_line(mapping, metadata or {})
+        if target:
+            parts.append(target)
+        if fzr_order_id:
+            parts.append(f"Номер заказа: {fzr_order_id}")
+    # v3.17.1: строку «если что-то не так — напишите здесь» убрали по просьбе
+    # продавца: покупатель читает её как приглашение к претензии и реже
+    # подтверждает заказ. Просьба о подтверждении уходит вторым сообщением.
+    # «Спасибо за покупку» добавляем только если его нет в шаблоне выдачи.
+    if "спасибо" not in " ".join(parts).lower():
+        parts.append("Спасибо за покупку!")
+    return "\n\n".join(p for p in parts if p)
+
+
+# какое поле показывать как «куда зачислено» для каждого типа товара
+_TARGET_FIELD_LABELS: Dict[str, str] = {
+    "steam_login": "Аккаунт Steam",
+    "telegram_username": "Аккаунт Telegram",
+    "player_id": "ID игрока",
+    "user_id": "ID игрока",
+    "account_id": "ID аккаунта",
+    "steam_id": "SteamID",
+    "email": "E-mail",
+    "invite_url": "Ссылка-приглашение",
+}
+
+
+def _delivered_target_line(mapping: Optional[Dict[str, Any]],
+                           metadata: Dict[str, Any]) -> str:
+    """Строка «Зачислено на: …» из данных, которые дал покупатель."""
+    if not metadata:
+        return ""
+    for key, label in _TARGET_FIELD_LABELS.items():
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return f"{label}: {value}"
+    # неизвестное поле — берём первое непустое, чтобы не молчать
+    for key, value in metadata.items():
+        text = str(value or "").strip()
+        if text:
+            return f"{key}: {text}"
+    return ""
+
+
+# -----------------------------------------------------------------------------
+# security / privacy helpers
+# -----------------------------------------------------------------------------
+_SENSITIVE_KEYS = {"api_key", "token", "secret", "password", "passwd", "authorization", "x-api-key", "api-key", "apikey"}
+
+_SENSITIVE_STRING_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key|apikey|token|secret|password|passwd|authorization|x-api-key|bearer|cookie|set-cookie)\s*[=:]\s*[^\s&\"\']+", re.IGNORECASE),
+]
+
+
+def _redact_sensitive(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _redact_sensitive(v) if k.lower() not in _SENSITIVE_KEYS else "***" for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_sensitive(v) for v in obj]
+    if isinstance(obj, str):
+        return _redact_string_patterns(obj)
+    return obj
+
+
+def _redact_string_patterns(s: str) -> str:
+    out = s
+    for pat in _SENSITIVE_STRING_PATTERNS:
+        out = pat.sub(lambda m: f"{m.group(1)}=***", out)
+    # redact long base64-like values after known sensitive keys in query strings
+    out = re.sub(
+        r"(?i)([?&](?:api[_-]?key|apikey|token|secret|password|authorization)=)([A-Za-z0-9+/]{32,}=*)",
+        r"\1***",
+        out,
+    )
+    return out
+
+
+def _fmt_minutes(value: Any) -> str:
+    """Минуты в человеческий вид: 45 мин, 2 ч, 1 д 6 ч."""
+    try:
+        minutes = int(float(value or 0))
+    except (TypeError, ValueError):
+        return "—"
+    if minutes <= 0:
+        return "выключено"
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} ч" + (f" {mins} мин" if mins else "")
+    days, hours = divmod(hours, 24)
+    return f"{days} д" + (f" {hours} ч" if hours else "")
+
+
+def _mask_api_key(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "***"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _set_private_file(path: str) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+_METRICS_FILE = os.path.join(BASE_CACHE_DIR, "metrics.json")
+_METRICS: Dict[str, Any] = {}
+_METRICS_LOCK = threading.Lock()
+
+
+def _metrics_file() -> str:
+    return os.path.join(os.path.dirname(CONFIG_FILE) or BASE_CACHE_DIR, "metrics.json")
+
+
+def _load_metrics() -> None:
+    global _METRICS
+    path = _metrics_file()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                _METRICS = json.load(f)
+        else:
+            _METRICS = {}
+    except Exception:
+        _METRICS = {}
+    for key in ("orders_received", "orders_matched", "orders_created", "orders_delivered",
+                "orders_failed", "delivery_failures", "api_errors"):
+        if key not in _METRICS:
+            _METRICS[key] = 0
+
+
+def _save_metrics() -> None:
+    path = _metrics_file()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp"
+        with _FILES_LOCK:
+            with open(tmp, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as f:
+                json.dump(_METRICS, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            _set_private_file(path)
+    except Exception as e:
+        logger.warning("save metrics failed", extra={"error": repr(e)})
+
+
+def _inc_metric(key: str, value: int = 1) -> None:
+    with _METRICS_LOCK:
+        _METRICS[key] = _METRICS.get(key, 0) + value
+        _save_metrics()
+
+
+def _get_metrics() -> Dict[str, Any]:
+    with _METRICS_LOCK:
+        return dict(_METRICS)
+
+
+def _html_unescape(s: Optional[str]) -> str:
+    if s is None:
+        return ""
+    return html.unescape(str(s))
+
+
+def _catalog_arg(**kwargs: Any) -> str:
+    return json.dumps(kwargs, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _catalog_parse(arg: str) -> Dict[str, Any]:
+    if not arg:
+        return {}
+    try:
+        return json.loads(arg)
+    except Exception:
+        return {}
+
+
+def _catalog_kind_label(kind: str) -> str:
+    labels = {
+        "giftcards": "🎁 Gift Cards",
+        "gamekeys": "🎮 Game Keys",
+        "topups": "💎 Top-ups",
+        "manual-services": "🛠 Manual Services",
+        "steam-gifts": "🎁 Steam Gifts",
+        "steam-topup": "💳 Пополнить Steam",
+        "telegram-stars": "⭐ Telegram Stars",
+        "telegram-premium": "👑 Telegram Premium",
+    }
+    return labels.get(kind, kind)
+
+
+def _normalize_catalog_page(
+    kind: str,
+    page: Dict[str, Any],
+    is_categories: bool,
+    cursor: Optional[str] = None,
+    edition_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    page = page or {}
+    items: List[Dict[str, Any]] = []
+    next_cursor: Optional[str] = None
+    fields: List[Dict[str, Any]] = []
+    offset = 0
+    if cursor:
+        try:
+            offset = int(cursor)
+        except (TypeError, ValueError):
+            pass
+    if is_categories:
+        if kind == "steam-gifts":
+            raw = page.get("games", [])
+            for it in raw:
+                items.append({"id": str(it.get("appid")), "name": _html_unescape(it.get("name", "—")), "appid": it.get("appid")})
+            meta = page.get("meta", {})
+            total = meta.get("total") or len(raw)
+            if meta.get("truncated") or (offset + len(raw) < total):
+                next_cursor = str(offset + len(raw))
+        else:
+            raw = page.get("items", [])
+            for it in raw:
+                cid = it.get("category_id") or it.get("game_id") or it.get("id")
+                name = _html_unescape(it.get("name", "—"))
+                note = _html_unescape(it.get("note") or "")
+                if kind == "gamekeys" and (it.get("region") or it.get("platform")):
+                    extra = " / ".join([_html_unescape(x) for x in [it.get("platform"), it.get("region")] if x])
+                    if extra:
+                        name = f"{name} ({extra})"
+                if note:
+                    name = f"{name} — {note}"[:120]
+                items.append({"id": str(cid) if cid is not None else "", "name": name})
+            meta = page.get("meta", {})
+            next_cursor = meta.get("next_cursor")
+    else:
+        if kind == "giftcards":
+            raw = page.get("offers", [])
+        elif kind == "gamekeys":
+            raw = page.get("keys", [])
+        elif kind == "topups":
+            raw = page.get("offers", [])
+            fields = page.get("fields", [])
+        elif kind == "manual-services":
+            raw = page.get("items", [])
+            fields = page.get("fields", [])
+        elif kind == "steam-gifts":
+            raw = page.get("offers", [])
+            if edition_id is None:
+                seen: Set[str] = set()
+                for offer in raw:
+                    sub_id = offer.get("sub_id")
+                    if sub_id is None or str(sub_id) in seen:
+                        continue
+                    seen.add(str(sub_id))
+                    offer_name = _html_unescape(offer.get("name", "—"))
+                    items.append({
+                        "id": str(sub_id),
+                        "name": offer_name,
+                        "price_usd": "—",
+                        "min_quantity": 1,
+                        "max_quantity": 1,
+                        "type": "edition",
+                    })
+            else:
+                for offer in raw:
+                    if str(offer.get("sub_id")) != str(edition_id):
+                        continue
+                    offer_name = _html_unescape(offer.get("name", "—"))
+                    for reg in offer.get("regions", []):
+                        region = _html_unescape(reg.get("region", "—"))
+                        price = reg.get("price", "—")
+                        items.append({
+                            "id": f"{offer.get('sub_id')}:{region}",
+                            "name": f"{offer_name} ({region})",
+                            "price_usd": price,
+                            "min_quantity": 1,
+                            "max_quantity": 1,
+                            "fields": [{"key": "invite_url", "label": "Ссылка-приглашение Steam",
+                                        "type": "input", "validation": "steam_invite"}],
+                        })
+            raw = []
+        elif kind == "steam-topup":
+            rates = page.get("rates", {}) or {}
+            fields = [{"key": "steam_login", "label": "Логин Steam",
+                       "type": "input", "validation": "steam_login"}]
+            for currency, rate in rates.items():
+                try:
+                    r = float(rate)
+                    price = round(1.0 / r, 6) if r else 0.0
+                except (TypeError, ValueError):
+                    price = 0.0
+                items.append({
+                    "id": currency,
+                    "name": f"Steam Top-up {currency}",
+                    "price_usd": str(price),
+                    "min_quantity": 1,
+                    "max_quantity": 1000000,
+                    "fields": fields,
+                })
+            raw = []
+        elif kind == "telegram-stars":
+            fields = [{"key": "telegram_username", "label": "Telegram username", "type": "input", "validation": "telegram"}]
+            items.append({
+                "id": "stars",
+                "name": "Telegram Stars",
+                "price_usd": page.get("price_per_star", "—"),
+                "min_quantity": page.get("min_amount", 50),
+                "max_quantity": page.get("max_amount", 10000),
+                "fields": fields,
+            })
+            raw = []
+        elif kind == "telegram-premium":
+            fields = [{"key": "telegram_username", "label": "Telegram username", "type": "input", "validation": "telegram"}]
+            for plan in page.get("plans", []):
+                months = plan.get("months")
+                if months is None:
+                    continue
+                items.append({
+                    "id": str(months),
+                    "name": f"Telegram Premium {months} мес.",
+                    "price_usd": plan.get("price_usd", "—"),
+                    "min_quantity": 1,
+                    "max_quantity": 1,
+                    "fields": fields,
+                })
+            raw = []
+        else:
+            raw = []
+        if raw:
+            for it in raw:
+                oid = it.get("card_id") or it.get("key_id") or it.get("offer_id") or it.get("id")
+                if oid is None:
+                    continue
+                name = _html_unescape(it.get("name", "—"))
+                price = it.get("price_usd", "—")
+                stock = it.get("stock")
+                min_q = it.get("min_quantity") or it.get("min_order_quantity") or 1
+                max_q = it.get("max_quantity") or it.get("max_order_quantity") or 100
+                item: Dict[str, Any] = {
+                    "id": str(oid),
+                    "name": name,
+                    "price_usd": price,
+                    "stock": stock,
+                    "min_quantity": min_q,
+                    "max_quantity": max_q,
+                }
+                if fields:
+                    item["fields"] = fields
+                items.append(item)
+        next_cursor = page.get("meta", {}).get("next_cursor")
+    return {"items": items, "next_cursor": next_cursor, "fields": fields}
+
+
+def _prune_catalog_cache(now: float) -> None:
+    # evict expired first, then oldest by LRU insertion/access order
+    expired = [k for k, (ts, _) in _CATALOG_CACHE.items() if now - ts > _CATALOG_CACHE_TTL]
+    for k in expired:
+        _CATALOG_CACHE.pop(k, None)
+    while len(_CATALOG_CACHE) > _CATALOG_CACHE_MAX_SIZE:
+        _CATALOG_CACHE.popitem(last=False)
+
+
+_STEAM_GIFTS_PAGE_SIZE = 10000
+
+
+def _save_steam_gifts_full_catalog(data: List[Dict[str, Any]]) -> None:
+    try:
+        path = CATALOG_CACHE_FILE
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp"
+        payload = {"ts": time.time(), "items": data}
+        with _FILES_LOCK:
+            with open(tmp, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o666)) as f:
+                json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o666)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("save steam-gifts catalog cache failed", extra={"error": repr(e)})
+
+
+def _load_steam_gifts_full_catalog_from_disk() -> Optional[Tuple[float, List[Dict[str, Any]]]]:
+    try:
+        path = CATALOG_CACHE_FILE
+        if not path or not os.path.exists(path):
+            return None
+        mtime = os.path.getmtime(path)
+        with _FILES_LOCK:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            return None
+        return (mtime, items)
+    except Exception as e:
+        logger.warning("load steam-gifts catalog cache failed", extra={"error": repr(e)})
+        return None
+
+
+def _load_steam_gifts_full_catalog(api: "FazerCardsAPI", allow_stale: bool = False) -> List[Dict[str, Any]]:
+    global _STEAM_GIFTS_FULL_CATALOG
+    with _STEAM_GIFTS_FULL_LOCK:
+        if _STEAM_GIFTS_FULL_CATALOG is not None:
+            ts, data = _STEAM_GIFTS_FULL_CATALOG
+            if time.time() - ts < _STEAM_GIFTS_FULL_TTL:
+                return data
+    disk = _load_steam_gifts_full_catalog_from_disk()
+    if disk is not None:
+        ts, data = disk
+        if allow_stale or time.time() - ts < _STEAM_GIFTS_FULL_TTL:
+            with _STEAM_GIFTS_FULL_LOCK:
+                _STEAM_GIFTS_FULL_CATALOG = (ts, data)
+            return data
+    page = api.get_categories("steam-gifts", limit=0)
+    norm = _normalize_catalog_page("steam-gifts", page, True)
+    full = norm.get("items", [])
+    with _STEAM_GIFTS_FULL_LOCK:
+        _STEAM_GIFTS_FULL_CATALOG = (time.time(), full)
+    _save_steam_gifts_full_catalog(full)
+    return full
+
+
+def _prefetch_steam_gifts_catalog() -> None:
+    try:
+        cfg = load_config()
+        if not cfg.get("api_key"):
+            return
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        _load_steam_gifts_full_catalog(api, allow_stale=True)
+        logger.info("steam-gifts full catalog prefetched", extra={"count": len(_STEAM_GIFTS_FULL_CATALOG[1]) if _STEAM_GIFTS_FULL_CATALOG else 0})
+    except Exception as e:
+        logger.warning("steam-gifts catalog prefetch failed", extra={"error": repr(e)})
+
+
+def _get_catalog_page(
+    api: "FazerCardsAPI",
+    kind: str,
+    category_id: Optional[str] = None,
+    cursor: Optional[str] = None,
+    limit: int = 20,
+    edition_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = time.time()
+    if kind == "steam-gifts" and category_id is None:
+        offset = 0
+        if cursor:
+            try:
+                offset = int(cursor)
+            except (TypeError, ValueError):
+                pass
+        try:
+            full = _load_steam_gifts_full_catalog(api)
+        except Exception as e:
+            logger.warning("steam-gifts full catalog load failed", extra={"error": repr(e)})
+            return {"items": [], "next_cursor": None, "fields": []}
+        page_limit = min(limit, _STEAM_GIFTS_PAGE_SIZE)
+        sliced = full[offset:offset + page_limit]
+        result = {"items": sliced, "fields": [], "next_cursor": None}
+        if offset + page_limit < len(full):
+            result["next_cursor"] = str(offset + page_limit)
+        return result
+    key = (kind, category_id, cursor, limit, edition_id)
+    with _CATALOG_CACHE_LOCK:
+        _prune_catalog_cache(now)
+        entry = _CATALOG_CACHE.get(key)
+        if entry and now - entry[0] < _CATALOG_CACHE_TTL:
+            _CATALOG_CACHE.move_to_end(key)
+            return entry[1]
+    if category_id is None:
+        page = api.get_categories(kind, cursor, limit)
+    else:
+        page = api.get_offers(kind, category_id, cursor=cursor)
+    norm = _normalize_catalog_page(kind, page, category_id is None, cursor=cursor, edition_id=edition_id)
+    with _CATALOG_CACHE_LOCK:
+        _prune_catalog_cache(now)
+        _CATALOG_CACHE[key] = (now, norm)
+    return norm
+
+
+
+# =============================================================================
+# Lot creation helpers (adapted from Lots Manager plugin)
+# =============================================================================
+_FZR_CATS_CACHE = {"ts": 0.0, "cats": [], "subcats": []}
+_FZR_CATS_LOCK = threading.Lock()
+_FZR_CATS_PER_PAGE = 8
+_FZR_SUBCATS_PER_PAGE = 8
+_FZR_CATS_CACHE_TTL = 600
+
+_SEARCH_PER_PAGE = 8
+_SEARCH_MAX_CATALOG_PAGES = 100
+_CUSTOM_OPTIONS_PER_PAGE = 10
+
+
+def _screen_data(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Где хранить id экрана мастера.
+
+    Мастер и поиск/каталог должны редактировать ОДНО сообщение, иначе после
+    «поиск → выбор товара → подтверждение» в чате остаётся 3-4 экрана. Для
+    состояния поиска отдаём словарь спрятанного мастера, если он есть.
+    """
+    if not isinstance(state, dict):
+        return None
+    if state.get("state") == "search":
+        saved = (state.get("data") or {}).get("wizard")
+        if isinstance(saved, dict) and isinstance(saved.get("data"), dict):
+            return saved["data"]
+    data = state.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _fzr_reply(c: "Cardinal", target: Any, text: str, kb: Optional[InlineKeyboardMarkup] = None,
+               state: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Показать экран мастера.
+
+    v3.15: мастер живёт ОДНИМ сообщением. Раньше каждый шаг отправлял новое
+    сообщение, и после 8 шагов чат ПУ был завален «✅ Сохранено», «💰 Цена
+    лота», обрывками вопросов. Теперь id экрана хранится в состоянии мастера
+    и следующий шаг редактирует его же.
+    """
+    if kb is None:
+        kb = _cancel_kb()
+    data = _screen_data(state)
+
+    # v3.15: короткие отметки «сохранено / ошибка» показываем ВНУТРИ экрана
+    # мастера, а не отдельными сообщениями — иначе чат ПУ забивается мусором.
+    if isinstance(data, dict):
+        ack = data.pop("ack", None)
+        if ack:
+            text = f"{ack}\n\n{text}"
+    # приходим либо от callback (есть call.message), либо от текстового сообщения
+    if target and getattr(target, "message", None):
+        _send_or_edit(c, target, text, kb=kb)
+        if isinstance(data, dict):
+            msg_id = getattr(getattr(target, "message", None), "message_id", None)
+            if msg_id:
+                data["screen_msg_id"] = msg_id
+                data["screen_chat_id"] = target.message.chat.id
+        return
+
+    chat_id = getattr(getattr(target, "chat", None), "id", None)
+    screen_id = (data or {}).get("screen_msg_id")
+    screen_chat = (data or {}).get("screen_chat_id") or chat_id
+    if screen_id and screen_chat and getattr(c, "telegram", None):
+        try:
+            c.telegram.bot.edit_message_text(
+                text if len(text) <= 4096 else text[:4090] + "\n<i>(…)</i>",
+                screen_chat, screen_id, reply_markup=kb,
+                parse_mode="HTML", disable_web_page_preview=True)
+            return
+        except Exception as e:
+            descr = str(getattr(e, "description", "")) or str(e)
+            if "message is not modified" in descr:
+                return
+            # сообщение удалено/устарело — отправим новое ниже
+            logger.debug("wizard screen edit failed", extra={"error": repr(e)})
+    sent = _send_telegram_message(c, chat_id, text, reply_to=None, kb=kb)
+    if isinstance(data, dict) and sent is not None:
+        new_id = getattr(sent, "message_id", None)
+        if new_id:
+            data["screen_msg_id"] = new_id
+            data["screen_chat_id"] = chat_id
+
+
+# -----------------------------------------------------------------------------
+# v3.15: навигация по мастеру создания лота
+# -----------------------------------------------------------------------------
+
+def _wizard_state(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Активный мастер создания лота этого пользователя или None."""
+    if user_id is None:
+        return None
+    state = get_state(user_id)
+    if state and state.get("state") in _WIZARD_STATES:
+        return state
+    # во время выбора SKU в каталоге/поиске состояние может быть search —
+    # тогда мастер лежит в его данных (см. _fzr_search_prompt)
+    if state and state.get("state") == "search":
+        saved = (state.get("data") or {}).get("wizard")
+        if isinstance(saved, dict) and saved.get("state") in _WIZARD_STATES:
+            return saved
+    return None
+
+
+def _wizard_back_button(state: Optional[Dict[str, Any]]) -> Optional[Any]:
+    """
+    Кнопка «Назад» на предыдущий шаг мастера.
+
+    Возвращает None на первом шаге: вести «назад» некуда, а кнопка, которая
+    ничего не делает, воспринимается как сломанная (см. баг с каталогом).
+    """
+    if not state:
+        return None
+    if _wizard_prev_step(state) is None:
+        return None
+    return _inline_button("⬅️ Назад", callback_data=f"{CB_PREFIX}:create_lot_back")
+
+
+def _wizard_prev_step(state: Dict[str, Any]) -> Optional[str]:
+    """
+    Предыдущий ПРОЙДЕННЫЙ шаг мастера с учётом пропусков.
+
+    Пропускаем: доп. поля (если их нет), «Наличие» (если поля нет в форме),
+    названия/описания EN (если продавец пропустил название целиком).
+    """
+    data = state.get("data") or {}
+    step = state.get("state")
+    seen = 0
+    while step and seen < len(_WIZARD_PREV) + 2:
+        seen += 1
+        prev = _WIZARD_PREV.get(step)
+        if prev is None:
+            return None
+        if prev == "create_lot_custom" and not (data.get("custom_fields") or []):
+            step = prev
+            continue
+        if prev == "create_lot_amount" and not _fzr_needs_amount(data):
+            step = prev
+            continue
+        if prev in ("create_lot_title_en", "create_lot_title_ru") and data.get("title_skipped"):
+            step = prev
+            continue
+        return prev
+    return None
+
+
+def _fzr_wizard_back(c: "Cardinal", call: Any) -> None:
+    """Кнопка «⬅️ Назад» внутри мастера создания лота."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") not in _WIZARD_STATES:
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    prev = _wizard_prev_step(state)
+    if prev is None:
+        # первый шаг: возвращаем к выбору подкатегории
+        _fzr_start_create_lot(c, call)
+        return
+    data = state["data"]
+    if prev == "create_lot_custom":
+        # возвращаемся на ПОСЛЕДНЕЕ доп. поле, а не на первое
+        fields = data.get("custom_fields") or []
+        data["current_field_idx"] = max(0, len(fields) - 1)
+    state["state"] = prev
+    # правка «Наличия» из подтверждения больше не должна возвращать в подтверждение
+    data.pop("return_to_confirm", None)
+    logger.info("wizard back", extra={"user_id": user_id, "to": prev})
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_wizard_resume(c: "Cardinal", call: Any) -> None:
+    """
+    Возврат в мастер из каталога/поиска («🔙 К созданию лота»).
+
+    Если мастер был спрятан в состоянии поиска — восстанавливаем его.
+    """
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if state and state.get("state") == "search":
+        saved = (state.get("data") or {}).get("wizard")
+        if isinstance(saved, dict) and saved.get("state") in _WIZARD_STATES:
+            set_state(user_id, saved["state"], saved.get("data") or {})
+            state = get_state(user_id)
+    if not state or state.get("state") not in _WIZARD_STATES:
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_delete_message(c: "Cardinal", message: Any) -> None:
+    """
+    Удаляет сообщение продавца после того, как шаг мастера принят.
+
+    Зачем: мастер из 8 шагов оставляет в чате ПУ гору «Steam Top-up RUB», «100»,
+    «9999» — читать историю невозможно. Экран мастера при этом живёт как одно
+    редактируемое сообщение.
+    """
+    if not getattr(c, "telegram", None):
+        return
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+    try:
+        c.telegram.bot.delete_message(chat_id, message_id)
+    except Exception as e:
+        # у бота может не быть права удалять сообщения — это не критично
+        logger.debug("delete_message failed", extra={"error": repr(e)})
+
+
+def _fzr_refresh_categories_cache(c: "Cardinal", force: bool = False) -> bool:
+    try:
+        with _FZR_CATS_LOCK:
+            if not force and (time.time() - _FZR_CATS_CACHE["ts"]) < _FZR_CATS_CACHE_TTL:
+                return True
+            sorted_subs = c.account.get_sorted_subcategories()
+            cats_dict: Dict[int, Dict[str, Any]] = {}
+            subcats_list: List[Dict[str, Any]] = []
+            for stype, subs in sorted_subs.items():
+                for sid, sub in subs.items():
+                    cat = sub.category
+                    if cat.id not in cats_dict:
+                        cats_dict[cat.id] = {
+                            "id": cat.id,
+                            "name": cat.name,
+                            "position": cat.position,
+                            "subcategories": [],
+                        }
+                    sub_info = {
+                        "id": sub.id,
+                        "name": sub.name,
+                        "type": stype.name,
+                        "category_id": cat.id,
+                        "category_name": cat.name,
+                        "fullname": sub.fullname,
+                        "is_common": sub.is_common,
+                    }
+                    cats_dict[cat.id]["subcategories"].append(sub_info)
+                    subcats_list.append(sub_info)
+            cats_list = sorted(cats_dict.values(), key=lambda x: (x["position"], x["name"]))
+            _FZR_CATS_CACHE["cats"] = cats_list
+            _FZR_CATS_CACHE["subcats"] = subcats_list
+            _FZR_CATS_CACHE["ts"] = time.time()
+            logger.info(f"Кэш категорий обновлён: {len(cats_list)} игр, {len(subcats_list)} подкатегорий.")
+            return True
+    except Exception as e:
+        logger.error("_fzr_refresh_categories_cache failed", extra={"error": _redact_sensitive(str(e))})
+        return False
+
+
+def _fzr_get_categories_list(c: "Cardinal") -> List[Dict[str, Any]]:
+    if _FZR_CATS_CACHE["ts"] == 0.0 or (time.time() - _FZR_CATS_CACHE["ts"]) > _FZR_CATS_CACHE_TTL:
+        _fzr_refresh_categories_cache(c)
+    return _FZR_CATS_CACHE.get("cats", [])
+
+
+def _fzr_get_subcategories_by_cat(c: "Cardinal", cat_id: int) -> List[Dict[str, Any]]:
+    cats = _fzr_get_categories_list(c)
+    for cat in cats:
+        if cat["id"] == cat_id:
+            return [s for s in cat["subcategories"] if s["is_common"]]
+    return []
+
+
+def _fzr_categories_kb(c: "Cardinal", page: int = 0) -> InlineKeyboardMarkup:
+    cats = _fzr_get_categories_list(c)
+    per_page = _FZR_CATS_PER_PAGE
+    total = max(1, (len(cats) + per_page - 1) // per_page)
+    page = max(0, min(page, total - 1))
+    start = page * per_page
+    page_cats = cats[start:start + per_page]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for cat in page_cats:
+        cb = _pack_callback_data(f"{CB_PREFIX}:lotcat:{cat['id']}:{page}")
+        kb.add(_inline_button(f"🎮 {cat['name']}", callback_data=cb))
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcat_page:{page - 1}")))
+    nav.append(_inline_button(f"{page + 1}/{total}", callback_data=f"{CB_PREFIX}:noop"))
+    if page < total - 1:
+        nav.append(_inline_button("➡️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcat_page:{page + 1}")))
+    if nav:
+        kb.add(*nav)
+    kb.add(_search_button("lot_categories", {}))
+    kb.add(_inline_button("🔙 Назад", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _fzr_subcategories_kb(c: "Cardinal", cat_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    subs = _fzr_get_subcategories_by_cat(c, cat_id)
+    per_page = _FZR_SUBCATS_PER_PAGE
+    total = max(1, (len(subs) + per_page - 1) // per_page)
+    page = max(0, min(page, total - 1))
+    start = page * per_page
+    page_subs = subs[start:start + per_page]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for sub in page_subs:
+        cb = _pack_callback_data(f"{CB_PREFIX}:lotsub:{sub['id']}:{page}")
+        kb.add(_inline_button(f"📂 {sub['name']}", callback_data=cb))
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotsub_page:{cat_id}:{page - 1}")))
+    nav.append(_inline_button(f"{page + 1}/{total}", callback_data=f"{CB_PREFIX}:noop"))
+    if page < total - 1:
+        nav.append(_inline_button("➡️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotsub_page:{cat_id}:{page + 1}")))
+    if nav:
+        kb.add(*nav)
+    kb.add(_search_button("lot_subcategories", {"cat_id": cat_id}))
+    kb.add(_inline_button("🔙 К категориям", callback_data=f"{CB_PREFIX}:create_lot"))
+    return kb
+
+
+def _search_button(mode: str, context: Dict[str, Any], label: str = "🔍 Поиск") -> Any:
+    payload = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    return _inline_button(label, callback_data=_pack_callback_data(f"{CB_PREFIX}:search:{mode}:{payload}"))
+
+
+def _fzr_fetch_all_catalog_items(
+    api: "FazerCardsAPI",
+    kind: str,
+    category_id: Optional[str],
+    max_pages: int = _SEARCH_MAX_CATALOG_PAGES,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if kind == "steam-gifts" and category_id is None:
+        return _load_steam_gifts_full_catalog(api)
+    if limit is None:
+        limit = 10000 if kind == "steam-gifts" else 200
+    items: List[Dict[str, Any]] = []
+    cursor = None
+    for _ in range(max_pages):
+        page = _get_catalog_page(api, kind, category_id, cursor, limit=limit)
+        items.extend(page.get("items", []))
+        cursor = page.get("next_cursor")
+        if not cursor:
+            break
+    return items
+
+
+def _fzr_filter_items(items: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    q = query.strip().lower()
+    if not q:
+        return items
+    def _match(it: Dict[str, Any]) -> bool:
+        hay = " ".join(
+            str(it.get(k) or "") for k in ("name", "region", "platform", "note", "category_name")
+        ).lower()
+        return q in hay
+    return [it for it in items if _match(it)]
+
+
+def _fzr_search_prompt(c: "Cardinal", call: Any, mode: str, context: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    # v3.15: если идёт мастер создания лота — прячем его в состояние поиска и
+    # возвращаем после выбора товара. Иначе (баг v3.14) плагин «забывал», что
+    # создаёт лот, и после выбора SKU спрашивал ID существующего лота FunPay.
+    wizard: Optional[Dict[str, Any]] = None
+    prev = get_state(user_id) if user_id else None
+    if prev and prev.get("state") in _WIZARD_STATES:
+        wizard = {"state": prev["state"], "data": prev.get("data") or {}}
+    elif prev and prev.get("state") == "search":
+        saved = (prev.get("data") or {}).get("wizard")
+        if isinstance(saved, dict) and saved.get("state") in _WIZARD_STATES:
+            wizard = saved
+    set_state(user_id, "search", {"mode": mode, "context": context, "query": None,
+                                  "page": 0, "wizard": wizard})
+    labels = {
+        "catalog_global": "каталог",
+        "catalog_categories": "подкатегорию",
+        "catalog_offers": "товар",
+        "lot_categories": "игру",
+        "lot_subcategories": "подкатегорию",
+    }
+    target = labels.get(mode, "элемент")
+    hint = ""
+    kb = InlineKeyboardMarkup(row_width=1)
+    if wizard is not None:
+        hint = "\n\n<i>Создание лота продолжается — выбранный товар подставится в него.</i>"
+        kb.add(_inline_button("🔙 К созданию лота",
+                              callback_data=f"{CB_PREFIX}:create_lot_back_to_wizard"))
+    else:
+        kb.add(_inline_button("🔙 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, f"🔍 <b>Поиск {target}</b>\n\nВведите название (или часть) для поиска:{hint}",
+                  kb=kb)
+
+
+def _fzr_show_search_results(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    data = state["data"]
+    mode = data["mode"]
+    ctx = data["context"]
+    query = data.get("query") or ""
+    page = max(0, data.get("page", 0))
+
+    cfg = load_config()
+    items: List[Dict[str, Any]] = []
+    try:
+        is_steam_gifts_appid = (
+            query.strip().isdigit()
+            and (mode in ("catalog_global", "catalog_categories"))
+            and (mode == "catalog_global" or ctx.get("kind") == "steam-gifts")
+        )
+        if is_steam_gifts_appid:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            appid = query.strip()
+            try:
+                offers_resp = api.get_offers("steam-gifts", appid)
+                offers = offers_resp.get("offers", [])
+                game_name = _html_unescape(offers[0].get("name", "—")) if offers else "—"
+                items = [{"id": appid, "name": game_name, "kind": "steam-gifts", "category_name": game_name}]
+            except Exception as e:
+                logger.warning("steam-gifts appid lookup failed", extra={"appid": appid, "error": repr(e)})
+                items = []
+        elif mode == "catalog_global":
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            all_kinds = ["gamekeys", "steam-gifts", "steam-topup", "giftcards", "topups", "manual-services", "telegram-stars", "telegram-premium"]
+            for k in all_kinds:
+                try:
+                    fetched = _fzr_fetch_all_catalog_items(api, k, None)
+                except Exception as e:
+                    logger.warning("search global kind failed", extra={"kind": k, "error": repr(e)})
+                    fetched = []
+                for it in fetched:
+                    it = dict(it)
+                    it["kind"] = k
+                    items.append(it)
+        elif mode == "catalog_categories":
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            items = _fzr_fetch_all_catalog_items(api, ctx["kind"], None)
+        elif mode == "catalog_offers":
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            items = _fzr_fetch_all_catalog_items(api, ctx["kind"], ctx["category_id"])
+        elif mode == "lot_categories":
+            items = _fzr_get_categories_list(c)
+        elif mode == "lot_subcategories":
+            items = _fzr_get_subcategories_by_cat(c, ctx["cat_id"])
+    except Exception as e:
+        logger.exception("search load items failed", extra={"mode": mode, "error": repr(e)})
+        _send_or_edit(c, target, f"❌ Ошибка загрузки списка: {_esc(e)}", kb=_main_keyboard())
+        return
+
+    filtered = _fzr_filter_items(items, query)
+    total = max(1, (len(filtered) + _SEARCH_PER_PAGE - 1) // _SEARCH_PER_PAGE)
+    page = min(page, total - 1)
+    start = page * _SEARCH_PER_PAGE
+    page_items = filtered[start:start + _SEARCH_PER_PAGE]
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    wiz_active = _wizard_state(getattr(getattr(target, "from_user", None), "id", None)) is not None
+    if not page_items:
+        kb.add(_inline_button("🔍 Искать заново", callback_data=_pack_callback_data(f"{CB_PREFIX}:search:{mode}:{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}")))
+        if wiz_active:
+            kb.add(_inline_button("🔙 К созданию лота",
+                                  callback_data=f"{CB_PREFIX}:create_lot_back_to_wizard"))
+        else:
+            kb.add(_inline_button("🔙 Назад", callback_data=f"{CB_PREFIX}:menu"))
+        _fzr_reply(c, target, f"🔍 <b>Ничего не найдено по запросу</b> <code>{_esc(query)}</code>.",
+                   kb=kb, state=state)
+        return
+
+    for it in page_items:
+        kind = it.get("kind") or ctx.get("kind")
+        if mode in ("catalog_categories", "catalog_global"):
+            cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=it['id'], category_name=it['name'])}")
+            kb.add(_inline_button(f"📂 {_catalog_kind_label(kind)}: {_esc(it['name'])}", callback_data=cb))
+        elif mode == "catalog_offers":
+            if kind == "steam-gifts" and it.get("type") == "edition":
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=ctx['category_id'], category_name=ctx.get('category_name') or '—', edition_id=it['id'], edition_name=it['name'])}")
+                kb.add(_inline_button(f"📦 {_esc(it['name'])}", callback_data=cb))
+            else:
+                price = _esc(str(it.get('price_usd') or '—'))
+                suffix = f" | stock {it['stock']}" if it.get('stock') is not None else ""
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog_select:{_catalog_arg(kind=kind, category_id=ctx['category_id'], offer_id=it['id'], offer_name=it['name'], price_usd=str(it.get('price_usd') or ''), fields=it.get('fields') or [], stock=it.get('stock'), min_quantity=it.get('min_quantity'), max_quantity=it.get('max_quantity'))}")
+                kb.add(_inline_button(f"🛒 {_esc(it['name'])} — 💵 {price} USD{suffix}", callback_data=cb))
+        elif mode == "lot_categories":
+            cb = _pack_callback_data(f"{CB_PREFIX}:lotcat:{it['id']}:0")
+            kb.add(_inline_button(f"🎮 {_esc(it['name'])}", callback_data=cb))
+        elif mode == "lot_subcategories":
+            cb = _pack_callback_data(f"{CB_PREFIX}:lotsub:{it['id']}:0")
+            kb.add(_inline_button(f"📂 {_esc(it['name'])}", callback_data=cb))
+
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=f"{CB_PREFIX}:search_page:-1"))
+    nav.append(_inline_button(f"{page + 1}/{total}", callback_data=f"{CB_PREFIX}:noop"))
+    if page < total - 1:
+        nav.append(_inline_button("➡️", callback_data=f"{CB_PREFIX}:search_page:1"))
+    if nav:
+        kb.add(*nav)
+    if mode == "catalog_global":
+        back_cb = _pack_callback_data(f"{CB_PREFIX}:catalog:")
+    elif mode == "catalog_categories":
+        back_cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=ctx.get('kind'))}")
+    elif mode == "catalog_offers":
+        back_cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=ctx.get('kind'), category_id=ctx.get('category_id'), category_name=ctx.get('category_name') or '—')}")
+    elif mode == "lot_categories":
+        back_cb = f"{CB_PREFIX}:create_lot"
+    elif mode == "lot_subcategories":
+        back_cb = _pack_callback_data(f"{CB_PREFIX}:lotcat:{ctx.get('cat_id')}:0")
+    else:
+        back_cb = f"{CB_PREFIX}:menu"
+    kb.add(_inline_button("🔍 Искать заново", callback_data=_pack_callback_data(f"{CB_PREFIX}:search:{mode}:{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}")))
+    nav2 = [_inline_button("🔙 Назад", callback_data=back_cb)]
+    if wiz_active:
+        nav2.append(_inline_button("📝 К созданию лота",
+                                   callback_data=f"{CB_PREFIX}:create_lot_back_to_wizard"))
+    kb.add(*nav2)
+
+    target_label = {
+        "catalog_global": "категорий",
+        "catalog_categories": "подкатегорий",
+        "catalog_offers": "товаров",
+        "lot_categories": "игр",
+        "lot_subcategories": "подкатегорий",
+    }.get(mode, "элементов")
+    text = f"🔍 <b>Поиск {target_label}</b> по <code>{_esc(query)}</code>\n<i>Найдено {len(filtered)}, страница {page + 1}/{total}</i>"
+    _fzr_reply(c, target, text, kb=kb, state=state)
+
+
+def _fzr_group_label(group: Any, fallback: str) -> str:
+    """
+    Заголовок поля из его form-group.
+
+    В группах radio/checkbox каждый вариант обёрнут в свой <label>, поэтому
+    «первый label» — это текст первого варианта («Россия»), а не название поля
+    («Регион активации»). Берём подпись поля: control-label, либо первый label
+    без input внутри.
+    """
+    if not group:
+        return fallback
+    label_el = group.find("label", class_="control-label")
+    if label_el is None:
+        for cand in group.find_all("label"):
+            if cand.find(["input", "select", "textarea"]) is None:
+                label_el = cand
+                break
+    if label_el is not None:
+        text = label_el.get_text(strip=True)
+        if text:
+            return text
+    return fallback
+
+
+def _fzr_option_label(inp: Any, fallback: str) -> str:
+    """Подпись варианта radio/checkbox: текст его <label> или соседний текст."""
+    label = inp.find_parent("label")
+    if label is not None:
+        text = label.get_text(strip=True)
+        if text:
+            return text
+    # <input id="x"><label for="x">Россия</label>
+    inp_id = inp.get("id")
+    if inp_id:
+        root = inp.find_parent("form") or inp.parent
+        if root is not None:
+            for cand in root.find_all("label"):
+                if cand.get("for") == inp_id:
+                    text = cand.get_text(strip=True)
+                    if text:
+                        return text
+    sibling_text = ""
+    try:
+        sibling_text = (inp.next_sibling or "").strip() if isinstance(inp.next_sibling, str) else ""
+    except Exception:
+        sibling_text = ""
+    return sibling_text or fallback
+
+
+def _fzr_fetch_lot_form(c: "Cardinal", subcat_id: int) -> Dict[str, Any]:
+    """
+    Разбирает форму создания лота в подкатегории.
+
+    Возвращает и «свои» поля подкатегории (серверы, платформы, регионы), и
+    признаки СТАНДАРТНЫХ полей: есть ли «Наличие» (`amount`) и обязательно ли
+    оно. Это важно: в разных подкатегориях набор полей разный, а FunPay на
+    любое незаполненное обязательное поле отвечает одинаково — «Заполните все
+    поля», не говоря каким именно.
+
+    v3.16: раньше собирались только <select> и текстовые <input>, а группы
+    radio/checkbox выбрасывались. В разделе «Подарки (Gifts) Steam» регион —
+    это именно radio-группа, поэтому мастер не спрашивал регион, поле не
+    уходило в сохранение и лот не создавался.
+    """
+    out: Dict[str, Any] = {"custom": [], "amount": None, "auto_delivery": False}
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.error("bs4 не установлен — не могу парсить форму лота")
+        return out
+    urls = [
+        # offerEdit — рабочий адрес формы (у offerAdd FunPay отдаёт 404),
+        # поэтому пробуем его первым, чтобы не тратить лишний запрос
+        f"lots/offerEdit?node={subcat_id}",
+        f"lots/offerAdd?node={subcat_id}",
+        f"lots/{subcat_id}/trade",
+    ]
+    html_response = None
+    headers = {"accept": "*/*"}
+    for url in urls:
+        try:
+            response = c.account.method("get", url, headers, {}, raise_not_200=False)
+            if response.status_code != 200:
+                continue
+            html_response = response.content.decode()
+            if "form-offer-editor" in html_response or 'name="node_id"' in html_response or 'name="csrf_token"' in html_response:
+                break
+        except Exception as e:
+            logger.debug("_fzr_fetch_lot_form failed", extra={"url": _redact_sensitive(str(url)), "error": _redact_sensitive(str(e))})
+            continue
+    if html_response is None:
+        return out
+    try:
+        bs = BeautifulSoup(html_response, "lxml")
+    except Exception:
+        bs = BeautifulSoup(html_response, "html.parser")
+    form = bs.find("form", class_="form-offer-editor")
+    if form is None:
+        for f in bs.find_all("form"):
+            if f.find("input", {"name": "node_id"}):
+                form = f
+                break
+        if form is None:
+            for f in bs.find_all("form"):
+                if f.find("input", {"name": "csrf_token"}):
+                    form = f
+                    break
+    if form is None:
+        form = bs.find("body")
+    if form is None:
+        return out
+    # v3.16.1: если form-offer-editor не нашли, поля могут лежать в <body> —
+    # тогда важно не потерять их из-за того, что «формы нет»
+    logger.info("lot form html fetched", extra={
+        "subcat_id": subcat_id,
+        "form_found": bool(bs.find("form", class_="form-offer-editor")),
+        "selects": len(form.find_all("select")),
+        "radios": len(form.find_all("input", {"type": "radio"})),
+        "checkboxes": len(form.find_all("input", {"type": "checkbox"})),
+    })
+    csrf_input = form.find("input", {"name": "csrf_token"})
+    if csrf_input and csrf_input.get("value"):
+        try:
+            c.account.csrf_token = csrf_input.get("value")
+        except Exception:
+            pass
+
+    # --- стандартные поля: есть ли «Наличие» и встроенная автовыдача ---
+    def _group_required(el: Any) -> bool:
+        group = el.find_parent(class_="form-group") if el else None
+        if not group:
+            return False
+        if "required" in (group.get("class") or []):
+            return True
+        return bool(group.find(class_="required"))
+
+    amount_el = form.find(["input", "select"], {"name": "amount"})
+    if amount_el is not None:
+        label = _fzr_group_label(amount_el.find_parent(class_="form-group"), "Наличие")
+        out["amount"] = {
+            "present": True,
+            "required": _group_required(amount_el),
+            "label": label,
+            "value": amount_el.get("value") or "",
+        }
+    out["auto_delivery"] = form.find("input", {"name": "auto_delivery"}) is not None
+
+    STANDARD_FIELDS = {
+        "fields[summary][ru]", "fields[summary][en]",
+        "fields[desc][ru]", "fields[desc][en]",
+        "fields[payment_msg][ru]", "fields[payment_msg][en]",
+        "fields[images]",
+        "price", "active", "auto_delivery", "secrets", "amount",
+        "deactivate_after_sale", "node_id", "offer_id", "csrf_token", "deleted", "location",
+    }
+    result: List[Dict[str, Any]] = []
+    seen_names: set = set()
+
+    # --- v3.16: группы radio / checkbox ---
+    # В «Подарках (Gifts) Steam» регион задаётся радиокнопками, а платформы —
+    # чекбоксами. Раньше такие поля молча выбрасывались, из-за чего мастер их
+    # не спрашивал, а FunPay отказывался сохранять лот.
+    radio_groups: Dict[str, Dict[str, Any]] = {}
+    for inp in form.find_all("input"):
+        try:
+            inp_type = (inp.get("type") or "").lower()
+            if inp_type not in ("radio", "checkbox"):
+                continue
+            name = inp.get("name")
+            if not name or name in STANDARD_FIELDS:
+                continue
+            group = inp.find_parent(class_="form-group")
+            required = _group_required(inp)
+            # hidden-группу с обязательным полем НЕ пропускаем (см. select выше)
+            if group and "hidden" in (group.get("class") or []) and not required:
+                continue
+            value = inp.get("value")
+            if value is None:
+                # чекбокс без value — это булев тумблер, значение по умолчанию "on"
+                value = "on"
+            entry = radio_groups.setdefault(name, {
+                "type": "select",
+                "name": name,
+                # имя вида fields[platform][] означает мультивыбор
+                "multi": inp_type == "checkbox" or name.endswith("[]"),
+                "input_type": inp_type,
+                "label": _fzr_group_label(group, _humanize_field_name(name)),
+                "required": required,
+                "options": [],
+                "current_value": None,
+            })
+            selected = inp.has_attr("checked")
+            entry["options"].append({
+                "value": str(value),
+                "text": _fzr_option_label(inp, str(value)),
+                "selected": selected,
+            })
+            if selected and entry["current_value"] is None:
+                entry["current_value"] = str(value)
+        except Exception as e:
+            logger.warning("_fzr_fetch_lot_form parse radio failed",
+                           extra={"error": _redact_sensitive(str(e))})
+            continue
+    for name, entry in radio_groups.items():
+        opts = entry.get("options") or []
+        # одиночный чекбокс — это «да/нет», спрашивать его как список из одного
+        # варианта бессмысленно: даём выбор «включить / не включать»
+        if entry["input_type"] == "checkbox" and len(opts) == 1 and not name.endswith("[]"):
+            entry["multi"] = False
+            entry["options"] = [
+                {"value": opts[0]["value"], "text": f"✅ {opts[0]['text'] or 'Да'}",
+                 "selected": opts[0]["selected"]},
+                {"value": "", "text": "➖ Нет", "selected": not opts[0]["selected"]},
+            ]
+        if not entry["options"]:
+            continue
+        result.append(entry)
+        seen_names.add(name)
+
+    for sel in form.find_all("select"):
+        try:
+            name = sel.get("name")
+            if not name or name in STANDARD_FIELDS or name in seen_names:
+                continue
+            parent_group = sel.find_parent(class_="form-group")
+            group_classes = (parent_group.get("class") or []) if parent_group else []
+            group_hidden = "hidden" in group_classes
+            # v3.16.2: lot-field — это «своё» поле подкатегории. FunPay отдаёт
+            # такие поля с классом hidden и БЕЗ пометки required: показывает и
+            # требует их JS, в зависимости от выбора в другом поле (например
+            # «Способ получения» решает, какой из fields[region]/fields[region2]
+            # обязателен). Раньше их выбрасывали как скрытые — из-за этого
+            # «Регион» не спрашивали, а FunPay отвечал «Заполните это поле».
+            is_lot_field = "lot-field" in group_classes
+            required = False
+            if parent_group:
+                if "required" in group_classes:
+                    required = True
+                if parent_group.find(class_="required"):
+                    required = True
+            if group_hidden and not required and not is_lot_field:
+                continue
+            label = _fzr_group_label(parent_group, _humanize_field_name(name))
+            options = []
+            current_value = None
+            for opt in sel.find_all("option"):
+                try:
+                    val = opt.get("value") or ""
+                    text = opt.get_text(strip=True) or val
+                    is_selected = opt.has_attr("selected")
+                    options.append({"value": val, "text": text, "selected": is_selected})
+                    if is_selected:
+                        current_value = val
+                except Exception:
+                    continue
+            # варианты без пустой заглушки
+            real_options = [o for o in options if o["value"] != ""]
+            if not real_options:
+                # v3.16.1: варианты подгружает JS (список зависит от игры) —
+                # раньше поле молча выбрасывалось, и FunPay отвечал
+                # «fields[...]: Заполните это поле». Теперь спрашиваем текстом.
+                if not required:
+                    continue
+                placeholder = ""
+                for o in options:
+                    if o["value"] == "" and o["text"]:
+                        placeholder = o["text"]
+                        break
+                result.append({
+                    "type": "input",
+                    "name": name,
+                    "label": label,
+                    "required": True,
+                    "options": [],
+                    "current_value": "",
+                    "placeholder": placeholder,
+                    "js_options": True,      # значения знает только сайт
+                    "lot_field": is_lot_field,
+                })
+                seen_names.add(name)
+                continue
+            result.append({
+                "type": "select",
+                "name": name,
+                "label": label,
+                "required": required,
+                "options": real_options,
+                "current_value": current_value,
+                "lot_field": is_lot_field,
+                # обязательность решает JS на сайте — блокировать создание нельзя,
+                # но предупредить о пустом поле нужно
+                "soft_required": bool(is_lot_field and group_hidden and not required),
+            })
+            seen_names.add(name)
+        except Exception as e:
+            logger.warning("_fzr_fetch_lot_form_custom_fields parse select failed", extra={"error": _redact_sensitive(str(e))})
+            continue
+    for inp in form.find_all(["input", "textarea"]):
+        try:
+            inp_type = (inp.get("type") or "text").lower()
+            if inp_type in ("hidden", "submit", "button", "checkbox", "radio", "file", "password"):
+                continue
+            name = inp.get("name")
+            if not name or name in STANDARD_FIELDS or name in seen_names:
+                continue
+            parent_group = inp.find_parent(class_="form-group")
+            group_classes = (parent_group.get("class") or []) if parent_group else []
+            group_hidden = "hidden" in group_classes
+            is_lot_field = "lot-field" in group_classes
+            required = False
+            if parent_group:
+                if "required" in group_classes:
+                    required = True
+                if parent_group.find(class_="required"):
+                    required = True
+            # v3.16.2: скрытое поле подкатегории (lot-field) сохраняем — его
+            # раскрывает JS, и FunPay может его требовать
+            if group_hidden and not required and not is_lot_field:
+                continue
+            label = _fzr_group_label(parent_group, _humanize_field_name(name))
+            current_value = inp.get("value") or ""
+            placeholder = inp.get("placeholder") or ""
+            result.append({
+                "type": "input",
+                "name": name,
+                "label": label,
+                "required": required,
+                "options": [],
+                "current_value": current_value,
+                "placeholder": placeholder,
+                "lot_field": is_lot_field,
+                "soft_required": bool(is_lot_field and group_hidden and not required),
+            })
+            seen_names.add(name)
+        except Exception as e:
+            logger.warning("_fzr_fetch_lot_form parse input failed", extra={"error": _redact_sensitive(str(e))})
+            continue
+    out["custom"] = result
+    # v3.16.2: у подкатегории может быть ДВА поля с одинаковой подписью
+    # (в «Ключах» это fields[region] и fields[region2], оба «Регион» — какой
+    # именно нужен, решает «Способ получения»). Два одинаковых вопроса подряд
+    # выглядят как баг, поэтому дописываем к подписи первые варианты.
+    _by_label: Dict[str, List[Dict[str, Any]]] = {}
+    for f in result:
+        _by_label.setdefault(str(f.get("label") or ""), []).append(f)
+    for label, group_fields in _by_label.items():
+        if len(group_fields) < 2 or not label:
+            continue
+        for f in group_fields:
+            opts = [str(o.get("text") or o.get("value")) for o in (f.get("options") or [])]
+            hint = ", ".join(opts[:3])
+            if hint:
+                f["label"] = f"{label} ({hint}…)"
+            else:
+                f["label"] = f"{label} [{f.get('name')}]"
+    logger.info("lot form parsed", extra={"subcat_id": subcat_id,
+                                          "custom_fields": len(result),
+                                          # v3.16.1: пишем ИМЕНА полей. Без этого
+                                          # «плагин не спросил поле X» невозможно
+                                          # разобрать, не имея HTML формы на руках
+                                          "field_names": [str(f.get("name")) for f in result],
+                                          "required_names": [str(f.get("name")) for f in result
+                                                             if f.get("required")],
+                                          "has_amount": bool(out["amount"]),
+                                          "amount_required": bool((out["amount"] or {}).get("required")),
+                                          "has_auto_delivery": out["auto_delivery"]})
+    return out
+
+
+def _fzr_fetch_lot_form_custom_fields(c: "Cardinal", subcat_id: int) -> List[Dict[str, Any]]:
+    """Совместимость: только «свои» поля подкатегории."""
+    return _fzr_fetch_lot_form(c, subcat_id).get("custom", [])
+
+
+_LOT_SAVE_HINTS: List[Tuple[Any, str]] = [
+    # FunPay на любое незаполненное обязательное поле отвечает одинаково,
+    # поэтому переводим его ответ в конкретный совет.
+    (re.compile(r"заполните\s+все\s+поля|fill\s+in\s+all", re.I),
+     "FunPay считает, что не хватает обязательного поля.\n"
+     "Чаще всего это <b>«Наличие»</b> (сколько штук) или своё поле подкатегории "
+     "(сервер, платформа, регион).\n"
+     "Проверьте на экране подтверждения: 📦 Наличие должно быть больше нуля."),
+    (re.compile(r"минимальн\w*\s+цен|price.*too\s+low", re.I),
+     "Цена ниже минимальной для этой подкатегории — поднимите её."),
+    (re.compile(r"лимит\w*\s+лот|too\s+many\s+offers", re.I),
+     "Достигнут лимит лотов FunPay в этой подкатегории."),
+    (re.compile(r"csrf", re.I),
+     "Истекла сессия FunPay. Подождите минуту и повторите — плагин обновит токен."),
+]
+
+
+def _lot_save_hint(err: Optional[str]) -> str:
+    """Понятный совет по ответу FunPay о неудачном сохранении лота."""
+    text = str(err or "")
+    for pat, hint in _LOT_SAVE_HINTS:
+        if pat.search(text):
+            return hint
+    return ""
+
+
+def _lot_saving_error_text(e: Exception) -> str:
+    """
+    Человекочитаемая причина отказа FunPay.
+
+    v3.16: раньше читался несуществующий атрибут `errors_dict` — в FunPayAPI
+    поля ошибок лежат в `errors`. Из-за этого детальный ответ FunPay («какое
+    поле не заполнено») терялся, и продавец видел лишь общий текст.
+    """
+    parts: List[str] = []
+    message = getattr(e, "error_message", None)
+    if message:
+        parts.append(str(message))
+    errors = getattr(e, "errors", None) or getattr(e, "errors_dict", None)
+    if isinstance(errors, dict) and errors:
+        for key, val in errors.items():
+            parts.append(f"{_humanize_field_name(str(key))}: {val}")
+    if not parts:
+        short = getattr(e, "short_str", None)
+        parts.append(short() if callable(short) else str(e))
+    return "\n".join(parts)
+
+
+# как называются стандартные поля FunPay в ответах об ошибках
+_FIELD_LABEL_HINTS = {
+    "price": "Цена",
+    "amount": "Наличие",
+    "fields[summary][ru]": "Название (RU)",
+    "fields[summary][en]": "Название (EN)",
+    "fields[desc][ru]": "Описание (RU)",
+    "fields[desc][en]": "Описание (EN)",
+    "secrets": "Товары автовыдачи FunPay",
+}
+
+# v3.16.1: человеческие названия для полей подкатегорий. FunPay присылает
+# «fields[region]», и показывать это продавцу — значит заставлять его гадать.
+_CUSTOM_FIELD_LABELS = {
+    "region": "Регион",
+    "platform": "Платформа",
+    "server": "Сервер",
+    "side": "Сторона",
+    "type": "Тип",
+    "quality": "Качество",
+    "currency": "Валюта",
+    "language": "Язык",
+    "edition": "Издание",
+    "method": "Способ",
+    "service_type": "Тип услуги",
+    "delivery": "Способ доставки",
+    "warranty": "Гарантия",
+}
+
+
+def _humanize_field_name(name: str) -> str:
+    """
+    «fields[region]» -> «Регион», «fields[platform][]» -> «Платформа».
+
+    Если ключ незнакомый, отдаём его внутреннее имя без служебной обёртки:
+    «fields[foo_bar]» -> «foo bar» читается лучше, чем сырое имя.
+    """
+    raw = str(name or "")
+    if raw in _FIELD_LABEL_HINTS:
+        return _FIELD_LABEL_HINTS[raw]
+    keys = re.findall(r"\[([^\]]+)\]", raw)
+    keys = [k for k in keys if k]
+    # v3.16.2: часть полей идёт без обёртки fields[...] — например server_id
+    key = keys[0] if keys else raw
+    if key in _CUSTOM_FIELD_LABELS:
+        return _CUSTOM_FIELD_LABELS[key]
+    stripped = re.sub(r"_id$", "", key)
+    if stripped in _CUSTOM_FIELD_LABELS:
+        return _CUSTOM_FIELD_LABELS[stripped]
+    if not keys:
+        return raw
+    return key.replace("_", " ").strip() or raw
+
+
+def _fzr_save_lot_fields(c: "Cardinal", lot_fields: fp_types.LotFields,
+                         attempts: int = 3) -> Tuple[bool, Optional[str], List[str]]:
+    """
+    Сохранить лот. Возвращает (успех, текст ошибки, СЫРЫЕ имена полей FunPay).
+
+    v3.16.1: имена возвращаем отдельно. Раньше их пытались вытащить обратно из
+    текста ошибки, но текст уже переведён на русский («Регион: …»), и разбор
+    ломался — кнопка «Заполнить поле» не появлялась.
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            c.account.save_lot(lot_fields)
+            return True, None, []
+        except fp_exceptions.LotSavingError as e:
+            errors = getattr(e, "errors", None) or getattr(e, "errors_dict", None) or {}
+            keys = [str(k) for k in errors.keys()] if isinstance(errors, dict) else []
+            return False, _lot_saving_error_text(e), keys
+        except Exception as e:
+            last_exc = e
+            logger.warning("save_lot attempt failed", extra={"attempt": i + 1, "error": _redact_sensitive(str(e))})
+            time.sleep(1.5)
+    return False, f"Не удалось сохранить лот после {attempts} попыток: {last_exc}", []
+
+
+def _fzr_create_new_lot(c: "Cardinal", subcat_id: int, fields: Dict[str, Any],
+                        custom_select_values: Optional[Dict[str, Any]] = None
+                        ) -> Tuple[bool, Optional[str], List[str]]:
+    """Создать лот. Третий элемент — имена полей, на которые пожаловался FunPay."""
+    try:
+        subcat = c.account.get_subcategory(fp_enums.SubCategoryTypes.COMMON, subcat_id)
+        if subcat is None:
+            return False, f"Подкатегория {subcat_id} не найдена.", []
+        raw_fields: Dict[str, str] = {
+            "node_id": str(subcat_id),
+            "offer_id": "0",
+            "fields[summary][ru]": fields.get("title_ru", "") or "",
+            "fields[summary][en]": fields.get("title_en", "") or "",
+            "fields[desc][ru]": fields.get("desc_ru", "") or "",
+            "fields[desc][en]": fields.get("desc_en", "") or "",
+            "fields[payment_msg][ru]": fields.get("payment_msg_ru", "") or "",
+            "fields[payment_msg][en]": fields.get("payment_msg_en", "") or "",
+            "fields[images]": "",
+            "price": str(fields.get("price", 0) or 0),
+            "active": "on" if fields.get("active", True) else "",
+            "secrets": "\n".join(fields.get("secrets", []) or []),
+            "csrf_token": c.account.csrf_token or "",
+        }
+        if fields.get("auto_delivery") is not None:
+            raw_fields["auto_delivery"] = "on" if fields["auto_delivery"] else ""
+        if fields.get("amount") is not None:
+            raw_fields["amount"] = str(int(fields["amount"]) or 0)
+        if fields.get("deactivate_after_sale") is not None:
+            raw_fields["deactivate_after_sale"] = "on" if fields["deactivate_after_sale"] else ""
+        if custom_select_values:
+            for sel_name, sel_value in custom_select_values.items():
+                if sel_value is None:
+                    continue
+                # v3.16: мультивыбор (чекбоксы вида fields[platform][]) уходит
+                # списком — requests повторит ключ для каждого значения.
+                # str(list) отправил бы на FunPay строку "['steam', 'egs']".
+                if isinstance(sel_value, (list, tuple, set)):
+                    values = [str(v) for v in sel_value if str(v) != ""]
+                    if values:
+                        raw_fields[sel_name] = values
+                    continue
+                raw_fields[sel_name] = str(sel_value)
+        lot_fields = fp_types.LotFields(0, raw_fields, subcategory=subcat, currency=c.account.currency)
+        ok, err, bad_fields = _fzr_save_lot_fields(c, lot_fields, attempts=3)
+        if not ok:
+            return False, err, bad_fields
+        _fzr_refresh_profile(c)
+        return True, None, []
+    except Exception as e:
+        logger.exception("_fzr_create_new_lot failed", extra={"error": _redact_sensitive(str(e))})
+        return False, f"Исключение: {_redact_sensitive(str(e))}", []
+
+
+def _fzr_calc_commission(c: "Cardinal", subcat_id: int, price: float) -> Optional[Any]:
+    try:
+        return c.account.calc(fp_enums.SubCategoryTypes.COMMON, subcategory_id=subcat_id, price=price)
+    except Exception as e:
+        logger.error("_fzr_calc_commission failed", extra={"subcat_id": subcat_id, "price": price, "error": _redact_sensitive(str(e))})
+        return None
+
+
+def _fzr_refresh_profile(c: "Cardinal") -> bool:
+    try:
+        new_profile = c.account.get_user(c.account.id)
+        c.profile = new_profile
+        c.curr_profile = new_profile
+        logger.info(f"Профиль обновлён: лотов теперь {len(new_profile.get_lots())}")
+        return True
+    except Exception as e:
+        logger.error("_fzr_refresh_profile failed", extra={"error": _redact_sensitive(str(e))})
+        return False
+
+
+def _fzr_find_new_lot_id(c: "Cardinal", title: str, lots_before: set) -> Optional[int]:
+    try:
+        profile = c.account.get_user(c.account.id)
+        lots_after = profile.get_lots() if profile else []
+        title_norm = title.strip().lower()
+        for lot in lots_after:
+            if lot.id in lots_before:
+                continue
+            desc = (lot.description or "").strip().lower()
+            if desc == title_norm or title_norm in desc:
+                return int(lot.id)
+        for lot in lots_after:
+            if lot.id not in lots_before:
+                return int(lot.id)
+    except Exception as e:
+        logger.error("_fzr_find_new_lot_id failed", extra={"error": _redact_sensitive(str(e))})
+    return None
+
+
+def _fzr_start_create_lot(c: "Cardinal", call: Any) -> None:
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    clear_state(user_id)
+    _fzr_refresh_categories_cache(c, force=False)
+    _send_or_edit(c, call, "🆕 <b>Создание лота</b>\n\n<i>Выберите игру (категорию):</i>", kb=_fzr_categories_kb(c))
+
+
+def _fzr_open_category(c: "Cardinal", call: Any, cat_id: int, page: int) -> None:
+    cats = _fzr_get_categories_list(c)
+    cat = next((c for c in cats if c["id"] == cat_id), None)
+    if cat is None:
+        _send_or_edit(c, call, "❌ Категория не найдена.", kb=_main_keyboard())
+        return
+    _send_or_edit(c, call, f"🎮 <b>{_esc(cat['name'])}</b>\n\n<i>Выберите подкатегорию:</i>", kb=_fzr_subcategories_kb(c, cat_id, page))
+
+
+def _fzr_select_subcategory(c: "Cardinal", call: Any, subcat_id: int) -> None:
+    sub = c.account.get_subcategory(fp_enums.SubCategoryTypes.COMMON, subcat_id)
+    if sub is None:
+        _send_or_edit(c, call, "❌ Подкатегория не найдена.", kb=_fzr_categories_kb(c))
+        return
+    _send_or_edit(c, call, "⏳ <b>Анализирую форму подкатегории...</b>\n<i>Это займёт 1–3 секунды.</i>")
+    form: Dict[str, Any] = {"custom": [], "amount": None, "auto_delivery": False}
+    try:
+        form = _fzr_fetch_lot_form(c, subcat_id)
+    except Exception as e:
+        logger.exception("_fzr_select_subcategory fetch fields failed", extra={"error": _redact_sensitive(str(e))})
+    custom_fields = form.get("custom") or []
+    user_id = call.from_user.id
+    logger.info("fzr_select_subcategory", extra={"user_id": user_id, "subcat_id": subcat_id, "subcat_name": getattr(sub, "fullname", None)})
+    set_state(user_id, "create_lot_custom", {
+        "subcat_id": subcat_id,
+        "subcat_name": sub.fullname,
+        "custom_fields": custom_fields,
+        "custom_values": {},
+        "current_field_idx": 0,
+        # Форма подкатегории: есть ли «Наличие» и встроенная автовыдача FunPay.
+        # Без этого мастер молча отправлял лот без обязательного поля и получал
+        # от FunPay бесполезное «Заполните все поля».
+        "form_amount": form.get("amount"),
+        "form_has_auto_delivery": bool(form.get("auto_delivery")),
+        "amount": None,
+        "title_ru": "",
+        "title_en": "",
+        "desc_ru": "",
+        "desc_en": "",
+        "price": 0.0,
+        "price_income": 0.0,
+        "active": True,
+        "auto_delivery": False,
+        "sku": "",
+    })
+    _fzr_show_create_step(c, call, get_state(user_id))
+
+
+def _wizard_kb(state: Dict[str, Any], extra: Optional[List[Any]] = None,
+               row_width: int = 1) -> InlineKeyboardMarkup:
+    """
+    Клавиатура шага мастера: свои кнопки + «⬅️ Назад» + «❌ Отмена».
+
+    Кнопка «Назад» на первом шаге не рисуется (вести некуда), иначе получаем
+    ту же проблему, что была в каталоге: кнопка есть, а нажатие ничего не меняет.
+    """
+    kb = InlineKeyboardMarkup(row_width=row_width)
+    for btn in (extra or []):
+        kb.add(btn)
+    nav = []
+    back = _wizard_back_button(state)
+    if back is not None:
+        nav.append(back)
+    nav.append(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    kb.add(*nav)
+    return kb
+
+
+def _fzr_show_create_step(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    if state is None:
+        return
+    data = state["data"]
+    step = state["state"]
+    if step == "create_lot_custom":
+        idx = data.get("current_field_idx", 0)
+        fields = data.get("custom_fields", [])
+        if idx < len(fields):
+            _fzr_show_custom_field(c, target, state, idx)
+            return
+        # v3.16: если пришли сюда с экрана подтверждения (правка полей) —
+        # туда и возвращаемся, а не гоняем продавца по всем шагам заново
+        if data.pop("return_to_confirm_after_custom", False):
+            state["state"] = "create_lot_confirm"
+            _fzr_show_create_confirm(c, target, state)
+            return
+        state["state"] = "create_lot_title_ru"
+        _fzr_ask_title(c, target, state)
+    elif step == "create_lot_title_ru":
+        _fzr_ask_title(c, target, state)
+    elif step == "create_lot_title_en":
+        _fzr_reply(c, target, "✏️ <b>Шаг (необязательно):</b> Введите <b>название (EN)</b> или отправьте <b>/skip</b>:",
+                   kb=_wizard_kb(state), state=state)
+    elif step == "create_lot_desc_ru":
+        _fzr_reply(c, target, "📝 <b>Шаг (необязательно):</b> Введите <b>описание (RU)</b> или <b>/skip</b>:",
+                   kb=_wizard_kb(state), state=state)
+    elif step == "create_lot_desc_en":
+        _fzr_reply(c, target, "📝 <b>Шаг (необязательно):</b> Введите <b>описание (EN)</b> или <b>/skip</b>:",
+                   kb=_wizard_kb(state), state=state)
+    elif step == "create_lot_price":
+        _fzr_reply(c, target, "💰 <b>Шаг:</b> Введите цену, которую хотите получить <b>чистыми</b> (например <code>100</code>). FunPay добавит комиссию автоматически.",
+                   kb=_wizard_kb(state), state=state)
+    elif step == "create_lot_amount":
+        _fzr_ask_amount(c, target, state)
+    elif step == "create_lot_sku":
+        kb = _wizard_kb(state, extra=[
+            _inline_button("📦 Выбрать из каталога", callback_data=f"{CB_PREFIX}:create_lot_sku_catalog"),
+            _inline_button("⏭ Без привязки", callback_data=f"{CB_PREFIX}:create_lot_skip_sku"),
+        ])
+        _fzr_reply(c, target, "🔗 <b>Шаг:</b> Введите <b>SKU FazerCards</b> для привязки "
+                              "(например <code>giftcards:123:456</code>) или <b>-</b> чтобы пропустить:", kb=kb, state=state)
+    elif step == "create_lot_confirm":
+        _fzr_show_create_confirm(c, target, state)
+
+
+_AMOUNT_DEFAULT = 9999
+_AMOUNT_MAX = 999999
+
+
+def _fzr_amount_meta(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Что известно о поле «Наличие» в этой подкатегории.
+
+    Важно различать два случая:
+      * ключа `form_amount` нет вообще — форму не разбирали (старое состояние
+        мастера, ручной вызов), безопаснее считать, что поле есть;
+      * `form_amount is None` — форму разобрали, поля «Наличие» в ней нет.
+    """
+    if "form_amount" in data:
+        meta = data.get("form_amount")
+        if isinstance(meta, dict):
+            return meta
+        return {"present": False, "required": False, "label": "Наличие", "value": ""}
+    return {"present": True, "required": True, "label": "Наличие", "value": ""}
+
+
+def _fzr_needs_amount(data: Dict[str, Any]) -> bool:
+    """Спрашивать ли «Наличие». Если поля в форме нет — не спрашиваем."""
+    return bool(_fzr_amount_meta(data).get("present"))
+
+
+def _fzr_ask_amount(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    """
+    Запрос «Наличия».
+
+    FunPay считает это поле обязательным в большинстве подкатегорий (пополнения
+    Steam в том числе), а на пустое значение отвечает лишь «Заполните все поля».
+    Поэтому спрашиваем явно и предлагаем разумный запас: товар цифровой,
+    выдаётся через плагин, склад по факту ограничен балансом, а не числом здесь.
+    """
+    meta = _fzr_amount_meta(state["data"])
+    label = _esc(meta.get("label") or "Наличие")
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button(f"♾ Много ({_AMOUNT_DEFAULT})",
+                          callback_data=f"{CB_PREFIX}:create_lot_amount:{_AMOUNT_DEFAULT}"),
+           _inline_button("1 шт", callback_data=f"{CB_PREFIX}:create_lot_amount:1"))
+    kb.add(_inline_button("10 шт", callback_data=f"{CB_PREFIX}:create_lot_amount:10"),
+           _inline_button("100 шт", callback_data=f"{CB_PREFIX}:create_lot_amount:100"))
+    nav = []
+    back = _wizard_back_button(state)
+    if back is not None:
+        nav.append(back)
+    nav.append(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    kb.add(*nav)
+    _fzr_reply(
+        c, target,
+        f"📦 <b>Шаг:</b> Укажите <b>{label}</b> — сколько штук доступно.\n\n"
+        f"<blockquote>Это обязательное поле FunPay: без него лот не сохранится "
+        f"(в ответе будет только «Заполните все поля»).\n"
+        f"Товар цифровой и выдаётся плагином, поэтому обычно ставят запас "
+        f"побольше — реальный лимит всё равно определяется вашим балансом.</blockquote>\n"
+        f"<i>Введите число или нажмите кнопку.</i>", kb=kb, state=state)
+
+
+def _fzr_set_amount(c: "Cardinal", call: Any, arg: str) -> None:
+    """Кнопки выбора наличия на шаге «Наличие»."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") != "create_lot_amount":
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    try:
+        amount = int(str(arg).strip())
+    except (TypeError, ValueError):
+        amount = _AMOUNT_DEFAULT
+    state["data"]["amount"] = max(1, min(amount, _AMOUNT_MAX))
+    # если пришли сюда правкой с экрана подтверждения — туда и возвращаемся
+    state["state"] = ("create_lot_confirm" if state["data"].pop("return_to_confirm", False)
+                      else "create_lot_sku")
+    _fzr_show_create_step(c, call, state)
+
+
+def _step_create_lot_amount(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    """Ввод «Наличия» текстом."""
+    raw = (message.text or "").strip().replace(" ", "")
+    _fzr_delete_message(c, message)
+    if raw in ("/skip", "-", ""):
+        # пропуск разрешаем только если поле необязательное — иначе FunPay
+        # вернёт «Заполните все поля», и продавец опять не поймёт причину
+        if _fzr_amount_meta(state["data"]).get("required"):
+            state["data"]["ack"] = (
+                "❌ Это поле обязательное — без него FunPay не сохранит лот.\n"
+                f"<i>Введите число или нажмите «♾ Много ({_AMOUNT_DEFAULT})».</i>")
+            _fzr_show_create_step(c, message, state)
+            return
+        state["data"]["amount"] = None
+        state["state"] = ("create_lot_confirm" if state["data"].pop("return_to_confirm", False)
+                          else "create_lot_sku")
+        _fzr_show_create_step(c, message, state)
+        return
+    try:
+        amount = int(float(raw.replace(",", ".")))
+    except ValueError:
+        state["data"]["ack"] = "❌ Нужно целое число, например <code>9999</code>."
+        _fzr_show_create_step(c, message, state)
+        return
+    if amount < 1:
+        state["data"]["ack"] = ("❌ Наличие должно быть больше нуля — иначе лот сразу "
+                                "станет неактивным.")
+        _fzr_show_create_step(c, message, state)
+        return
+    if amount > _AMOUNT_MAX:
+        state["data"]["ack"] = f"❌ Слишком много. Максимум {_AMOUNT_MAX}."
+        _fzr_show_create_step(c, message, state)
+        return
+    state["data"]["amount"] = amount
+    state["state"] = ("create_lot_confirm" if state["data"].pop("return_to_confirm", False)
+                      else "create_lot_sku")
+    state["data"]["ack"] = f"📦 Наличие: <b>{_esc(amount)}</b>"
+    _fzr_show_create_step(c, message, state)
+
+
+def _fzr_edit_amount(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Наличие» на экране подтверждения — вернуться к этому шагу."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") not in ("create_lot_confirm", "create_lot_amount"):
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    state["state"] = "create_lot_amount"
+    state["data"]["return_to_confirm"] = True
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_ask_title(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    """
+    Запрос названия лота.
+
+    В части подкатегорий FunPay названия («краткое описание») нет вовсе или оно
+    не обязательно — раньше мастер требовал его всегда и создание вставало.
+    Поэтому даём кнопку «Пропустить»: название подставим из выбранного товара
+    или из имени подкатегории.
+    """
+    kb = _wizard_kb(state, extra=[
+        _inline_button("⏭ Без названия", callback_data=f"{CB_PREFIX}:create_lot_skip_title"),
+    ])
+    _fzr_reply(c, target,
+               "✏️ <b>Шаг:</b> Введите <b>название лота (RU)</b>.\n\n"
+               "<i>Если в этой категории названия нет или оно не нужно — "
+               "нажмите «Без названия» или отправьте <b>/skip</b>.</i>", kb=kb, state=state)
+
+
+def _fzr_missing_required_fields(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Обязательные поля подкатегории, которые остались незаполненными.
+
+    v3.16: без этой проверки лот уходил на FunPay без региона/платформы, и
+    ответ был бесполезным «Заполните все поля» — теперь называем поле сами
+    и не тратим запрос.
+    """
+    values = data.get("custom_values") or {}
+    missing = []
+    for field in data.get("custom_fields") or []:
+        if not field.get("required"):
+            continue
+        name = field.get("name")
+        val = values.get(name)
+        if isinstance(val, (list, tuple, set)):
+            val = [v for v in val if str(v).strip()]
+        if not val:
+            missing.append(field)
+    return missing
+
+
+def _fzr_custom_values_summary(data: Dict[str, Any]) -> str:
+    """Строки «поле: значение» для экрана подтверждения."""
+    values = data.get("custom_values") or {}
+    lines = []
+    for field in data.get("custom_fields") or []:
+        name = field.get("name")
+        if name not in values:
+            continue
+        raw = values[name]
+        picked = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        texts = []
+        for v in picked:
+            label = str(v)
+            for opt in field.get("options") or []:
+                if str(opt.get("value")) == str(v):
+                    label = opt.get("text") or label
+                    break
+            texts.append(label)
+        lines.append(f"• {_esc(field.get('label') or name)}: <b>{_esc(', '.join(texts))}</b>")
+    return "\n".join(lines)
+
+
+def _fzr_unfilled_soft_fields(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Поля подкатегории, которые FunPay может потребовать (v3.16.2).
+
+    Это скрытые `lot-field` без пометки required: обязательность включает JS в
+    зависимости от выбора в другом поле. Блокировать создание нельзя (иначе не
+    создать лот там, где поле правда не нужно), но предупредить — обязательно.
+    """
+    values = data.get("custom_values") or {}
+    out = []
+    for field in data.get("custom_fields") or []:
+        if field.get("required") or not field.get("soft_required"):
+            continue
+        val = values.get(field.get("name"))
+        if isinstance(val, (list, tuple, set)):
+            val = [v for v in val if str(v).strip()]
+        if not val:
+            out.append(field)
+    return out
+
+
+def _fzr_show_create_confirm(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    """
+    Финальный экран мастера: проверка данных + опции привязки.
+
+    Здесь же тумблер синхронизации цены — раньше его приходилось включать
+    вручную в карточке привязки после создания лота, и о нём легко забыть.
+    """
+    data = state["data"]
+    cfg = load_config()
+    sku = data.get("sku") or ""
+    psync = bool(data.get("price_sync"))
+    lines = ["🆕 <b>Проверьте лот перед созданием</b>", ""]
+    amount_line = ""
+    if _fzr_needs_amount(data):
+        amt = data.get("amount")
+        amount_line = (f"\n📦 Наличие: <b>{_esc(amt)}</b>" if amt
+                       else f"\n📦 Наличие: <b>{_AMOUNT_DEFAULT}</b> <i>(по умолчанию)</i>")
+    lines.append(f"<blockquote>📌 Название: <b>{_esc(data.get('title_ru') or '—')}</b>\n"
+                 f"🎮 Категория: {_esc(data.get('subcat_name') or '—')}\n"
+                 f"💰 Цена (чистыми): <b>{_esc(data.get('price'))}</b>{amount_line}</blockquote>")
+    # v3.16: показываем поля подкатегории (регион, платформа) — раньше их не было
+    # видно, и продавец не понимал, что именно ушло на FunPay
+    custom_summary = _fzr_custom_values_summary(data)
+    if custom_summary:
+        lines.append(f"<blockquote>🧩 <b>Поля подкатегории</b>\n{custom_summary}</blockquote>")
+    missing = _fzr_missing_required_fields(data)
+    if missing:
+        names = ", ".join(str(f.get("label") or f.get("name")) for f in missing)
+        lines.append(f"⚠️ <b>Не заполнены обязательные поля:</b> {_esc(names)}\n"
+                     f"<i>FunPay не сохранит лот без них — нажмите «Заполнить поля».</i>")
+    else:
+        # v3.16.2: скрытые поля подкатегории FunPay требует избирательно —
+        # предупреждаем, но создавать не мешаем
+        soft = _fzr_unfilled_soft_fields(data)
+        if soft:
+            names = ", ".join(str(f.get("label") or f.get("name")) for f in soft)
+            lines.append(f"ℹ️ <b>Не заполнено:</b> {_esc(names)}\n"
+                         f"<i>FunPay требует эти поля не всегда. Если откажет — "
+                         f"заполните и создайте снова.</i>")
+    if sku:
+        bd = _markup_breakdown(data.get("price_usd"), {}, cfg)
+        calc = ""
+        calc_price = bd.get("price_rub")
+        if calc_price is not None:
+            calc = (f"\n<i>расчёт по курсу: {_esc(bd['price_usd'])}$ × {_esc(bd['rate'])} "
+                    f"+{_esc(bd['markup_percent'])}% = {_esc(bd['price_rub'])}₽</i>")
+        lines.append(f"<blockquote>🔗 SKU: <code>{_esc(sku)}</code>\n"
+                     f"🛒 {_esc(data.get('offer_name') or '—')}\n"
+                     f"💵 Закупка: <b>{_esc(data.get('price_usd') or '—')} USD</b>{calc}</blockquote>")
+        lines.append(f"<blockquote>🔄 Синхронизация цены: "
+                     f"<b>{'включена' if psync else 'выключена'}</b>\n"
+                     f"<i>Когда включена, плагин сам меняет цену лота при изменении "
+                     f"курса или закупки на FazerCards.</i></blockquote>")
+        # Предупреждаем о расхождении: иначе продавец поставит 100₽, включит
+        # синхронизацию, и первая же проверка «неожиданно» поднимет цену.
+        if psync and calc_price is not None:
+            try:
+                own = float(data.get("price") or 0)
+            except (TypeError, ValueError):
+                own = 0.0
+            if own and abs(own - float(calc_price)) / max(own, 0.01) > 0.05:
+                lines.append(f"⚠️ <i>Ваша цена <b>{_esc(own)}₽</b> отличается от расчётной "
+                             f"<b>{_esc(calc_price)}₽</b>. С включённой синхронизацией "
+                             f"плагин выставит расчётную — нажмите «Взять расчётную цену», "
+                             f"чтобы не удивляться.</i>")
+        if psync and not (cfg["settings"].get("exchange_rate") or 0):
+            lines.append("⚠️ <i>Курс RUB/USD не задан — синхронизация не сработает, "
+                         "пока не укажете его в настройках.</i>")
+        if psync and not cfg["settings"].get("price_sync"):
+            lines.append("⚠️ <i>Общий автопересчёт цен выключен в настройках — "
+                         "цена будет меняться только по кнопке «Пересчитать».</i>")
+    else:
+        lines.append("<blockquote>🔗 Привязка к SKU: <i>нет</i>\n"
+                     "<i>Автовыдача работать не будет — привязку можно добавить "
+                     "позже в разделе «Привязки».</i></blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    if missing:
+        # ведём прямо к первому незаполненному полю
+        first_idx = (data.get("custom_fields") or []).index(missing[0])
+        kb.add(_inline_button(f"🧩 Заполнить поля ({len(missing)})",
+                              callback_data=_pack_callback_data(
+                                  f"{CB_PREFIX}:lotcustom_goto:{first_idx}")))
+    elif data.get("custom_fields"):
+        soft = _fzr_unfilled_soft_fields(data)
+        if soft:
+            idx = (data.get("custom_fields") or []).index(soft[0])
+            label = str(soft[0].get("label") or soft[0].get("name"))[:26]
+            kb.add(_inline_button(f"🧩 Заполнить: {label}",
+                                  callback_data=_pack_callback_data(
+                                      f"{CB_PREFIX}:lotcustom_goto:{idx}")))
+        else:
+            kb.add(_inline_button("🧩 Изменить поля подкатегории",
+                                  callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom_goto:0")))
+    if _fzr_needs_amount(data):
+        kb.add(_inline_button(f"📦 Наличие: {data.get('amount') or _AMOUNT_DEFAULT}",
+                              callback_data=f"{CB_PREFIX}:create_lot_amount_edit"))
+    if sku:
+        kb.add(_inline_button(f"{'🛑 Выключить' if psync else '🔄 Включить'} синхронизацию цены",
+                              callback_data=f"{CB_PREFIX}:create_lot_psync"))
+        calc_price = _markup_breakdown(data.get("price_usd"), {}, cfg).get("price_rub")
+        if calc_price is not None and str(data.get("price")) != str(calc_price):
+            kb.add(_inline_button(f"💱 Взять расчётную цену ({calc_price}₽)",
+                                  callback_data=f"{CB_PREFIX}:create_lot_useprice"))
+    kb.add(_inline_button("✅ Создать лот", callback_data=f"{CB_PREFIX}:create_lot_go"))
+    nav = []
+    back = _wizard_back_button(state)
+    if back is not None:
+        nav.append(back)
+    nav.append(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    kb.add(*nav)
+    _fzr_reply(c, target, "\n".join(lines), kb=kb, state=state)
+
+
+def _fzr_show_custom_field(c: "Cardinal", target: Any, state: Dict[str, Any], idx: int, page: int = 0) -> None:
+    fields = state["data"]["custom_fields"]
+    if idx < 0 or idx >= len(fields):
+        state["state"] = "create_lot_title_ru"
+        _fzr_show_create_step(c, target, state)
+        return
+    field = fields[idx]
+    total = len(fields)
+    label = field.get("label") or field.get("name", "?")
+    required_mark = " *" if field.get("required") else ""
+    state["data"]["current_field_idx"] = idx
+    state["data"].setdefault("custom_field_pages", {})[str(idx)] = page
+    state["state"] = "create_lot_custom"
+    if field.get("type") == "input":
+        placeholder = field.get("placeholder") or ""
+        hint = f"\n<i>Подсказка: {_esc(placeholder)}</i>" if placeholder else ""
+        text = f"🧩 <b>Доп. поле {idx + 1}/{total}:</b> {_esc(label)}{required_mark}{hint}\n\nВведите значение или <b>/skip</b> (если не обязательно)."
+        extra = []
+        if not field.get("required"):
+            extra.append(_inline_button(
+                "⏭ Пропустить",
+                callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom:{idx}:__skip__")))
+        if idx > 0:
+            extra.append(_inline_button(
+                "⬅️ Пред. поле",
+                callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom_back:{idx}")))
+        _fzr_reply(c, target, text, kb=_wizard_kb(state, extra=extra), state=state)
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    options = field.get("options", [])
+    multi = bool(field.get("multi"))
+    field_name = field.get("name") or f"field_{idx}"
+    chosen_raw = (state["data"].get("custom_values") or {}).get(field_name)
+    if multi:
+        chosen = set(chosen_raw or [])
+    else:
+        chosen = {chosen_raw} if chosen_raw else set()
+    per_page = _CUSTOM_OPTIONS_PER_PAGE
+    total_opts = len(options)
+    total_pages = max(1, (total_opts + per_page - 1) // per_page) if total_opts else 1
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+    start = page * per_page
+    end = start + per_page
+    for opt in options[start:end]:
+        val = (opt.get("value") or "")[:50]
+        text = opt.get("text") or val
+        # отмечаем то, что выбрано СЕЙЧАС (а не то, что было в форме FunPay):
+        # в мультивыборе продавец должен видеть свой набор
+        if chosen:
+            mark = "✅ " if val in chosen else "☐ " if multi else ""
+        else:
+            mark = "✅ " if opt.get("selected") else ("☐ " if multi else "")
+        cb = _pack_callback_data(f"{CB_PREFIX}:lotcustom:{idx}:{val}")
+        kb.add(_inline_button(f"{mark}{_esc(text)}", callback_data=cb))
+    nav = []
+    if total_pages > 1:
+        if page > 0:
+            nav.append(_inline_button("⬅️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom_page:{idx}:{page - 1}")))
+        nav.append(_inline_button(f"{page + 1}/{total_pages}", callback_data=f"{CB_PREFIX}:noop"))
+        if page < total_pages - 1:
+            nav.append(_inline_button("➡️", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom_page:{idx}:{page + 1}")))
+    if nav:
+        kb.add(*nav)
+    if multi:
+        # мультивыбор нужно чем-то завершить, иначе непонятно, когда дальше
+        kb.add(_inline_button(f"➡️ Готово ({len(chosen)})",
+                              callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom:{idx}:__done__")))
+    if not field.get("required"):
+        kb.add(_inline_button("⏭ Пропустить", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom:{idx}:__skip__")))
+    nav2 = []
+    if idx > 0:
+        nav2.append(_inline_button("⬅️ Пред. поле", callback_data=_pack_callback_data(f"{CB_PREFIX}:lotcustom_back:{idx}")))
+    else:
+        back = _wizard_back_button(state)
+        if back is not None:
+            nav2.append(back)
+    nav2.append(_inline_button("🚫 Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    kb.add(*nav2)
+    hint = ("\n<i>Можно выбрать несколько — нажимайте варианты, потом «Готово».</i>"
+            if multi else "")
+    chosen_line = ""
+    if multi and chosen:
+        picked = [o.get("text") or o.get("value") for o in options if o.get("value") in chosen]
+        chosen_line = f"\n✅ Выбрано: <b>{_esc(', '.join(picked))}</b>"
+    text = (f"🧩 <b>Доп. поле {idx + 1}/{total}:</b> {_esc(label)}{required_mark}{hint}{chosen_line}"
+            f"\n\n<i>Страница {page + 1}/{total_pages}. Выберите значение:</i>")
+    _fzr_reply(c, target, text, kb=kb, state=state)
+
+
+def _fzr_handle_custom_select(c: "Cardinal", call: Any, arg: str) -> None:
+    state = get_state(call.from_user.id)
+    if state is None or state.get("state") != "create_lot_custom":
+        _send_or_edit(c, call,
+                      "⚠️ <b>Шаг мастера уже не активен.</b>\n\n"
+                      "<i>Начните создание лота заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    try:
+        idx_raw, value = arg.split(":", 1)
+        idx = int(idx_raw)
+    except ValueError:
+        _send_or_edit(c, call, "❌ Некорректные данные кнопки.", kb=_main_keyboard())
+        return
+    value = (value or "").strip()
+    fields = state["data"].get("custom_fields", [])
+    if idx < 0 or idx >= len(fields):
+        _send_or_edit(c, call, "❌ Поле не найдено.", kb=_main_keyboard())
+        return
+    field = fields[idx]
+    field_name = field.get("name") or f"field_{idx}"
+    multi = bool(field.get("multi"))
+    values = state["data"].setdefault("custom_values", {})
+
+    if value == "__done__":
+        # завершение мультивыбора
+        picked = values.get(field_name) or []
+        if field.get("required") and not picked:
+            try:
+                c.telegram.bot.answer_callback_query(call.id, "Выберите хотя бы один вариант")
+            except Exception:
+                pass
+            return
+        try:
+            c.telegram.bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        state["data"]["current_field_idx"] = idx + 1
+        _fzr_show_create_step(c, call, state)
+        return
+
+    if value == "__skip__" or value == "":
+        if field.get("required"):
+            try:
+                c.telegram.bot.answer_callback_query(call.id, "Это поле обязательное")
+            except Exception:
+                pass
+            return
+        # необязательное поле: снимаем ранее выбранное, чтобы «Пропустить»
+        # после случайного выбора реально пропускал
+        values.pop(field_name, None)
+    elif multi:
+        # v3.16: чекбоксы — переключаем значение в наборе и остаёмся на шаге
+        current = list(values.get(field_name) or [])
+        if value in current:
+            current.remove(value)
+        else:
+            current.append(value[:1000])
+        if current:
+            values[field_name] = current
+        else:
+            values.pop(field_name, None)
+        try:
+            c.telegram.bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        page = int((state["data"].get("custom_field_pages") or {}).get(str(idx), 0) or 0)
+        _fzr_show_custom_field(c, call, state, idx, page=page)
+        return
+    else:
+        values[field_name] = value[:1000]
+    try:
+        c.telegram.bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    state["data"]["current_field_idx"] = idx + 1
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_handle_custom_page(c: "Cardinal", call: Any, arg: str) -> None:
+    state = get_state(call.from_user.id)
+    if state is None or state.get("state") != "create_lot_custom":
+        _send_or_edit(c, call,
+                      "⚠️ <b>Шаг мастера уже не активен.</b>\n\n"
+                      "<i>Начните создание лота заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    try:
+        idx_raw, page_raw = arg.split(":", 1)
+        idx = int(idx_raw)
+        page = int(page_raw)
+    except ValueError:
+        _send_or_edit(c, call, "❌ Некорректные данные пагинации.", kb=_main_keyboard())
+        return
+    _fzr_show_custom_field(c, call, state, idx, page)
+
+
+def _fzr_goto_custom_field(c: "Cardinal", call: Any, arg: str) -> None:
+    """
+    Прыжок к полю подкатегории с экрана подтверждения (v3.16).
+
+    Нужен, когда обязательное поле (регион у гифтов) осталось пустым: без
+    этого продавцу пришлось бы жать «Назад» через все шаги мастера.
+    """
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") not in _WIZARD_STATES:
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    try:
+        idx = int(arg)
+    except (TypeError, ValueError):
+        idx = 0
+    fields = state["data"].get("custom_fields") or []
+    if not fields:
+        _fzr_show_create_step(c, call, state)
+        return
+    idx = max(0, min(idx, len(fields) - 1))
+    # запомним, что после заполнения полей нужно вернуться к подтверждению
+    state["data"]["return_to_confirm_after_custom"] = True
+    state["state"] = "create_lot_custom"
+    _fzr_show_custom_field(c, call, state, idx)
+
+
+def _fzr_handle_custom_back(c: "Cardinal", call: Any, arg: str) -> None:
+    state = get_state(call.from_user.id)
+    if state is None or state.get("state") != "create_lot_custom":
+        _send_or_edit(c, call,
+                      "⚠️ <b>Шаг мастера уже не активен.</b>\n\n"
+                      "<i>Начните создание лота заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    try:
+        idx = int(arg)
+    except ValueError:
+        _send_or_edit(c, call, "❌ Некорректные данные кнопки.", kb=_main_keyboard())
+        return
+    prev_idx = max(0, idx - 1)
+    state["data"]["current_field_idx"] = prev_idx
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_open_sku_catalog_for_create_lot(c: "Cardinal", call: Any) -> None:
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if state is None or state.get("state") not in ("create_lot_sku", "create_lot_confirm"):
+        _send_or_edit(c, call,
+                      "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                      "<i>Начните заново: «🆕 Создать лот» — либо добавьте привязку "
+                      "к существующему лоту через «🔗 Привязки».</i>",
+                      kb=_main_keyboard())
+        return
+    state["data"]["selecting_sku"] = True
+    _show_catalog(c, call, "")
+
+
+def _step_create_lot_custom(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip()
+    data = state["data"]
+    # v3.15: ответ продавца убираем из чата — экран мастера один и он же
+    # покажет, что значение принято
+    _fzr_delete_message(c, message)
+    idx = data.get("current_field_idx", 0)
+    fields = data.get("custom_fields", [])
+    if idx < 0 or idx >= len(fields):
+        state["state"] = "create_lot_title_ru"
+        _fzr_show_create_step(c, message, state)
+        return
+    field = fields[idx]
+    if field.get("type") == "select":
+        data["ack"] = "⚠️ Для этого поля нужно выбрать значение кнопкой ниже."
+        _fzr_show_create_step(c, message, state)
+        return
+    if text.lower() == "/skip":
+        if field.get("required"):
+            data["ack"] = "⚠️ Это поле обязательное — введите значение."
+            _fzr_show_create_step(c, message, state)
+            return
+        data["ack"] = "⏭ Пропущено."
+    else:
+        if not text:
+            data["ack"] = "⚠️ Введите текстовое значение."
+            _fzr_show_create_step(c, message, state)
+            return
+        data["custom_values"][field["name"]] = text[:1000]
+        data["ack"] = f"✅ Сохранено: <code>{_esc(text[:50])}</code>"
+    data["current_field_idx"] = idx + 1
+    _fzr_show_create_step(c, message, state)
+
+
+def _step_create_lot_title_ru(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip()
+    _fzr_delete_message(c, message)
+    # /skip и «-» разрешены: в ряде подкатегорий названия нет вообще
+    if text.lower() in ("/skip", "-"):
+        state["data"]["title_ru"] = ""
+        state["data"]["title_skipped"] = True
+        state["state"] = "create_lot_desc_ru"
+        state["data"]["ack"] = "⏭ Название пропущено — подставлю его из выбранного товара."
+        _fzr_show_create_step(c, message, state)
+        return
+    if len(text) > 500:
+        state["data"]["ack"] = "❌ Название (RU) слишком длинное (макс. 500 символов)."
+        _fzr_show_create_step(c, message, state)
+        return
+    state["data"]["title_ru"] = text
+    state["data"]["title_skipped"] = False
+    state["data"]["ack"] = f"✅ Название: <code>{_esc(text[:60])}</code>"
+    state["state"] = "create_lot_title_en"
+    _fzr_show_create_step(c, message, state)
+
+
+def _fzr_skip_title(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Без названия» на шаге ввода названия."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") not in ("create_lot_title_ru", "create_lot_title_en"):
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    state["data"]["title_ru"] = ""
+    state["data"]["title_en"] = ""
+    state["data"]["title_skipped"] = True
+    state["state"] = "create_lot_desc_ru"
+    _fzr_show_create_step(c, call, state)
+
+
+def _step_create_lot_title_en(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip()
+    _fzr_delete_message(c, message)
+    if text.lower() in ("/skip", "-"):
+        text = state["data"].get("title_ru") or ""
+    if len(text) > 500:
+        state["data"]["ack"] = "❌ Название (EN) слишком длинное (макс. 500 символов)."
+        _fzr_show_create_step(c, message, state)
+        return
+    state["data"]["title_en"] = text
+    state["state"] = "create_lot_desc_ru"
+    _fzr_show_create_step(c, message, state)
+
+
+def _step_create_lot_desc_ru(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip()
+    _fzr_delete_message(c, message)
+    if text.lower() == "/skip":
+        text = ""
+    if text and len(text) > 4000:
+        state["data"]["ack"] = "❌ Описание (RU) слишком длинное (макс. 4000 символов)."
+        _fzr_show_create_step(c, message, state)
+        return
+    state["data"]["desc_ru"] = text
+    state["state"] = "create_lot_desc_en"
+    _fzr_show_create_step(c, message, state)
+
+
+def _step_create_lot_desc_en(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip()
+    _fzr_delete_message(c, message)
+    if text.lower() == "/skip":
+        text = state["data"]["desc_ru"]
+    if text and len(text) > 4000:
+        state["data"]["ack"] = "❌ Описание (EN) слишком длинное (макс. 4000 символов)."
+        _fzr_show_create_step(c, message, state)
+        return
+    state["data"]["desc_en"] = text
+    state["state"] = "create_lot_price"
+    _fzr_show_create_step(c, message, state)
+
+
+def _step_create_lot_price(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    logger.info("step_create_lot_price start", extra={"user_id": user_id, "state": state.get("state"), "text": (message.text or "")[:50]})
+    _fzr_delete_message(c, message)
+    income, error = _validate_price(message.text or "")
+    if error:
+        state["data"]["ack"] = f"❌ {_esc(error)}"
+        _fzr_show_create_step(c, message, state)
+        return
+    data = state["data"]
+    data["price"] = income
+    data["price_income"] = income
+    # Встроенную автовыдачу FunPay НЕ включаем: товары выдаёт плагин, а с
+    # auto_delivery=on FunPay считает наличие по своим «секретам» (их 0) и
+    # отклоняет лот. Наличие спрашиваем отдельным шагом.
+    data["auto_delivery"] = False
+    data["ack"] = (f"💰 Цена: <b>{_esc(income)}</b> чистыми "
+                   f"<i>(FunPay добавит комиссию покупателю)</i>")
+    if _fzr_needs_amount(data):
+        state["state"] = "create_lot_amount"
+    else:
+        state["state"] = "create_lot_sku"
+    logger.info("step_create_lot_price done", extra={"user_id": user_id, "next": state["state"]})
+    _fzr_show_create_step(c, message, state)
+
+
+def _step_create_lot_sku(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    logger.info("step_create_lot_sku start", extra={"user_id": user_id, "state": state.get("state"), "text": (message.text or "")[:200]})
+    sku_text = (message.text or "").strip()
+    data = state["data"]
+    _fzr_delete_message(c, message)
+    if sku_text in ("-", "", "/skip"):
+        data["sku"] = ""
+        data["price_sync"] = False
+    else:
+        try:
+            kind, category_id, offer_id = _parse_sku(sku_text)
+        except ValueError as e:
+            data["ack"] = (f"❌ {_esc(e)}\n"
+                           f"Формат: <code>kind:category_id:offer_id</code>, "
+                           f"например <code>giftcards:123:456</code>")
+            _fzr_show_create_step(c, message, state)
+            return
+        data["sku"] = f"{kind}:{category_id}:{offer_id}"
+        data["category_kind"] = kind
+        data["category_id"] = category_id
+        data["offer_id"] = offer_id
+        # синхронизацию цены предлагаем включённой: цену лота считает плагин,
+        # значит и следить за курсом/закупкой логично ему же
+        data.setdefault("price_sync", True)
+    state["state"] = "create_lot_confirm"
+    _fzr_show_create_step(c, message, state)
+
+
+def _fzr_skip_sku_step(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Без привязки» на шаге SKU."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") != "create_lot_sku":
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    state["data"]["sku"] = ""
+    state["data"]["price_sync"] = False
+    state["state"] = "create_lot_confirm"
+    _fzr_show_create_step(c, call, state)
+
+
+def _fzr_toggle_create_psync(c: "Cardinal", call: Any) -> None:
+    """Тумблер синхронизации цены на экране подтверждения."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") != "create_lot_confirm":
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    state["data"]["price_sync"] = not state["data"].get("price_sync")
+    _fzr_show_create_confirm(c, call, state)
+
+
+def _fzr_use_calc_price(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Взять расчётную цену»: ставим ту цену, которую посчитал плагин."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") != "create_lot_confirm":
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    cfg = load_config()
+    calc = _markup_breakdown(state["data"].get("price_usd"), {}, cfg).get("price_rub")
+    if calc is None:
+        _fzr_show_create_confirm(c, call, state)
+        return
+    state["data"]["price"] = calc
+    state["data"]["price_income"] = calc
+    _fzr_show_create_confirm(c, call, state)
+
+
+def _fzr_fix_failed_lot(c: "Cardinal", call: Any) -> None:
+    """
+    «Заполнить поле» после отказа FunPay (v3.16.1).
+
+    Возвращает мастер к незаполненному полю с сохранёнными данными. Если поля
+    нет в разобранной форме (FunPay требует то, что парсер не увидел) —
+    добавляем его как поле ручного ввода: продавец впишет значение сам, и лот
+    всё равно создастся, а не встанет насмерть.
+    """
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    item = _failed_draft_get(user_id)
+    if not item:
+        _send_or_edit(c, call, "⚠️ <b>Черновик лота уже неактуален.</b>\n\n"
+                               "<i>Создайте лот заново: «🆕 Создать лот».</i>",
+                      kb=_main_keyboard())
+        return
+    data = copy.deepcopy(item["data"])
+    missing = item.get("missing") or []
+    fields = list(data.get("custom_fields") or [])
+    known = {f.get("name") for f in fields}
+
+    # обновляем форму: возможно, поле распознаётся уже сейчас
+    try:
+        fresh = _fzr_fetch_lot_form(c, data.get("subcat_id"))
+        for f in fresh.get("custom") or []:
+            if f.get("name") in missing and f.get("name") not in known:
+                fields.append(f)
+                known.add(f.get("name"))
+    except Exception as e:
+        logger.warning("refetch lot form failed", extra={"error": _redact_sensitive(str(e))})
+
+    target_idx = None
+    for name in missing:
+        if name in ("price", "amount"):
+            continue
+        if name not in known:
+            # поля нет даже в свежей форме — спросим значение текстом
+            fields.append({
+                "type": "input",
+                "name": name,
+                "label": _humanize_field_name(name),
+                "required": True,
+                "options": [],
+                "current_value": "",
+                "placeholder": "значение как на сайте FunPay",
+                "manual": True,
+            })
+            known.add(name)
+        if target_idx is None:
+            target_idx = next((i for i, f in enumerate(fields) if f.get("name") == name), None)
+
+    data["custom_fields"] = fields
+    data["return_to_confirm_after_custom"] = True
+    data.pop("screen_msg_id", None)
+    data.pop("screen_chat_id", None)
+    # «Наличие» правится своим экраном
+    if target_idx is None and "amount" in missing:
+        set_state(user_id, "create_lot_amount", data)
+        state = get_state(user_id)
+        state["data"]["return_to_confirm"] = True
+        _fzr_show_create_step(c, call, state)
+        return
+    if target_idx is None:
+        set_state(user_id, "create_lot_confirm", data)
+        _fzr_show_create_step(c, call, get_state(user_id))
+        return
+    data["current_field_idx"] = target_idx
+    set_state(user_id, "create_lot_custom", data)
+    with _FAILED_LOT_LOCK:
+        _FAILED_LOT_DRAFTS.pop(user_id, None)
+    _fzr_show_custom_field(c, call, get_state(user_id), target_idx)
+
+
+def _fzr_confirm_create_lot(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Создать лот» — единственная точка фактического создания."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    state = get_state(user_id) if user_id else None
+    if not state or state.get("state") != "create_lot_confirm":
+        _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
+                               "<i>Начните заново: «🆕 Создать лот».</i>", kb=_main_keyboard())
+        return
+    # v3.16: не отправляем лот, если обязательное поле подкатегории пустое.
+    # FunPay всё равно откажет, а ответ будет бесполезным «Заполните все поля».
+    missing = _fzr_missing_required_fields(state["data"])
+    if missing:
+        names = ", ".join(str(f.get("label") or f.get("name")) for f in missing)
+        state["data"]["ack"] = (f"⚠️ Сначала заполните: <b>{_esc(names)}</b>\n"
+                                f"<i>Без этих полей FunPay не сохранит лот.</i>")
+        _fzr_show_create_confirm(c, call, state)
+        return
+    data = dict(state["data"])
+    chat_id = getattr(getattr(getattr(call, "message", None), "chat", None), "id", None)
+    message_id = getattr(getattr(call, "message", None), "message_id", None)
+    clear_state(user_id)
+    _send_or_edit(c, call, "⏳ <b>Создаю лот на FunPay...</b>", kb=None)
+    _submit_task(_fzr_do_create_lot, c, data, chat_id, message_id, user_id)
+
+
+def _step_create_lot_confirm(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    """
+    На экране подтверждения ждём нажатия кнопки.
+
+    Если продавец вместо кнопки пишет текст — трактуем его как новый SKU
+    (частый сценарий: «а давай другой товар»), иначе просто напоминаем.
+    """
+    text = (message.text or "").strip()
+    if text and text not in ("-", "/skip") and ":" in text:
+        state["state"] = "create_lot_sku"
+        _step_create_lot_sku(c, message, state)
+        return
+    _fzr_show_create_confirm(c, message, state)
+
+
+def _fzr_effective_title(data: Dict[str, Any]) -> str:
+    """
+    Название лота для FunPay.
+
+    Продавец мог пропустить его (в части подкатегорий поля названия нет),
+    поэтому подставляем по убыванию осмысленности: имя товара FazerCards →
+    имя подкатегории → SKU. Совсем пустое название оставляем только если
+    больше нечего взять: FunPay такое принимает, но лот потом не найти.
+    """
+    for key in ("title_ru", "offer_name", "subcat_name"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value[:500]
+    sku = str(data.get("sku") or "").strip()
+    return sku[:500]
+
+
+def _fzr_build_lot_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    title_ru = _fzr_effective_title(data)
+    title_en = str(data.get("title_en") or "").strip() or title_ru
+    # Встроенная автовыдача FunPay нам не нужна (выдаёт плагин), и включать её
+    # опасно: при auto_delivery=on FunPay берёт наличие из своих «секретов»,
+    # которых у нас нет, и лот не сохраняется.
+    auto_delivery = bool(data.get("auto_delivery"))
+    amount = data.get("amount")
+    if not auto_delivery and _fzr_needs_amount(data):
+        # поле «Наличие» в форме есть — оно обязательное, пустым не отправляем
+        try:
+            amount = int(amount) if amount not in (None, "") else _AMOUNT_DEFAULT
+        except (TypeError, ValueError):
+            amount = _AMOUNT_DEFAULT
+        amount = max(1, min(amount, _AMOUNT_MAX))
+    elif auto_delivery:
+        amount = None       # FunPay посчитает сам по числу секретов
+    return {
+        "title_ru": title_ru,
+        "title_en": title_en,
+        "desc_ru": data.get("desc_ru", ""),
+        "desc_en": data.get("desc_en", ""),
+        "payment_msg_ru": "",
+        "payment_msg_en": "",
+        "price": data.get("price", 0),
+        "active": data.get("active", True),
+        "auto_delivery": auto_delivery,
+        "secrets": [],
+        "amount": amount,
+        "deactivate_after_sale": False,
+    }
+
+
+def _fzr_build_mapping_from_offer(data: Dict[str, Any], offer_info: Dict[str, Any], lot_id: Any, subcat_id: Any) -> Dict[str, Any]:
+    cfg = load_config()
+    sku = data.get("sku", "")
+    kind = data.get("category_kind")
+    category_id = data.get("category_id")
+    offer_id = data.get("offer_id")
+    meta_fields: List[Dict[str, Any]] = []
+    for f in offer_info.get("fields") or data.get("fields") or []:
+        key = f.get("code") or f.get("key") or ""
+        label = f.get("name") or f.get("label") or key
+        if not key:
+            continue
+        # _make_metadata_field сохраняет type/options для select-полей
+        meta_fields.append(_make_metadata_field(key, label, f))
+    return {
+        "id": str(uuid.uuid4()),
+        "fzr_sku_id": sku,
+        "category_kind": kind or "",
+        "category_id": category_id or "",
+        "offer_id": offer_id or "",
+        "offer_name": offer_info.get("offer_name", data.get("offer_name", "")),
+        "price_usd": str(offer_info.get("price_usd") or data.get("price_usd", "")),
+        "stock": offer_info.get("stock", data.get("stock")),
+        "min_quantity": offer_info.get("min_quantity", data.get("min_quantity")),
+        "max_quantity": offer_info.get("max_quantity", data.get("max_quantity")),
+        "fields": offer_info.get("fields", data.get("fields", [])),
+        "funpay_lot_id": lot_id,
+        "funpay_subcategory_id": subcat_id,
+        "funpay_title": data.get("title_ru") or _fzr_effective_title(data),
+        # None = наследовать глобальную наценку (0 означал бы «ровно 0%»)
+        "markup_percent": None,
+        "markup_fixed": None,
+        "metadata_key": meta_fields[0]["key"] if meta_fields else "",
+        "metadata_prompt": meta_fields[0]["label"] if meta_fields else "",
+        "metadata_fields": meta_fields,
+        "delivery_template": "",
+        "enabled": True,
+        # v3.7: синхронизацию цены выбирают прямо в мастере создания лота
+        "price_sync": 1 if data.get("price_sync") else 0,
+        # цену лота мы только что поставили сами — фиксируем как эталон,
+        # иначе первая синхронизация посчитала бы её «первым запуском»
+        "last_price_usd": str(offer_info.get("price_usd") or data.get("price_usd") or ""),
+        "last_lot_price": data.get("price"),
+        "price_synced_at": time.time() if data.get("price_sync") else None,
+    }
+
+
+def _fzr_resolve_offer_info_for_lot(cfg: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    kind = data.get("category_kind")
+    category_id = data.get("category_id")
+    offer_id = data.get("offer_id")
+    if kind and category_id and offer_id and cfg.get("api_key"):
+        try:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            return _resolve_offer_info(api, kind, category_id, offer_id)
+        except Exception:
+            return {}
+    return {}
+
+
+_FAILED_LOT_DRAFTS: Dict[int, Dict[str, Any]] = {}
+_FAILED_LOT_LOCK = threading.RLock()
+_FAILED_LOT_TTL = 3600.0
+
+
+def _failed_draft_put(user_id: Optional[int], data: Dict[str, Any],
+                      missing_names: List[str]) -> None:
+    """
+    Запоминаем черновик лота, который FunPay отказался сохранить.
+
+    v3.16.1: раньше при отказе состояние мастера уже было очищено, и продавцу
+    предлагали «Создать лот заново» — то есть заполнить все 8 шагов повторно.
+    Теперь возвращаем его к незаполненному полю с сохранёнными данными.
+    """
+    if user_id is None:
+        return
+    with _FAILED_LOT_LOCK:
+        now = time.time()
+        for uid in [u for u, v in _FAILED_LOT_DRAFTS.items()
+                    if now - v.get("ts", 0) > _FAILED_LOT_TTL]:
+            _FAILED_LOT_DRAFTS.pop(uid, None)
+        _FAILED_LOT_DRAFTS[user_id] = {"data": copy.deepcopy(data),
+                                       "missing": list(missing_names),
+                                       "ts": now}
+
+
+def _failed_draft_get(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if user_id is None:
+        return None
+    with _FAILED_LOT_LOCK:
+        item = _FAILED_LOT_DRAFTS.get(user_id)
+        if not item:
+            return None
+        if time.time() - item.get("ts", 0) > _FAILED_LOT_TTL:
+            _FAILED_LOT_DRAFTS.pop(user_id, None)
+            return None
+        return item
+
+
+def _funpay_error_field_names(err: Optional[str]) -> List[str]:
+    """
+    Имена полей, на которые пожаловался FunPay.
+
+    Формат строки: «fields[region]: Заполните это поле.» — берём ключи,
+    чтобы вернуть продавца ровно к нужному шагу.
+    """
+    names = []
+    for line in str(err or "").splitlines():
+        if ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip()
+        if key.startswith("fields[") or key in ("amount", "price"):
+            if key not in names:
+                names.append(key)
+    return names
+
+
+def _fzr_do_create_lot(c: "Cardinal", data: Dict[str, Any], chat_id: int,
+                       reply_msg_id: Optional[int] = None,
+                       user_id: Optional[int] = None) -> None:
+    try:
+        cfg = load_config()
+        subcat_id = data["subcat_id"]
+        lots_before: set = set()
+        try:
+            profile = c.account.get_user(c.account.id)
+            lots_before = {lot.id for lot in (profile.get_lots() if profile else [])}
+        except Exception as e:
+            logger.warning("get lots before create failed", extra={"error": _redact_sensitive(str(e))})
+        fields = _fzr_build_lot_fields(data)
+        logger.info("creating lot", extra={"subcat_id": subcat_id,
+                                          "amount": fields.get("amount"),
+                                          "auto_delivery": fields.get("auto_delivery"),
+                                          "custom_values": len(data.get("custom_values") or {})})
+        ok, err, bad_fields = _fzr_create_new_lot(
+            c, subcat_id, fields, custom_select_values=data.get("custom_values"))
+        if not ok:
+            hint = _lot_save_hint(err)
+            msg = f"❌ <b>Не удалось создать лот:</b>\n\n<blockquote>{_esc(err)}</blockquote>"
+            kb = InlineKeyboardMarkup(row_width=1)
+            # v3.16.1: FunPay назвал поле — предлагаем заполнить именно его,
+            # сохранив всё остальное, а не начинать мастер с нуля
+            # сырые имена от FunPay; текст ошибки уже переведён, парсить его нельзя
+            bad_names = [n for n in bad_fields if n] or _funpay_error_field_names(err)
+            if bad_names:
+                _failed_draft_put(user_id, data, bad_names)
+                labels = []
+                for name in bad_names:
+                    label = _humanize_field_name(name)
+                    for f in data.get("custom_fields") or []:
+                        if f.get("name") == name:
+                            label = f.get("label") or label
+                            break
+                    labels.append(str(label))
+                hint = (f"Не заполнено: <b>{_esc(', '.join(labels))}</b>.\n"
+                        f"Данные лота сохранены — нажмите кнопку ниже, заполните поле "
+                        f"и создание продолжится с того же места.")
+                kb.add(_inline_button(f"🧩 Заполнить: {labels[0][:30]}",
+                                      callback_data=f"{CB_PREFIX}:create_lot_fix"))
+            if hint:
+                msg += f"\n💡 {hint}"
+            kb.add(_inline_button("🆕 Создать лот заново", callback_data=f"{CB_PREFIX}:create_lot"))
+            kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+            _send_telegram_message(c, chat_id, msg, kb=kb)
+            return
+        lot_id = _fzr_find_new_lot_id(c, fields["title_ru"], lots_before)
+        if lot_id is None:
+            _send_telegram_message(c, chat_id, "⚠️ <b>Лот создан, но не удалось определить его ID.</b>\nДобавьте привязку вручную через /fzr.", kb=_main_keyboard())
+            return
+        sku_text = "\n<i>Привязку к SKU можно добавить позже через «Привязки».</i>"
+        if data.get("sku"):
+            offer_info = _fzr_resolve_offer_info_for_lot(cfg, data)
+            mapping = _fzr_build_mapping_from_offer(data, offer_info, lot_id, subcat_id)
+            _db_save_mapping(mapping)
+            sku_text = f"\n🔗 Привязан к SKU: <code>{_esc(data['sku'])}</code>"
+            if mapping.get("price_sync"):
+                sku_text += "\n🔄 Синхронизация цены: <b>включена</b>"
+                if not cfg["settings"].get("price_sync"):
+                    sku_text += ("\n<i>⚠️ Общий автопересчёт цен выключен в настройках — "
+                                 "включите его, чтобы цена обновлялась сама.</i>")
+            else:
+                sku_text += "\n🔄 Синхронизация цены: <i>выключена</i>"
+        title_note = ""
+        if data.get("title_skipped"):
+            title_note = "\n<i>Название подставлено автоматически.</i>"
+        _send_telegram_message(
+            c,
+            chat_id,
+            f"✅ <b>Лот создан!</b>\n\n📌 {_esc(fields['title_ru'])}{title_note}\n"
+            f"💵 Цена: <b>{_esc(data.get('price'))}</b>\n"
+            f"🔗 ID лота: <code>{_esc(lot_id)}</code>{sku_text}",
+            kb=_main_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("_fzr_do_create_lot failed", extra={"error": _redact_sensitive(str(e))})
+        _send_telegram_message(c, chat_id, f"❌ <b>Ошибка создания лота:</b>\n\n<blockquote>{_esc(e)}</blockquote>", kb=_main_keyboard())
+
+
+def _prepare_order_row(order: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {col: None for col in _ORDER_COLUMNS}
+    for k, v in order.items():
+        if k in row:
+            row[k] = v
+        elif k == "metadata":
+            row["metadata_json"] = _to_json(v)
+        elif k == "order_info":
+            row["order_json"] = _to_json(v)
+        elif k == "result":
+            row["result_json"] = _to_json(v)
+    if row.get("completed_notification_sent") is None:
+        row["completed_notification_sent"] = 0
+    return row
+
+
+def _db_insert_order(order: Dict[str, Any]) -> bool:
+    if not _DB_INITIALIZED:
+        _db_init()
+    row = _prepare_order_row(order)
+    if row.get("created_at") is None:
+        row["created_at"] = time.time()
+    row["updated_at"] = time.time()
+    cols = list(row.keys())
+    placeholders = ",".join("?" for _ in cols)
+    sql = f"INSERT OR IGNORE INTO orders ({','.join(cols)}) VALUES ({placeholders})"
+    with _DB_LOCK:
+        cur = _db_connect().execute(sql, [row[c] for c in cols])
+        inserted = cur.rowcount > 0
+    if inserted:
+        _db_log_event(row.get("funpay_order_id"), "order_created", {"status": row.get("status"), "sku_id": row.get("sku_id")})
+    return inserted
+
+
+def _db_update_order(order_id: Any, **fields: Any) -> int:
+    if not _DB_INITIALIZED:
+        _db_init()
+    if not fields:
+        return 0
+    bad = set(fields) - set(_ORDER_COLUMNS)
+    if bad:
+        raise ValueError(f"invalid order columns: {bad}")
+    fields["updated_at"] = time.time()
+    cols = list(fields.keys())
+    sets = ",".join(f"{c}=?" for c in cols)
+    values = [fields[c] for c in cols] + [str(order_id)]
+    sql = f"UPDATE orders SET {sets} WHERE funpay_order_id=?"
+    with _DB_LOCK:
+        conn = _db_connect()
+        old_status = None
+        if "status" in fields:
+            row = conn.execute("SELECT status FROM orders WHERE funpay_order_id=?", (str(order_id),)).fetchone()
+            old_status = row[0] if row else None
+            if not _is_order_status_transition_allowed(old_status, fields["status"]):
+                return 0
+        cur = conn.execute(sql, values)
+        updated = cur.rowcount
+    if updated and "status" in fields and old_status != fields["status"]:
+        _db_log_event(str(order_id), "status_changed", {"from": old_status, "to": fields["status"]})
+    return updated
+
+
+def _db_force_update_order(order_id: Any, _event: str = "status_forced", **fields: Any) -> int:
+    """
+    Admin-only UPDATE that bypasses the state machine but still validates columns and logs events.
+
+    _event задаёт название события в журнале: по умолчанию «статус изменён
+    вручную», но автоматика (например, ожидание баланса) пишет свою причину,
+    иначе в истории заказа появляется вводящая в заблуждение запись.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    if not fields:
+        return 0
+    bad = set(fields) - set(_ORDER_COLUMNS)
+    if bad:
+        raise ValueError(f"invalid order columns: {bad}")
+    fields["updated_at"] = time.time()
+    cols = list(fields.keys())
+    sets = ",".join(f"{c}=?" for c in cols)
+    values = [fields[c] for c in cols] + [str(order_id)]
+    sql = f"UPDATE orders SET {sets} WHERE funpay_order_id=?"
+    with _DB_LOCK:
+        conn = _db_connect()
+        old_status = None
+        if "status" in fields:
+            row = conn.execute("SELECT status FROM orders WHERE funpay_order_id=?", (str(order_id),)).fetchone()
+            old_status = row[0] if row else None
+        cur = conn.execute(sql, values)
+        updated = cur.rowcount
+    if updated and "status" in fields:
+        _db_log_event(str(order_id), _event, {"from": old_status, "to": fields["status"]})
+    return updated
+
+
+def _db_reset_stuck_delivery_claims() -> int:
+    """Сбрасывает заказы, зависшие между claim и реальной отправкой (completed_notification_sent=1)."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    sql = """
+        UPDATE orders
+        SET completed_notification_sent = 0,
+            updated_at = ?
+        WHERE completed_notification_sent = 1
+    """
+    with _DB_LOCK:
+        cur = _db_connect().execute(sql, (time.time(),))
+        return cur.rowcount
+
+
+def _db_claim_delivery(order_id: Any, fzr_order_id: str, result_json: str) -> int:
+    if not _DB_INITIALIZED:
+        _db_init()
+    sql = """
+        UPDATE orders
+        SET status='completed',
+            fzr_order_id=?,
+            result_json=?,
+            completed_notification_sent=1,
+            updated_at=?
+        WHERE funpay_order_id=?
+          AND completed_notification_sent=0
+          AND status IN ('processing','pending','completed')
+    """
+    with _DB_LOCK:
+        cur = _db_connect().execute(sql, [str(fzr_order_id), result_json, time.time(), str(order_id)])
+        claimed = cur.rowcount
+    if claimed:
+        _db_log_event(str(order_id), "delivery_claimed", {"fzr_order_id": fzr_order_id})
+    return claimed
+def _db_get_order(order_id: Any) -> Optional[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT * FROM orders WHERE funpay_order_id=?", (str(order_id),)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["metadata"] = _from_json(d.pop("metadata_json", None))
+        d["order_info"] = _from_json(d.pop("order_json", None))
+        d["result"] = _from_json(d.pop("result_json", None))
+        d["funds"] = _from_json(d.get("funds_json"))
+        return d
+
+
+def _prepare_pending_row(dialog: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {col: None for col in _PENDING_COLUMNS}
+    for k, v in dialog.items():
+        if k in row:
+            row[k] = v
+        elif k == "data":
+            row["data_json"] = _to_json(v)
+    return row
+
+
+def _db_upsert_pending(dialog: Dict[str, Any]) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    row = _prepare_pending_row(dialog)
+    if row.get("created_at") is None:
+        row["created_at"] = time.time()
+    if row.get("chat_id") is not None:
+        row["chat_id"] = str(row["chat_id"])
+    cols = ",".join(_PENDING_COLUMNS)
+    placeholders = ",".join("?" for _ in _PENDING_COLUMNS)
+    # v3.14: created_at при обновлении НЕ трогаем. Раньше каждое сохранение
+    # диалога переписывало его текущим временем — «когда начался диалог»
+    # терялось, и потолок ожидания (см. _DIALOG_MAX_EXTENSION) не наступал
+    # никогда, а сортировка по created_at выбирала не тот диалог.
+    updates = ",".join(
+        f"{c}=excluded.{c}" for c in _PENDING_COLUMNS
+        if c not in ("funpay_order_id", "created_at")
+    )
+    updates += ",created_at=COALESCE(pending_dialogs.created_at, excluded.created_at)"
+    sql = f"INSERT INTO pending_dialogs ({cols}) VALUES ({placeholders}) ON CONFLICT(funpay_order_id) DO UPDATE SET {updates}"
+    with _DB_LOCK:
+        _db_connect().execute(sql, [row[c] for c in _PENDING_COLUMNS])
+
+
+def _db_get_pending_by_buyer(buyer_id: Any, chat_id: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        if chat_id is not None and str(chat_id) != "":
+            row = _db_connect().execute(
+                "SELECT * FROM pending_dialogs WHERE buyer_id=? AND (chat_id=? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1",
+                (buyer_id, str(chat_id)),
+            ).fetchone()
+        else:
+            row = None
+        # Fallback: order.chat_id is a string like "users-<seller>-<buyer>",
+        # but NewMessageEvent.message.chat_id is numeric, so buyer_id is the only reliable key.
+        if not row:
+            row = _db_connect().execute(
+                "SELECT * FROM pending_dialogs WHERE buyer_id=? ORDER BY created_at DESC LIMIT 1",
+                (buyer_id,),
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["data"] = _from_json(d.pop("data_json", None))
+        return d
+def _db_remove_pending(funpay_order_id: Any) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute("DELETE FROM pending_dialogs WHERE funpay_order_id=?", (str(funpay_order_id),))
+
+
+def _db_list_pending_dialogs() -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        rows = _db_connect().execute("SELECT * FROM pending_dialogs").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["data"] = _from_json(d.pop("data_json", None))
+            out.append(d)
+        return out
+
+
+def _db_update_pending_reminded(funpay_order_id: Any) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute(
+            "UPDATE pending_dialogs SET reminded_at=? WHERE funpay_order_id=?",
+            (time.time(), str(funpay_order_id)),
+        )
+
+
+def _db_clear_pending_reminded(funpay_order_id: Any) -> None:
+    """
+    v3.14: покупатель ответил — снимаем отметку о напоминании.
+
+    Иначе напоминание в диалоге срабатывает один раз за всю жизнь заказа:
+    после первого молчания флаг стоит навсегда, и если покупатель замолчит
+    на следующем шаге, его уже никто не подтолкнёт — заказ просто отвалится
+    по таймауту.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute(
+            "UPDATE pending_dialogs SET reminded_at=NULL WHERE funpay_order_id=?",
+            (str(funpay_order_id),),
+        )
+
+
+def _prepare_mapping_row(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {col: None for col in _MAPPING_COLUMNS}
+    for k, v in mapping.items():
+        if k in row:
+            row[k] = v
+        elif k == "fields":
+            row["fields_json"] = _to_json(v)
+        elif k == "metadata_fields":
+            row["metadata_fields_json"] = _to_json(v)
+    row["enabled"] = 1 if mapping.get("enabled", True) else 0
+    # validate_id: по умолчанию включена (None у старых привязок трактуем как 1)
+    row["validate_id"] = 0 if mapping.get("validate_id") in (0, "0", False) else 1
+    # units_per_item: 1 = прежнее поведение (штука лота == единица товара)
+    try:
+        _upi = int(float(mapping.get("units_per_item") or 1))
+    except (TypeError, ValueError):
+        _upi = 1
+    row["units_per_item"] = _upi if _upi > 0 else 1
+    # price_sync: по умолчанию ВЫКЛЮЧЕНА — цену лота меняем только по разрешению
+    row["price_sync"] = 1 if mapping.get("price_sync") in (1, "1", True) else 0
+    # наценка: None = «наследовать глобальную», число (в т.ч. 0) = своё значение
+    for _mk in ("markup_percent", "markup_fixed"):
+        row[_mk] = _markup_own(mapping, _mk)
+    if row.get("created_at") is None:
+        row["created_at"] = time.time()
+    row["updated_at"] = time.time()
+    return row
+
+
+def _row_to_mapping(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["enabled"] = bool(d.get("enabled", 1))
+    d["validate_id"] = 0 if d.get("validate_id") in (0, "0", False) else 1
+    try:
+        _upi = int(float(d.get("units_per_item") or 1))
+    except (TypeError, ValueError):
+        _upi = 1
+    d["units_per_item"] = _upi if _upi > 0 else 1
+    d["price_sync"] = 1 if d.get("price_sync") in (1, "1", True) else 0
+    d["fields"] = _from_json(d.pop("fields_json", None))
+    d["metadata_fields"] = _from_json(d.pop("metadata_fields_json", None))
+    return d
+
+
+def _db_get_mappings(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    sql = "SELECT * FROM mappings"
+    params: Tuple[Any, ...] = ()
+    if enabled_only:
+        sql += " WHERE enabled=1"
+    sql += " ORDER BY updated_at DESC"
+    with _DB_LOCK:
+        rows = _db_connect().execute(sql, params).fetchall()
+        return [_row_to_mapping(r) for r in rows]
+
+
+def _db_get_mapping_by_id(mapping_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not mapping_id:
+        return None
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT * FROM mappings WHERE id=?", (str(mapping_id),)).fetchone()
+        return _row_to_mapping(row) if row else None
+
+
+def _db_get_mapping_by_lot_id(lot_id: Any) -> Optional[Dict[str, Any]]:
+    if lot_id is None:
+        return None
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT * FROM mappings WHERE funpay_lot_id=? AND enabled=1 LIMIT 1", (str(lot_id),)).fetchone()
+        return _row_to_mapping(row) if row else None
+
+
+def _db_get_mapping_by_sku_id(sku_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not sku_id:
+        return None
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT * FROM mappings WHERE fzr_sku_id=? AND enabled=1 LIMIT 1", (str(sku_id),)).fetchone()
+        return _row_to_mapping(row) if row else None
+
+
+def _db_save_mapping(mapping: Dict[str, Any]) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    row = _prepare_mapping_row(mapping)
+    cols = ",".join(_MAPPING_COLUMNS)
+    placeholders = ",".join("?" for _ in _MAPPING_COLUMNS)
+    updates = ",".join(f"{c}=excluded.{c}" for c in _MAPPING_COLUMNS if c != "id")
+    sql = f"INSERT INTO mappings ({cols}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}"
+    with _DB_LOCK:
+        _db_connect().execute(sql, [row[c] for c in _MAPPING_COLUMNS])
+
+
+def _db_delete_mapping(mapping_id: str) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute("DELETE FROM mappings WHERE id=?", (str(mapping_id),))
+
+
+def _db_delete_all_mappings() -> int:
+    """
+    Удаляет ВСЕ привязки. Возвращает, сколько удалено (v3.20).
+
+    Вызывать только после подтверждения и бэкапа: заказы по этим лотам
+    перестанут выдаваться автоматически.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        cur = _db_connect().execute("DELETE FROM mappings")
+        removed = cur.rowcount
+    logger.warning("all mappings deleted", extra={"count": removed})
+    return max(0, removed)
+
+
+def _db_log_event(funpay_order_id: Any, event_type: str, data: Optional[Dict[str, Any]] = None) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute(
+            "INSERT INTO order_events (funpay_order_id, event_type, data_json, created_at) VALUES (?, ?, ?, ?)",
+            (str(funpay_order_id), event_type, _to_json(data), time.time()),
+        )
+
+
+def _db_get_events(funpay_order_id: Any, limit: int = 50) -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        rows = _db_connect().execute(
+            "SELECT * FROM order_events WHERE funpay_order_id=? ORDER BY created_at DESC LIMIT ?",
+            (str(funpay_order_id), limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["data"] = _from_json(d.pop("data_json", None))
+            out.append(d)
+        return out
+
+
+# -----------------------------------------------------------------------------
+# manual_chat (v3.4): переписка с исполнителем по ручным услугам
+# -----------------------------------------------------------------------------
+
+def _manual_msg_hash(funpay_order_id: str, msg: Dict[str, Any]) -> str:
+    """
+    Устойчивый ключ сообщения.
+
+    API не даёт id сообщения, а историю отдаёт целиком, поэтому дедуплицируем
+    по (заказ, отправитель, время, текст, картинки). created_at у одного и того
+    же сообщения не меняется, так что ключ стабилен между опросами.
+    """
+    payload = "|".join([
+        str(funpay_order_id),
+        str(msg.get("sender") or ""),
+        str(msg.get("created_at") or ""),
+        str(msg.get("body") or ""),
+        ",".join(_manual_images(msg)),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _manual_images(msg: Dict[str, Any]) -> List[str]:
+    """Все картинки сообщения: API отдаёт и image_url, и image_urls[]."""
+    urls: List[str] = []
+    raw = msg.get("image_urls")
+    if isinstance(raw, list):
+        urls.extend(str(u) for u in raw if u)
+    single = msg.get("image_url")
+    if single and str(single) not in urls:
+        urls.insert(0, str(single))
+    return urls
+
+
+def _db_manual_chat_new(funpay_order_id: str, fzr_order_id: Optional[str],
+                        messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Сохраняет сообщения и возвращает ТОЛЬКО те, которых раньше не видели.
+
+    INSERT OR IGNORE по msg_hash: если опрос повторится (или два потока опросят
+    одновременно), продавец не получит дубли.
+
+    Наши собственные сообщения приходят из API в общей истории (sender «you»).
+    Мы уже записали их локально при отправке, поэтому:
+      * помечаем их outgoing=1 (иначе кнопка «переслать покупателю» пыталась бы
+        отправить покупателю наш же ответ и возвращала 0);
+      * не создаём второй записи, если такой текст мы отправили сами недавно.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    fresh: List[Dict[str, Any]] = []
+    now = time.time()
+    with _DB_LOCK:
+        conn = _db_connect()
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            body = str(msg.get("body") or "").strip()
+            images = _manual_images(msg)
+            if not body and not images:
+                continue
+            sender = str(msg.get("sender") or "?")
+            outgoing = 1 if _is_seller_message(sender) else 0
+            if outgoing and body:
+                # своё сообщение уже лежит в базе (записали при отправке)
+                dup = conn.execute(
+                    "SELECT 1 FROM manual_chat WHERE funpay_order_id=? AND outgoing=1 "
+                    "AND body=? AND seen_at > ? LIMIT 1",
+                    (str(funpay_order_id), body, now - 86400),
+                ).fetchone()
+                if dup:
+                    continue
+            h = _manual_msg_hash(funpay_order_id, msg)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO manual_chat "
+                "(msg_hash, funpay_order_id, fzr_order_id, sender, body, "
+                " image_urls_json, created_at, seen_at, outgoing) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (h, str(funpay_order_id), str(fzr_order_id or ""), sender, body,
+                 _to_json(images), str(msg.get("created_at") or ""), now, outgoing),
+            )
+            if cur.rowcount:
+                fresh.append({"hash": h, "sender": sender, "body": body,
+                              "images": images, "created_at": msg.get("created_at"),
+                              "outgoing": outgoing})
+    return fresh
+
+
+def _db_manual_chat_log_outgoing(funpay_order_id: str, fzr_order_id: Optional[str],
+                                 body: str, sender: str = "seller") -> None:
+    """Пишем свои сообщения в ту же таблицу — чтобы история была полной."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    msg = {"sender": sender, "body": body, "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    h = _manual_msg_hash(funpay_order_id, msg)
+    with _DB_LOCK:
+        _db_connect().execute(
+            "INSERT OR IGNORE INTO manual_chat "
+            "(msg_hash, funpay_order_id, fzr_order_id, sender, body, image_urls_json, "
+            " created_at, seen_at, outgoing) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (h, str(funpay_order_id), str(fzr_order_id or ""), sender, body,
+             _to_json([]), msg["created_at"], time.time()),
+        )
+
+
+def _db_manual_chat_history(funpay_order_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        # rowid во вторичной сортировке: сообщения одного опроса получают
+        # одинаковый seen_at, и без него порядок внутри пачки был случайным
+        rows = _db_connect().execute(
+            "SELECT rowid AS rid, * FROM manual_chat WHERE funpay_order_id=? "
+            "ORDER BY seen_at DESC, rid DESC LIMIT ?",
+            (str(funpay_order_id), limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d.pop("rid", None)
+        d["images"] = _from_json(d.pop("image_urls_json", None)) or []
+        out.append(d)
+    return list(reversed(out))
+
+
+def _db_manual_chat_count(funpay_order_id: str) -> int:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute(
+            "SELECT COUNT(*) FROM manual_chat WHERE funpay_order_id=?",
+            (str(funpay_order_id),)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _db_manual_chat_orders() -> List[str]:
+    """Заказы, по которым есть переписка — для списка в ПУ."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        rows = _db_connect().execute(
+            "SELECT funpay_order_id, MAX(seen_at) AS last FROM manual_chat "
+            "GROUP BY funpay_order_id ORDER BY last DESC LIMIT 30").fetchall()
+    return [str(r[0]) for r in rows]
+
+
+# =============================================================================
+# config
+# =============================================================================
+
+def _config_cache_put(cfg: Dict[str, Any]) -> None:
+    with _FILES_LOCK:
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            mtime = None
+        _CONFIG_CACHE["path"] = CONFIG_FILE
+        _CONFIG_CACHE["mtime"] = mtime
+        _CONFIG_CACHE["cfg"] = copy.deepcopy(cfg)
+
+
+def _config_cache_invalidate() -> None:
+    with _FILES_LOCK:
+        _CONFIG_CACHE["path"] = None
+        _CONFIG_CACHE["mtime"] = None
+        _CONFIG_CACHE["cfg"] = None
+
+
+def create_default_config() -> Dict[str, Any]:
+    return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def load_config() -> Dict[str, Any]:
+    def _try_load(path: str) -> Optional[Dict[str, Any]]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.strip():
+                return None
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError("config is not a dict")
+            return data
+        except Exception:
+            return None
+
+    with _FILES_LOCK:
+        if _CONFIG_CACHE["cfg"] is not None and _CONFIG_CACHE["path"] == CONFIG_FILE:
+            try:
+                if os.path.getmtime(CONFIG_FILE) == _CONFIG_CACHE["mtime"]:
+                    return copy.deepcopy(_CONFIG_CACHE["cfg"])
+            except OSError:
+                pass
+
+    logger.info("loading config", extra={"path": CONFIG_FILE})
+    cfg = _try_load(CONFIG_FILE)
+    needs_save = False
+
+    if cfg is None:
+        backup_dir = os.path.join(os.path.dirname(CONFIG_FILE) or BASE_CACHE_DIR, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        if os.path.exists(CONFIG_FILE):
+            try:
+                backup_path = os.path.join(backup_dir, f"config.{int(time.time())}.corrupt.json")
+                shutil.copy2(CONFIG_FILE, backup_path)
+                logger.warning("config corrupted, backed up", extra={"backup": backup_path})
+            except Exception as e:
+                logger.error("config backup failed", extra={"error": repr(e)})
+            try:
+                backups = sorted([
+                    os.path.join(backup_dir, fn)
+                    for fn in os.listdir(backup_dir)
+                    if fn.startswith("config.") and fn.endswith(".corrupt.json")
+                ])
+                for bp in reversed(backups):
+                    cfg = _try_load(bp)
+                    if cfg is not None:
+                        logger.warning("config restored from backup", extra={"backup": bp})
+                        needs_save = True
+                        break
+            except Exception as e:
+                logger.error("config backup restore failed", extra={"error": repr(e)})
+        if cfg is None:
+            cfg = create_default_config()
+            cfg["settings"]["auto_delivery"] = False
+            needs_save = True
+            logger.error("config missing or corrupted, using default (auto_delivery OFF)")
+
+    for k, v in DEFAULT_CONFIG.items():
+        if isinstance(v, dict):
+            cfg.setdefault(k, {})
+            for sk, sv in v.items():
+                cfg[k].setdefault(sk, sv)
+        elif isinstance(v, list):
+            cfg.setdefault(k, list(v))
+        else:
+            cfg.setdefault(k, v)
+
+    _config_cache_put(cfg)
+    if needs_save:
+        save_config(cfg)
+    _set_private_file(CONFIG_FILE)
+    return cfg
+def save_config(cfg: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
+    tmp = f"{CONFIG_FILE}.tmp"
+    with _FILES_LOCK:
+        with open(tmp, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=4)
+        os.replace(tmp, CONFIG_FILE)
+        _set_private_file(CONFIG_FILE)
+        _config_cache_put(cfg)
+    logger.info("config saved", extra={"path": CONFIG_FILE})
+
+
+def get_config() -> Dict[str, Any]:
+    return load_config()
+
+
+def get_mappings() -> List[Dict[str, Any]]:
+    return _db_get_mappings()
+
+
+def save_mappings(mappings: List[Dict[str, Any]]) -> None:
+    for m in mappings:
+        _db_save_mapping(m)
+
+
+def _migrate_config_mappings_to_db() -> None:
+    cfg = load_config()
+    mappings = cfg.get("mappings")
+    if not mappings:
+        return
+    if not isinstance(mappings, list):
+        return
+    for m in mappings:
+        if isinstance(m, dict) and m.get("id"):
+            _db_save_mapping(m)
+    cfg["mappings"] = []
+    save_config(cfg)
+    logger.info("migrated mappings from config to db", extra={"count": len(mappings)})
+
+
+def _migrate_v314_settings(cfg: Dict[str, Any]) -> bool:
+    """
+    v3.14: у существующих установок dialog_timeout остался 300 с.
+
+    С поэтапным подтверждением шагов в диалоге стало больше (значение →
+    подтверждение → следующее значение → сводка), и 5 минут покупателю не
+    хватает: заказ отменялся посреди живой переписки. Поднимаем только те
+    значения, которые продавец никогда не менял (ровно старый дефолт),
+    и делаем это один раз.
+
+    Отметку о миграции держим в отдельной секции `_migrations`, а НЕ в
+    settings: settings выгружаются в файл экспорта, и служебный флаг там
+    выглядел бы как «неизвестный параметр» при импорте на другом аккаунте.
+    """
+    done = cfg.setdefault("_migrations", {})
+    if not isinstance(done, dict):
+        done = {}
+        cfg["_migrations"] = done
+    if done.get("v314_timeouts"):
+        return False
+    settings = cfg.setdefault("settings", {})
+    changed = []
+    try:
+        if int(settings.get("dialog_timeout") or 0) == 300:
+            settings["dialog_timeout"] = 900
+            changed.append("dialog_timeout 300 -> 900")
+        if int(settings.get("dialog_reminder") or 0) == 120:
+            settings["dialog_reminder"] = 180
+            changed.append("dialog_reminder 120 -> 180")
+    except (TypeError, ValueError):
+        pass
+    done["v314_timeouts"] = True
+    logger.info("v3.14 timeouts migrated", extra={
+        "dialog_timeout": settings.get("dialog_timeout"),
+        "dialog_reminder": settings.get("dialog_reminder"),
+        "changed": changed})
+    return True
+
+
+_V3170_REVIEW_TEMPLATE = (
+    "Если всё в порядке — подтвердите заказ и оставьте отзыв, "
+    "это очень помогает продавцу:\n"
+    "{order_link}\n\n"
+    "Если что-то не так — не подтверждайте заказ, напишите мне здесь, "
+    "я на связи и всё решу."
+)
+
+
+def _migrate_v3171_templates(cfg: Dict[str, Any]) -> bool:
+    """
+    v3.17.1: заменяем текст просьбы об отзыве на новый.
+
+    Тонкость: шаблоны хранятся в config.json, и `load_config` только
+    доставляет ОТСУТСТВУЮЩИЕ ключи. У кого стояла 3.17.0, в конфиге лежит
+    старый текст, и новый дефолт сам бы не применился. Меняем только если
+    текст ровно такой, как был в 3.17.0 — свой текст продавца не трогаем.
+    """
+    done = cfg.setdefault("_migrations", {})
+    if not isinstance(done, dict):
+        done = {}
+        cfg["_migrations"] = done
+    if done.get("v3171_review_text"):
+        return False
+    templates = cfg.setdefault("templates", {})
+    current = str(templates.get("review_request") or "")
+    replaced = False
+    if _normalize_title(current) == _normalize_title(_V3170_REVIEW_TEMPLATE):
+        templates["review_request"] = DEFAULT_CONFIG["templates"]["review_request"]
+        replaced = True
+    done["v3171_review_text"] = True
+    logger.info("v3.17.1 review template migrated", extra={"replaced": replaced})
+    return True
+
+
+def _migrate_legacy_config() -> None:
+    _migrate_config_mappings_to_db()
+    cfg = load_config()
+    # v3.1: наценка снова используется (см. _apply_markup), поля больше не удаляем
+    if cfg.get("settings") and cfg["settings"].get("auto_delivery") is False:
+        logger.info("auto_delivery was disabled, re-enabling after update", extra={"old": False})
+        cfg["settings"]["auto_delivery"] = True
+    _migrate_v314_settings(cfg)
+    _migrate_v3171_templates(cfg)
+    if cfg.get("settings"):
+        save_config(cfg)
+    if cfg.get("mappings"):
+        return
+    if not os.path.exists(MAPPINGS_FILE):
+        return
+    try:
+        with open(MAPPINGS_FILE, "r", encoding="utf-8") as f:
+            mappings = json.load(f)
+        if isinstance(mappings, list):
+            for m in mappings:
+                if isinstance(m, dict) and m.get("id"):
+                    _db_save_mapping(m)
+            _migrate_config_mappings_to_db()
+            logger.info("migrated legacy mappings", extra={"count": len(mappings)})
+    except Exception as e:
+        logger.exception("migrate legacy mappings failed", extra={"error": repr(e)})
+
+
+def _migrate_legacy_processed() -> None:
+    if not os.path.exists(PROCESSED_FILE):
+        return
+    try:
+        with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        inserted = 0
+        for order_id, info in data.items():
+            status = info.get("status")
+            fzr_order_id = info.get("fzr_order_id") or info.get("fzr_id") or ""
+            if status in ("completed", "error", "timeout", "no_mapping", "needs_review"):
+                if _db_insert_order({
+                    "funpay_order_id": str(order_id),
+                    "status": status,
+                    "fzr_order_id": str(fzr_order_id) if fzr_order_id else None,
+                    "result_json": _to_json(info),
+                    "completed_notification_sent": 2 if status == "completed" else 0,
+                }):
+                    inserted += 1
+            elif status == "pending":
+                if fzr_order_id:
+                    if _db_insert_order({
+                        "funpay_order_id": str(order_id),
+                        "status": "pending",
+                        "fzr_order_id": str(fzr_order_id),
+                        "result_json": _to_json(info),
+                        "completed_notification_sent": 0,
+                    }):
+                        inserted += 1
+                else:
+                    if _db_insert_order({
+                        "funpay_order_id": str(order_id),
+                        "status": "needs_review",
+                        "result_json": _to_json(info),
+                        "completed_notification_sent": 0,
+                    }):
+                        inserted += 1
+            else:
+                if _db_insert_order({
+                    "funpay_order_id": str(order_id),
+                    "status": "needs_review",
+                    "result_json": _to_json(info),
+                    "completed_notification_sent": 0,
+                }):
+                    inserted += 1
+        logger.info("migrated legacy processed", extra={"count": len(data), "inserted": inserted})
+    except Exception as e:
+        logger.exception("migrate legacy processed failed", extra={"error": repr(e)})
+# =============================================================================
+# HTTP client with retries
+# =============================================================================
+
+HTTP_TIMEOUT: Tuple[float, float] = (10.0, 30.0)
+HTTP_MAX_RETRIES = 4
+HTTP_BACKOFF_BASE = 1.0
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _get_http_session() -> requests.Session:
+    s = getattr(_HTTP_SESSION_TLS, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": "FPC-FazerCards-Plugin/2.2"})
+        _HTTP_SESSION_TLS.session = s
+    return s
+
+
+def http_request_with_retries(
+    method: str,
+    url: str,
+    *,
+    max_retries: int = HTTP_MAX_RETRIES,
+    backoff_base: float = HTTP_BACKOFF_BASE,
+    timeout: Optional[Tuple[float, float]] = None,
+    log_extra: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> requests.Response:
+    method = method.upper()
+    timeout = timeout if timeout is not None else HTTP_TIMEOUT
+    last_exc: Optional[BaseException] = None
+    last_resp: Optional[requests.Response] = None
+    extra = dict(log_extra or {})
+
+    for attempt in range(1, max_retries + 1):
+        if _SHUTDOWN_EVENT.is_set():
+            raise RuntimeError("plugin shutting down — abort retries")
+        try:
+            resp = _get_http_session().request(method, url, timeout=timeout, **kwargs)
+            if resp.status_code in _RETRYABLE_STATUSES:
+                last_resp = resp
+                logger.warning(
+                    "http retryable status",
+                    extra={
+                        **extra,
+                        "url": url,
+                        "method": method,
+                        "status": resp.status_code,
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                    },
+                )
+            else:
+                return resp
+        except requests.exceptions.RequestException as ex:
+            last_exc = ex
+            logger.warning(
+                "http request exception",
+                extra={
+                    **extra,
+                    "url": url,
+                    "method": method,
+                    "error": repr(ex),
+                    "attempt": attempt,
+                    "max_retries": max_retries,
+                },
+            )
+
+        if attempt < max_retries:
+            sleep_for = backoff_base * (2 ** (attempt - 1))
+            if last_resp is not None and last_resp.status_code == 429:
+                retry_after = last_resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep_for = max(float(retry_after), sleep_for)
+                    except ValueError:
+                        pass
+            sleep_for += random.uniform(0, sleep_for * 0.25)
+            if _SHUTDOWN_EVENT.wait(sleep_for):
+                raise RuntimeError("plugin shutting down — abort retries")
+
+    if last_exc is not None:
+        raise last_exc
+    if last_resp is not None:
+        last_resp.raise_for_status()
+        return last_resp
+    raise RuntimeError("http_request_with_retries: no attempt was made")
+
+
+def _fetch_usd_rub_exchange_rate() -> Optional[float]:
+    """
+    Курс RUB за 1 USD из открытых источников.
+
+    v3.15: возвращаем не только курс, но и пишем в _EXCHANGE_RATE_STATUS, какой
+    источник ответил и что сказали остальные — иначе «курс не обновляется»
+    невозможно диагностировать, не читая логи FPC.
+    """
+    errors: List[str] = []
+    providers = [
+        ("exchangerate-api", "https://api.exchangerate-api.com/v4/latest/USD", _parse_exchangerate_api),
+        ("open.er-api", "https://open.er-api.com/v6/latest/USD", _parse_exchangerate_api),
+    ]
+    for name, url, parser in providers:
+        try:
+            resp = http_request_with_retries("GET", url, timeout=(5.0, 15.0))
+            rate = parser(resp.json())
+            if rate:
+                logger.info("exchange rate fetched", extra={"url": url, "rate": rate})
+                _EXCHANGE_RATE_STATUS["source"] = name
+                _EXCHANGE_RATE_STATUS["errors"] = errors
+                return rate
+            errors.append(f"{name}: в ответе нет курса RUB")
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}")
+            logger.warning("exchange rate provider failed", extra={"url": url, "error": repr(e)})
+    # fallback to Central Bank of Russia
+    try:
+        date_req = time.strftime("%d/%m/%Y")
+        url = f"https://www.cbr.ru/scripts/XML_daily.asp?date_req={date_req}"
+        resp = http_request_with_retries("GET", url, timeout=(5.0, 15.0))
+        rate = _parse_cbr_xml(resp.content)
+        if rate:
+            _EXCHANGE_RATE_STATUS["source"] = "ЦБ РФ"
+            _EXCHANGE_RATE_STATUS["errors"] = errors
+            return rate
+        errors.append("ЦБ РФ: в XML нет USD")
+    except Exception as e:
+        errors.append(f"ЦБ РФ: {type(e).__name__}")
+        logger.warning("CBR exchange rate fallback failed", extra={"error": repr(e)})
+    _EXCHANGE_RATE_STATUS["source"] = ""
+    _EXCHANGE_RATE_STATUS["errors"] = errors
+    return None
+
+
+def _parse_exchangerate_api(data: Dict[str, Any]) -> Optional[float]:
+    rates = data.get("rates") or data.get("rates_rub")
+    if not isinstance(rates, dict):
+        return None
+    rub = rates.get("RUB")
+    if rub is None:
+        return None
+    try:
+        return float(rub)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_cbr_xml(content: bytes) -> Optional[float]:
+    import xml.etree.ElementTree as ET
+    text = content.decode("windows-1251", errors="replace")
+    root = ET.fromstring(text)
+    for valute in root.findall("Valute"):
+        char_code = valute.find("CharCode")
+        if char_code is not None and char_code.text == "USD":
+            value = valute.find("Value")
+            if value is not None and value.text:
+                return float(value.text.replace(",", "."))
+    return None
+
+
+def _update_exchange_rate(c: "Cardinal", force: bool = False) -> Optional[float]:
+    try:
+        cfg = load_config()
+        if not force and not cfg["settings"].get("auto_update_exchange_rate"):
+            return None
+        _EXCHANGE_RATE_STATUS["last_try_ts"] = time.time()
+        rate = _fetch_usd_rub_exchange_rate()
+        if rate is None:
+            errs = _EXCHANGE_RATE_STATUS.get("errors") or []
+            _EXCHANGE_RATE_STATUS["last_error"] = "; ".join(errs) or "источники не ответили"
+            logger.warning("exchange rate update returned no rate",
+                           extra={"errors": errs})
+            return None
+        current = float(cfg["settings"].get("exchange_rate") or 0)
+        cfg["settings"]["exchange_rate"] = round(rate, 4)
+        save_config(cfg)
+        _EXCHANGE_RATE_STATUS["last_ok_ts"] = time.time()
+        _EXCHANGE_RATE_STATUS["last_error"] = ""
+        _EXCHANGE_RATE_STATUS["rate"] = round(rate, 4)
+        if abs(current - rate) > 0.01:
+            _notify_admin(c, f"💱 Курс RUB/USD обновлён: <b>{rate:.2f}</b>")
+        logger.info("exchange rate updated", extra={"rate": rate, "previous": current})
+        return rate
+    except Exception as e:
+        _EXCHANGE_RATE_STATUS["last_error"] = f"{type(e).__name__}: {e}"[:200]
+        logger.warning("exchange rate update failed", extra={"error": repr(e)})
+        return None
+
+
+def _exchange_rate_health(cfg: Dict[str, Any]) -> str:
+    """
+    Строка состояния автокурса для раздела «Цены».
+
+    Продавцу нужно видеть не тумблер, а факт: обновляется или нет, когда в
+    последний раз получилось и что мешает.
+    """
+    s = cfg["settings"]
+    if not s.get("auto_update_exchange_rate"):
+        return "🔄 Автообновление курса: ❌ выкл"
+    with _EXCHANGE_RATE_LOCK:
+        alive = bool(_EXCHANGE_RATE_THREAD and _EXCHANGE_RATE_THREAD.is_alive())
+    st = _EXCHANGE_RATE_STATUS
+    parts = [f"🔄 Автообновление курса: {'✅ вкл' if alive else '⚠️ вкл, но поток не запущен'}"]
+    if st.get("last_ok_ts"):
+        src = st.get("source") or "?"
+        parts.append(f"🕐 Последнее обновление: <b>{_esc(_ago(st['last_ok_ts']))}</b> ({_esc(src)})")
+    else:
+        parts.append("🕐 Последнее обновление: <b>ещё не было</b>")
+    if st.get("last_error"):
+        parts.append(f"⚠️ Ошибка: <i>{_esc(str(st['last_error'])[:150])}</i>")
+    return "\n".join(parts)
+
+
+def _exchange_rate_interval(cfg: Optional[Dict[str, Any]] = None) -> float:
+    """
+    Как часто обновлять курс RUB/USD.
+
+    Значение из настроек в минутах; зажимаем 15 мин … 7 суток, чтобы опечатка
+    («0») не превратила поток в busy-loop по внешнему API ЦБ.
+    """
+    try:
+        cfg = cfg or load_config()
+        minutes = float(cfg["settings"].get("exchange_rate_interval") or 0)
+    except Exception:
+        minutes = 0.0
+    if minutes <= 0:
+        return _EXCHANGE_RATE_INTERVAL_DEFAULT
+    return max(900.0, min(minutes * 60.0, 7 * 86400.0))
+
+
+def _wait_any(events: List[threading.Event], timeout: float) -> Optional[threading.Event]:
+    """
+    Ждать до timeout, пока сработает любой из событий.
+
+    threading.Event.wait умеет слушать только своё событие, поэтому «ждём
+    остановку 30 с» глухо к «настройки изменились»: пробуждение замечалось
+    только по истечении среза. Опрашиваем короткими шагами — для фоновых
+    потоков этого достаточно и не нужен selector.
+    """
+    deadline = time.time() + max(0.0, timeout)
+    step = 0.2
+    while True:
+        for ev in events:
+            if ev.is_set():
+                return ev
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        time.sleep(min(step, remaining))
+
+
+def _exchange_rate_updater_loop(c: "Cardinal") -> None:
+    """
+    Поток автообновления курса.
+
+    v3.15, три реальных бага прошлой версии (проверены прогоном потока):
+      1) пробуждение по _EXCHANGE_RATE_WAKE делало `continue` — начинало новое
+         ожидание, НЕ обновляя курс. Продавец включал тумблер «Автокурс», а
+         курс не появлялся вообще;
+      2) любая правка настроек сбрасывала отсчёт заново, поэтому при
+         регулярных правках обновление не наступало никогда;
+      3) ожидание висело на _SHUTDOWN_EVENT.wait(30), то есть пробуждение
+         замечалось только через 30 с (а не сразу).
+
+    Теперь считаем от времени ПОСЛЕДНЕГО обновления и слушаем оба события.
+    """
+    logger.info("exchange rate updater started")
+    last_run = 0.0
+    while not _SHUTDOWN_EVENT.is_set():
+        cfg = load_config()
+        auto = bool(cfg["settings"].get("auto_update_exchange_rate"))
+        interval = _exchange_rate_interval(cfg)
+        if _EXCHANGE_RATE_FORCE.is_set():
+            # тумблер только что включили — обновляем немедленно
+            _EXCHANGE_RATE_FORCE.clear()
+            last_run = 0.0
+        if auto and (last_run <= 0.0 or time.time() - last_run >= interval):
+            _update_exchange_rate(c)
+            last_run = time.time()
+        if not auto:
+            sleep_for = min(interval, 300.0)     # выключено — просто дремлем
+        else:
+            sleep_for = max(1.0, last_run + interval - time.time())
+        fired = _wait_any([_SHUTDOWN_EVENT, _EXCHANGE_RATE_WAKE, _EXCHANGE_RATE_FORCE], sleep_for)
+        if fired is _SHUTDOWN_EVENT:
+            break
+        if fired is _EXCHANGE_RATE_WAKE:
+            # настройки изменились: пересчитываем срок, НЕ теряя last_run
+            _EXCHANGE_RATE_WAKE.clear()
+            logger.info("exchange rate settings changed, rescheduling")
+    _exchange_rate_updater_done()
+
+
+def _exchange_rate_updater_done() -> None:
+    logger.info("exchange rate updater finished")
+
+
+def _start_exchange_rate_updater(c: "Cardinal") -> None:
+    global _EXCHANGE_RATE_THREAD
+    with _EXCHANGE_RATE_LOCK:
+        if _EXCHANGE_RATE_THREAD and _EXCHANGE_RATE_THREAD.is_alive():
+            return
+        _EXCHANGE_RATE_THREAD = threading.Thread(
+            target=_exchange_rate_updater_loop,
+            args=(c,),
+            daemon=True,
+            name="fzr_exchange_rate_updater",
+        )
+        _EXCHANGE_RATE_THREAD.start()
+
+
+def _ensure_exchange_rate_updater(c: "Cardinal") -> bool:
+    """
+    Поднять поток курса, если он умер.
+
+    v3.15: поток стартовал только в init_plugin. Если он падал (или плагин
+    перезагружали через ПУ без перезапуска FPC), курс молча перестал
+    обновляться навсегда — ровно то, на что жаловался продавец. Теперь
+    проверяем при каждом обращении к настройкам курса.
+    """
+    if _SHUTDOWN_EVENT.is_set():
+        return False
+    with _EXCHANGE_RATE_LOCK:
+        alive = bool(_EXCHANGE_RATE_THREAD and _EXCHANGE_RATE_THREAD.is_alive())
+    if alive:
+        return False
+    logger.warning("exchange rate updater was not running, restarting")
+    _start_exchange_rate_updater(c)
+    return True
+
+
+def _stop_exchange_rate_updater() -> None:
+    global _EXCHANGE_RATE_THREAD
+    with _EXCHANGE_RATE_LOCK:
+        thread = _EXCHANGE_RATE_THREAD
+    # разбудить поток, чтобы он не досыпал свой 30-секундный срез
+    _EXCHANGE_RATE_WAKE.set()
+    if thread and thread.is_alive():
+        try:
+            thread.join(timeout=5.0)
+        except Exception:
+            pass
+    with _EXCHANGE_RATE_LOCK:
+        _EXCHANGE_RATE_THREAD = None
+    _EXCHANGE_RATE_WAKE.clear()
+    _EXCHANGE_RATE_FORCE.clear()
+
+
+# =============================================================================
+# FazerCards API
+# =============================================================================
+
+class FazerCardsAPIError(Exception):
+    """
+    Ошибка FazerCards API.
+
+    status_code хранит HTTP-код (если ответ был получен) — нужен, чтобы отличать
+    422 «Player ID не подтверждён» от прочих сбоев, и code — машинный код из тела.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+class InsufficientFundsError(FazerCardsAPIError):
+    """
+    Не хватило баланса FazerCards на этот заказ.
+
+    Отдельный тип, потому что реакция принципиально другая: заказ покупателя
+    оплачен и данные собраны, терять его нельзя — переводим в ожидание
+    пополнения и повторяем, а не помечаем ошибкой.
+    """
+
+    def __init__(self, message: str, needed_usd: Optional[float] = None,
+                 balance_usd: Optional[float] = None,
+                 status_code: Optional[int] = None, code: Optional[str] = None) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+        self.needed_usd = needed_usd
+        self.balance_usd = balance_usd
+
+    @property
+    def deficit_usd(self) -> Optional[float]:
+        if self.needed_usd is None or self.balance_usd is None:
+            return None
+        return max(0.0, self.needed_usd - self.balance_usd)
+
+
+# Признаки «нет денег» в ответе API: 402 по стандарту, но текст встречается
+# и в 400/422, поэтому смотрим и на сообщение.
+_INSUFFICIENT_FUNDS_KEYWORDS = (
+    "insufficient funds", "insufficient balance", "not enough funds",
+    "not enough balance", "недостаточно средств", "недостаточно баланса",
+    "пополните баланс", "low balance", "balance too low",
+)
+
+
+def _is_insufficient_funds_error(error_text: str, status_code: Optional[int] = None,
+                                 code: Optional[str] = None) -> bool:
+    """
+    Отличает «нет денег» от прочих ошибок.
+
+    Осторожно со словом balance: `balance` встречается и в безобидных ответах,
+    поэтому ловим только конкретные формулировки и код 402/INSUFFICIENT_FUNDS.
+    """
+    if status_code == 402:
+        return True
+    if code and "insufficient" in str(code).lower():
+        return True
+    text = (error_text or "").lower()
+    return any(kw in text for kw in _INSUFFICIENT_FUNDS_KEYWORDS)
+
+
+class FazerCardsAPI:
+    def __init__(self, api_key: str, base_url: str = "https://api.fzr.cards/api/v2") -> None:
+        if not api_key or not isinstance(api_key, str):
+            raise FazerCardsAPIError("API ключ не задан")
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme != "https" or not parsed.netloc.endswith(".fzr.cards"):
+            raise FazerCardsAPIError("Некорректный base_url")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json: Dict[str, Any] = None,
+        params: Dict[str, Any] = None,
+        headers: Dict[str, str] = None,
+        idempotency_key: str = None,
+        max_retries: Optional[int] = None,
+        backoff_base: Optional[float] = None,
+        timeout: Optional[Tuple[float, float]] = None,
+        files: Any = None,
+    ) -> Any:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        req_headers = {
+            "X-API-Key": self.api_key,
+            "Accept": "application/json",
+            "User-Agent": "FPC-FazerCards-Plugin/2.2",
+        }
+        if headers:
+            req_headers.update(headers)
+        if idempotency_key:
+            req_headers["Idempotency-Key"] = idempotency_key
+        retry_kwargs: Dict[str, Any] = {}
+        if max_retries is not None:
+            retry_kwargs["max_retries"] = max_retries
+        if backoff_base is not None:
+            retry_kwargs["backoff_base"] = backoff_base
+        if timeout is not None:
+            retry_kwargs["timeout"] = timeout
+        try:
+            request_kwargs: Dict[str, Any] = {}
+            if files is not None:
+                # multipart: тело (data) и файлы, Content-Type ставит requests
+                request_kwargs["files"] = files
+                if json:
+                    request_kwargs["data"] = json
+            elif json is not None:
+                request_kwargs["json"] = json
+            resp = http_request_with_retries(
+                method,
+                url,
+                headers=req_headers,
+                params=params,
+                log_extra={"stage": path.lstrip("/").split("/")[0]},
+                **request_kwargs,
+                **retry_kwargs,
+            )
+        except requests.exceptions.RequestException as ex:
+            _inc_metric("api_errors")
+            raise FazerCardsAPIError(f"Сетевая ошибка: {_redact_sensitive(str(ex))}")
+        try:
+            data = resp.json() if resp.text else {}
+        except ValueError:
+            data = {"raw": resp.text}
+        if not resp.ok:
+            _inc_metric("api_errors")
+            safe_data = _redact_sensitive(data)
+            err_code = data.get("code") if isinstance(data, dict) else None
+            message = f"HTTP {resp.status_code}: {safe_data}"
+            # «нет денег» — отдельный тип: заказ покупателя не теряем,
+            # а ставим в ожидание пополнения (см. InsufficientFundsError)
+            if _is_insufficient_funds_error(str(safe_data), resp.status_code, err_code):
+                raise InsufficientFundsError(message, status_code=resp.status_code,
+                                             code=err_code)
+            raise FazerCardsAPIError(message, status_code=resp.status_code, code=err_code)
+        return data
+
+    def get_balance(self) -> Dict[str, Any]:
+        return self._request("GET", "/balance")
+
+    # --- аккаунт и подписка (v3.5) ---
+    def get_me(self) -> Dict[str, Any]:
+        """
+        GET /me — профиль по ключу.
+
+        Отдаёт login, email, plan, planExpiresAt, planAutoRenew,
+        subscriptionActive и summary {totalSpent, totalOrders}.
+        """
+        return self._request("GET", "/me", max_retries=2)
+
+    def get_subscription(self) -> Dict[str, Any]:
+        """
+        GET /subscription — план, срок, автопродление, активность.
+
+        Если подписка кончится, API перестанет отвечать и посыпятся ВСЕ заказы,
+        поэтому срок нужно знать заранее.
+        """
+        return self._request("GET", "/subscription", max_retries=2)
+
+    def get_categories(self, kind: str, cursor: str = None, limit: int = 50) -> Dict[str, Any]:
+        if kind == "manual-services":
+            return self._request("GET", "/manual-services", params={"include_ui": 1})
+        if kind == "steam-gifts":
+            params: Dict[str, Any] = {}
+            if limit:
+                params["limit"] = limit
+            if cursor:
+                try:
+                    params["offset"] = int(cursor)
+                except (TypeError, ValueError):
+                    pass
+            return self._request("GET", "/steam-gifts/games", params=params, max_retries=1, backoff_base=0, timeout=(10, 180))
+        if kind == "steam-topup":
+            return {"ok": True, "items": [{"id": "topup", "name": "Steam Top-up"}]}
+        if kind == "telegram-stars":
+            return {"ok": True, "items": [{"id": "stars", "name": "Telegram Stars"}]}
+        if kind == "telegram-premium":
+            return {"ok": True, "items": [{"id": "premium", "name": "Telegram Premium"}]}
+        params = {"limit": limit, "include_ui": 1}
+        if cursor:
+            params["cursor"] = cursor
+        if kind == "giftcards":
+            return self._request("GET", "/giftcards", params=params)
+        if kind == "gamekeys":
+            return self._request("GET", "/gamekeys", params=params)
+        if kind == "topups":
+            return self._request("GET", "/topups", params=params)
+        raise FazerCardsAPIError(f"Неподдерживаемый тип каталога: {kind}")
+
+    def get_offers(self, kind: str, category_id: str, cursor: str = None, include_ui: bool = True) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if include_ui and kind not in ("steam-gifts", "steam-topup", "telegram-stars", "telegram-premium"):
+            params["include_ui"] = 1
+        if cursor:
+            params["cursor"] = cursor
+        if kind == "giftcards":
+            params["category_id"] = category_id
+            return self._request("GET", "/giftcards/cards", params=params)
+        if kind == "gamekeys":
+            params["game_id"] = category_id
+            return self._request("GET", "/gamekeys/keys", params=params)
+        if kind == "topups":
+            params["category_id"] = category_id
+            return self._request("GET", "/topups/offers", params=params)
+        if kind == "manual-services":
+            return self._request("GET", f"/manual-services/{category_id}/offers", params=params)
+        if kind == "steam-gifts":
+            return self._request("GET", f"/steam-gifts/games/{category_id}", max_retries=1, backoff_base=0)
+        if kind == "steam-topup":
+            return self._request("GET", "/steam-topup/rates")
+        if kind == "telegram-stars":
+            return self._request("GET", "/telegram/stars")
+        if kind == "telegram-premium":
+            return self._request("GET", "/telegram/premium")
+        raise FazerCardsAPIError(f"Неподдерживаемый тип каталога: {kind}")
+
+    def create_order(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        idempotency_key: str = None,
+    ) -> Dict[str, Any]:
+        endpoints = {
+            "giftcards": "/giftcards/order",
+            "gamekeys": "/gamekeys/order",
+            "topups": "/topups/order",
+            "manual-services": "/manual-services/order",
+            "steam-gifts": "/steam-gifts/order",
+            "steam-topup": "/steam-topup/order",
+            "telegram-stars": "/telegram/stars/buy",
+            "telegram-premium": "/telegram/premium/buy",
+        }
+        if kind not in endpoints:
+            raise FazerCardsAPIError(f"Неподдерживаемый тип заказа: {kind}")
+        return self._request("POST", endpoints[kind], json=payload, idempotency_key=idempotency_key)
+
+    def get_order(self, order_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/orders/{order_id}")
+
+    # --- проверка Player ID (v3.1) ---
+    def get_validate_id_games(self) -> Dict[str, Any]:
+        """GET /topups/validate-id — игры, поддерживающие проверку Player ID."""
+        return self._request("GET", "/topups/validate-id")
+
+    def validate_player_id(self, category_id: str, fields: Dict[str, str]) -> Dict[str, Any]:
+        """
+        POST /topups/validate-id — проверка Player ID до заказа.
+        422 означает "ID не подтверждён" и приходит как FazerCardsAPIError.
+        """
+        return self._request("POST", "/topups/validate-id",
+                             json={"category_id": category_id, "fields": fields})
+
+    def check_steam_login(self, steam_login: str) -> Dict[str, Any]:
+        """
+        POST /steam-topup/check-login — можно ли пополнить этот аккаунт Steam.
+        Ответ: {"ok": true, "can_refill": bool}.
+        """
+        return self._request("POST", "/steam-topup/check-login",
+                             json={"steamLogin": steam_login})
+
+    # --- чат по ручным услугам (v3.4) ---
+    def get_manual_chat(self, fzr_order_id: str) -> Dict[str, Any]:
+        """
+        GET /manual-services/orders/{id}/chat — переписка с исполнителем.
+
+        Ответ: {ok, chat_frozen, chat_opened, chat_read_only, messages: [...]}.
+        messages[]: {sender, body, image_url, image_urls[], created_at}.
+        """
+        return self._request("GET", f"/manual-services/orders/{fzr_order_id}/chat",
+                             max_retries=2)
+
+    def send_manual_chat(self, fzr_order_id: str, body: Optional[str] = None,
+                         image: Optional[Tuple[str, bytes, str]] = None) -> Dict[str, Any]:
+        """
+        POST /manual-services/orders/{id}/chat — сообщение исполнителю.
+
+        multipart/form-data: поле body и/или файл image
+        (image = (имя_файла, содержимое, mime)).
+        """
+        if not body and image is None:
+            raise FazerCardsAPIError("Пустое сообщение")
+        files: Dict[str, Any] = {}
+        if image is not None:
+            files["image"] = image
+        if files:
+            return self._request("POST", f"/manual-services/orders/{fzr_order_id}/chat",
+                                 json={"body": body} if body else None,
+                                 files=files, max_retries=1)
+        # без файла отправляем как multipart с одним полем: API ждёт form-data
+        return self._request("POST", f"/manual-services/orders/{fzr_order_id}/chat",
+                             files={"body": (None, body)}, max_retries=1)
+
+    # --- webhook (v3.1) ---
+    def get_webhook(self) -> Dict[str, Any]:
+        return self._request("GET", "/account/webhook")
+
+    def set_webhook(self, url: str, events: Optional[List[str]] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"url": url}
+        if events:
+            payload["events"] = events
+        return self._request("PUT", "/account/webhook", json=payload)
+
+    def delete_webhook(self) -> Dict[str, Any]:
+        return self._request("DELETE", "/account/webhook")
+
+    def regenerate_webhook_secret(self) -> Dict[str, Any]:
+        return self._request("POST", "/account/webhook/secret/regenerate")
+
+    def test_webhook(self) -> Dict[str, Any]:
+        return self._request("POST", "/account/webhook/test")
+
+    def get_webhook_deliveries(self, limit: int = 20) -> Dict[str, Any]:
+        return self._request("GET", "/account/webhook/deliveries", params={"limit": limit})
+
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        for method, path in (("POST", f"/orders/{order_id}/cancel"), ("DELETE", f"/orders/{order_id}")):
+            try:
+                return self._request(method, path)
+            except FazerCardsAPIError as ex:
+                err = str(ex).lower()
+                if "404" in err or "not found" in err:
+                    continue
+                raise
+        raise FazerCardsAPIError(f"Не удалось отменить заказ {order_id}: эндпоинт не найден")
+
+
+
+def get_fzr_client(api_key: str, base_url: str) -> "FazerCardsAPI":
+    key = f"{api_key}@{base_url.rstrip('/')}"
+    with _FZR_CLIENTS_LOCK:
+        if key not in _FZR_CLIENTS:
+            _FZR_CLIENTS[key] = FazerCardsAPI(api_key, base_url)
+        return _FZR_CLIENTS[key]
+
+
+def _find_offer_in_page(page: Dict[str, Any], kind: str, offer_id: str) -> Optional[Dict[str, Any]]:
+    edition_id = None
+    if kind == "steam-gifts" and ":" in str(offer_id):
+        edition_id = str(offer_id).split(":", 1)[0]
+    norm = _normalize_catalog_page(kind, page, False, edition_id=edition_id)
+    target = str(offer_id)
+    for it in norm.get("items", []):
+        if str(it.get("id")) == target:
+            return it
+    return None
+
+
+def _extract_offer_info(offer: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not offer:
+        return {}
+    info: Dict[str, Any] = {}
+    for k in ("name", "title"):
+        v = offer.get(k)
+        if v is not None:
+            info["offer_name"] = str(v)
+            break
+    if offer.get("price_usd") is not None:
+        try:
+            info["price_usd"] = float(offer["price_usd"])
+        except (TypeError, ValueError):
+            pass
+    if offer.get("stock") is not None:
+        try:
+            info["stock"] = int(offer["stock"])
+        except (TypeError, ValueError):
+            pass
+    min_q = offer.get("min_quantity") or offer.get("min_order_quantity")
+    if min_q is not None:
+        try:
+            info["min_quantity"] = int(min_q)
+        except (TypeError, ValueError):
+            pass
+    max_q = offer.get("max_quantity") or offer.get("max_order_quantity")
+    if max_q is not None:
+        try:
+            info["max_quantity"] = int(max_q)
+        except (TypeError, ValueError):
+            pass
+    fields = offer.get("fields")
+    if fields:
+        info["fields"] = fields
+    return info
+
+
+def _resolve_offer_info(
+    api: "FazerCardsAPI",
+    kind: str,
+    category_id: str,
+    offer_id: str,
+) -> Dict[str, Any]:
+    try:
+        page = api.get_offers(kind, category_id, include_ui=False)
+    except Exception:
+        logger.exception("resolve offer info failed", extra={"kind": kind, "category_id": category_id, "offer_id": offer_id})
+        return {}
+    offer = _find_offer_in_page(page, kind, offer_id)
+    if not offer:
+        return {}
+    return _extract_offer_info(offer)
+
+
+# =============================================================================
+# helpers
+# =============================================================================
+
+_USERNAME_BAD_CHARS = re.compile(r"[\u0000-\u001F\u007F]")
+
+
+def _safe_username(s: Optional[str], max_len: int = 64) -> str:
+    if not s:
+        return "—"
+    s = _USERNAME_BAD_CHARS.sub("", str(s)).strip()
+    s = re.sub(r"[<>`\[\]\(\)*_~]", "", s)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s or "—"
+
+
+def _normalize_title(title: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (title or "").strip().lower())
+
+
+# «13 шт.», «2 pcs» — количество FunPay вставляет ВНУТРЬ описания заказа,
+# между стороной и остальными полями. Для сопоставления его надо убрать.
+_ORDER_AMOUNT_TOKEN_RE = re.compile(r"\s*,?\s*\d+\s*(?:шт\.?|pcs?\.?|од\.?)(?=,|$)", re.I)
+
+
+def _strip_amount_token(desc: str) -> str:
+    return re.sub(r"\s*,\s*", ", ", _ORDER_AMOUNT_TOKEN_RE.sub("", desc or "")).strip(" ,")
+
+
+def _lot_desc_variants(info: Dict[str, Any]) -> List[str]:
+    """
+    Как лот может выглядеть в описании заказа — от самого точного к общему.
+
+    FunPay формирует описание заказа как «сервер, сторона, N шт., доп. поля»
+    и НАЗВАНИЕ ЛОТА в него не попадает, если у лота есть сервер/сторона.
+    А если их нет — описание заказа равно названию лота. Поэтому вариантов
+    несколько, и сортируем по длине: чем длиннее совпадение, тем надёжнее.
+    """
+    server = str(info.get("server") or "").strip()
+    side = str(info.get("side") or "").strip()
+    title = str(info.get("title") or "").strip()
+    combos = [(server, side, title), (server, side), (server, title), (side, title)]
+    # Одиночные варианты опасны: «RUB🔥» совпадёт с любым заказом, где такой
+    # сервер, даже если сторона другая. Поэтому берём одиночный компонент
+    # только когда он у лота единственный.
+    if title and not (server or side):
+        combos.append((title,))
+    if server and not side:
+        combos.append((server,))
+    if side and not server:
+        combos.append((side,))
+    variants: List[str] = []
+    for combo in combos:
+        parts = [p for p in combo if p]
+        if parts:
+            variants.append(", ".join(parts))
+    seen: set = set()
+    out: List[str] = []
+    for v in sorted(variants, key=len, reverse=True):
+        n = _normalize_title(v)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _order_lot_id_from_event(e: Any) -> Optional[Any]:
+    """
+    ID лота, если его уже кто-то определил.
+
+    FunPayCardinal в `setup_event_attributes_handler` пытается найти лот и
+    кладёт `e.lot_id` / `e.lot_shortcut`. Его хэндлеры регистрируются раньше
+    плагинов, так что к нам событие приходит уже с этими полями — но только
+    когда его способ сработал (он требует совпадения «сервер, сторона, название»
+    целиком, а количество внутри описания это ломает).
+    """
+    for attr in ("lot_id",):
+        v = getattr(e, attr, None)
+        if v:
+            return v
+    shortcut = getattr(e, "lot_shortcut", None)
+    if shortcut is not None and getattr(shortcut, "id", None):
+        return shortcut.id
+    order = getattr(e, "order", None)
+    for attr in ("offer_id", "lot_id"):
+        v = getattr(order, attr, None)
+        if v:
+            return v
+    offer = getattr(order, "offer", None)
+    if offer is not None and getattr(offer, "id", None):
+        return offer.id
+    return None
+
+
+def _resolve_order_lot_ids(c: Optional["Cardinal"], order: Any) -> List[str]:
+    """
+    Опознаёт лот аккаунта по описанию заказа.
+
+    Это главный путь сопоставления: сравниваем описание заказа с тем, как
+    выглядят лоты аккаунта (сервер / сторона / название), а не с названием
+    из привязки. Лоты «за 1 ₽» (пополнения Steam) название в заказ не
+    передают вовсе — по названию их найти невозможно.
+
+    Возвращает id лотов-кандидатов (обычно один).
+    """
+    desc = getattr(order, "description", "") or ""
+    if not desc:
+        return []
+    sub_id = getattr(getattr(order, "subcategory", None), "id", None)
+    index = _lots_index(c)
+    by_id = index.get("by_id") or {}
+    if not by_id:
+        return []
+    norm_full = _normalize_title(desc)
+    norm_clean = _normalize_title(_strip_amount_token(desc))
+    best_len = 0
+    best: List[str] = []
+    for lot_id, info in by_id.items():
+        lot_sub = info.get("subcategory_id")
+        if sub_id is not None and lot_sub is not None and str(lot_sub) != str(sub_id):
+            continue
+        for variant in _lot_desc_variants(info):
+            hit = False
+            for haystack in (norm_full, norm_clean):
+                if not haystack:
+                    continue
+                # начало описания — самый частый и самый надёжный случай
+                if haystack == variant or haystack.startswith(variant + ",") \
+                        or haystack.startswith(variant + " "):
+                    hit = True
+                    break
+                if re.search(r"(?<!\w)" + re.escape(variant) + r"(?!\w)", haystack):
+                    hit = True
+                    break
+            if not hit:
+                continue
+            if len(variant) > best_len:
+                best_len, best = len(variant), [str(lot_id)]
+            elif len(variant) == best_len and str(lot_id) not in best:
+                best.append(str(lot_id))
+            break
+    return best
+
+
+def find_mapping(e: NewOrderEvent, c: Optional["Cardinal"] = None) -> Optional[Dict[str, Any]]:
+    """
+    Находит привязку для заказа.
+
+    Порядок важен, от надёжного к приблизительному:
+      1. ID лота, если он уже известен (его мог определить FunPayCardinal);
+      2. опознание лота по описанию заказа среди лотов аккаунта — работает и
+         для лотов «за 1 ₽», где название в заказ не передаётся;
+      3. сравнение названия привязки с описанием заказа (старый путь) — на
+         случай, когда список лотов недоступен.
+    """
+    mappings = get_mappings()
+    if not mappings:
+        return None
+    shortcut = e.order
+    title = shortcut.description or ""
+    subcategory_id = getattr(getattr(shortcut, "subcategory", None), "id", None)
+    norm_title = _normalize_title(title)
+
+    # 1) точный ID лота — самый надёжный вариант
+    lot_id = _order_lot_id_from_event(e)
+    if lot_id is not None:
+        exact = _db_get_mapping_by_lot_id(lot_id)
+        if exact:
+            logger.info("mapping matched by lot id", extra={"lot_id": str(lot_id)})
+            return exact
+
+    # 2) опознаём лот по описанию заказа среди лотов аккаунта
+    lot_candidates: List[str] = []
+    if c is not None:
+        candidates = _resolve_order_lot_ids(c, shortcut)
+        lot_candidates = list(candidates)
+        found: List[Dict[str, Any]] = []
+        for cand in candidates:
+            m = _db_get_mapping_by_lot_id(cand)
+            if m and str(m.get("id")) not in {str(x.get("id")) for x in found}:
+                found.append(m)
+        if len(found) == 1:
+            logger.info("mapping matched by lot lookup",
+                        extra={"lot_id": candidates[0], "title": norm_title})
+            return found[0]
+        if len(found) > 1:
+            logger.warning("ambiguous lot lookup", extra={
+                "title": norm_title,
+                "lots": candidates,
+                "mappings": [m.get("fzr_sku_id") for m in found]})
+            return None
+        if candidates:
+            logger.info("lot found but not linked",
+                        extra={"lots": candidates, "title": norm_title})
+
+    if not norm_title:
+        return None
+
+    # 3) старый путь: сравниваем название привязки с описанием заказа
+    exact_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    substring_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    for m in mappings:
+        if not m.get("enabled", True):
+            continue
+        m_title = _normalize_title(m.get("funpay_title", ""))
+        if not m_title:
+            continue
+        m_sub = m.get("funpay_subcategory_id")
+        if m_sub is not None and subcategory_id is not None and str(m_sub) != str(subcategory_id):
+            continue
+        if m_title == norm_title:
+            exact_candidates.append((len(m_title), m))
+            continue
+        if not re.search(r"(?<!\w)" + re.escape(m_title) + r"(?!\w)", norm_title):
+            continue
+        order_nums = set(re.findall(r"\d+", norm_title))
+        mapping_nums = set(re.findall(r"\d+", m_title))
+        if mapping_nums and not mapping_nums <= order_nums:
+            continue
+        substring_candidates.append((len(m_title), m))
+
+    picked: Optional[Dict[str, Any]] = None
+    if exact_candidates:
+        exact_candidates.sort(key=lambda x: x[0], reverse=True)
+        picked = exact_candidates[0][1]
+    elif substring_candidates:
+        substring_candidates.sort(key=lambda x: x[0], reverse=True)
+        if len(substring_candidates) > 1 and substring_candidates[0][0] == substring_candidates[1][0]:
+            logger.warning("ambiguous mapping match", extra={"title": norm_title, "top": [m.get("funpay_title") for _, m in substring_candidates[:2]]})
+            return None
+        picked = substring_candidates[0][1]
+
+    if picked is not None:
+        # v3.21: привязка нашлась по названию, а ID лота в ней чужой или пустой
+        # (типичный след переноса на другой аккаунт). Пропишем живой ID сами —
+        # иначе каждый следующий заказ снова пойдёт длинным путём, а часть
+        # функций (цены, деактивация лота) без ID вообще не работает.
+        _autolink_lot_id(picked, lot_candidates)
+    return picked
+
+
+def _autolink_lot_id(mapping: Dict[str, Any], candidates: List[str]) -> bool:
+    """
+    Дописывает в привязку ID лота, опознанного по описанию заказа (v3.21).
+
+    Осторожность: правим только если ID пустой или такого лота на аккаунте
+    нет, и только когда кандидат ровно один — иначе можно молча увести
+    привязку на чужой лот.
+    """
+    if len(candidates) != 1:
+        return False
+    new_lot = str(candidates[0])
+    current = str(mapping.get("funpay_lot_id") or "")
+    if current == new_lot:
+        return False
+    if current:
+        # существующий ID трогаем только если такого лота на аккаунте больше нет
+        try:
+            if current in ((_LOTS_INDEX_CACHE.get("by_id") or {})):
+                return False
+        except Exception:
+            return False
+    try:
+        fresh = _db_get_mapping_by_id(str(mapping.get("id"))) or dict(mapping)
+        fresh["funpay_lot_id"] = new_lot
+        live = (_LOTS_INDEX_CACHE.get("by_id") or {}).get(new_lot) or {}
+        if live.get("title"):
+            fresh["funpay_title"] = live["title"]
+        if live.get("subcategory_id") is not None:
+            fresh["funpay_subcategory_id"] = live["subcategory_id"]
+        _db_save_mapping(fresh)
+        mapping["funpay_lot_id"] = new_lot
+        logger.info("lot id auto-linked from order",
+                    extra={"mapping": fresh.get("fzr_sku_id"), "lot_id": new_lot,
+                           "was": current or None})
+        return True
+    except Exception as e:
+        logger.warning("auto-link lot id failed",
+                       extra={"mapping": mapping.get("id"), "error": repr(e)})
+        return False
+
+
+def _serialize_order(order: Any) -> Dict[str, Any]:
+    lot_id = getattr(order, "offer_id", None) or getattr(order, "lot_id", None)
+    if lot_id is None:
+        offer_obj = getattr(order, "offer", None)
+        if offer_obj is not None:
+            lot_id = getattr(offer_obj, "id", None)
+    return {
+        "id": str(order.id),
+        "description": getattr(order, "description", None),
+        "price": getattr(order, "price", None),
+        "currency": getattr(order, "currency", None),
+        "buyer_username": getattr(order, "buyer_username", None),
+        "buyer_id": getattr(order, "buyer_id", None),
+        "chat_id": getattr(order, "chat_id", None),
+        "status": getattr(order, "status", None),
+        "subcategory_name": getattr(order, "subcategory_name", None),
+        "subcategory_id": getattr(getattr(order, "subcategory", None), "id", None) if getattr(order, "subcategory", None) else None,
+        "lot_id": lot_id,
+        "amount": getattr(order, "amount", 1) or 1,
+    }
+
+
+def _order_proxy(order_row: Dict[str, Any]) -> Any:
+    info = order_row.get("order_info") or {}
+    return _SimpleNamespace(**info)
+
+
+def _is_admin(c: "Cardinal", obj: Any) -> bool:
+    if not c.telegram:
+        return False
+    user = getattr(obj, "from_user", None)
+    if user is None:
+        return False
+    return user.id in c.telegram.authorized_users
+
+
+# -----------------------------------------------------------------------------
+# защита от упоминаний поставщика в чате с покупателем
+#
+# Покупатель не должен узнать, где продавец закупает товар: это его канал,
+# и любая утечка = покупатель идёт закупаться сам. Поэтому весь текст,
+# уходящий в чат FunPay, проходит через один фильтр — так надёжнее, чем
+# помнить про каждый шаблон.
+# -----------------------------------------------------------------------------
+
+# Название поставщика во всех написаниях + внутренние термины плагина.
+# Порядок важен: сначала более длинные и более конкретные варианты.
+# Везде `[ \t]*` вместо `\s*` — иначе вырезание съедает перевод строки
+# и слипаются соседние абзацы сообщения.
+_SUPPLIER_NAME_RE = r"(?:fazer\s*cards?|фазер\s*кардс)"
+_SUPPLIER_PATTERNS: List[Tuple[Any, str]] = [
+    # «Заказ FazerCards: ord-1» -> «Номер заказа: ord-1» (номер нужен покупателю)
+    (re.compile(rf"\bзаказ[а-яё]*[ \t]+{_SUPPLIER_NAME_RE}[ \t]*(?:№|:)?[ \t]*", re.I),
+     "Номер заказа: "),
+    # Обороты «куплено через X», «оформлено на X» — вырезаем целиком:
+    # заменять бренд словом внутри такой фразы = ломать падежи.
+    (re.compile(rf"[ \t]*\b(?:куплено|оформлено|приобретено|заказано)[ \t]+"
+                rf"(?:через|на|в|у)[ \t]+{_SUPPLIER_NAME_RE}\b[,.]?", re.I), ""),
+    (re.compile(rf"[ \t]*\b(?:через|на|в|у|от)[ \t]+{_SUPPLIER_NAME_RE}\b", re.I), ""),
+    # внутренние идентификаторы плагина
+    (re.compile(r"\bfzr[-_]?order[-_]?id\b", re.I), "номер заказа"),
+    (re.compile(r"\bfzr[-_]?(?:order|api|id)\b", re.I), "заказ"),
+    (re.compile(r"\bfzr[-_]?(\d+)\b", re.I), r"\1"),
+    # сам бренд, когда обороты уже сняты и он стоит отдельным словом
+    (re.compile(rf"\b{_SUPPLIER_NAME_RE}\b[ \t]*", re.I), ""),
+    (re.compile(r"\bfzr[a-z0-9]*\b[ \t]*", re.I), ""),
+]
+
+# Ссылки на инфраструктуру поставщика: домен сам себя выдаёт, даже если
+# в тексте бренда нет. Сюда же — служебные ссылки API.
+_SUPPLIER_URL_RE = re.compile(
+    r"https?://\S*(?:fazercards?|fzr)\S*", re.I)
+
+# Слова, выдающие «перепродажу», а не собственный товар. Покупателю
+# незачем знать про «закупку» — для него это просто выдача заказа.
+# Падеж сохраняем подменой основы: «поставщику» -> «сервису»,
+# «закупкой» -> «выдачей» (для «закупки» окончания совпадают не все).
+_PURCHASE_WORD_ENDINGS = {"а": "а", "у": "у", "и": "и", "е": "е", "ой": "ей",
+                          "ам": "ам", "ами": "ами", "ах": "ах", "": "а"}
+_RESELL_WORDS: List[Tuple[Any, Any]] = [
+    (re.compile(r"\bзакупк([а-яё]*)", re.I),
+     lambda m: "выдач" + _PURCHASE_WORD_ENDINGS.get(m.group(1).lower(), m.group(1))),
+    (re.compile(r"\bзакупа(ю|ем|ет|ется|ются)\b", re.I), r"оформля\1"),
+    # «поставщик» и «сервис» склоняются одинаково — меняем только основу
+    (re.compile(r"\bпоставщик([а-яё]*)", re.I), r"сервис\1"),
+]
+
+
+def _keep_case(original: str, replacement: str) -> str:
+    """Сохранить регистр первой буквы: «Закупка» -> «Выдача», а не «выдача»."""
+    if original and replacement and original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def _scrub_buyer_text(text: str) -> str:
+    """
+    Убирает из текста для покупателя всё, что выдаёт поставщика.
+
+    Работает как последний рубеж: даже если продавец впишет «FazerCards»
+    в свой шаблон выдачи, покупатель этого не увидит. Ссылки на домен
+    поставщика вырезаются целиком — их нельзя «переписать» безопасно.
+    Номер заказа при этом сохраняется: покупателю он полезен.
+    """
+    if not text:
+        return text
+    out = str(text)
+    out = _SUPPLIER_URL_RE.sub("[ссылка скрыта]", out)
+    for pat, repl in _SUPPLIER_PATTERNS + _RESELL_WORDS:
+        def _sub(m: Any, _repl: Any = repl) -> str:
+            if callable(_repl):
+                value = _repl(m)
+            else:
+                try:
+                    value = m.expand(_repl)
+                except (re.error, IndexError):
+                    value = _repl
+            return _keep_case(m.group(0), value)
+        out = pat.sub(_sub, out)
+    # после вырезаний могли остаться двойные пробелы и висячие знаки
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"[ \t]+([,.!?;:])", r"\1", out)
+    out = re.sub(r"(?m)[ \t]+$", "", out)
+    out = re.sub(r"(?m)^[ \t]+", "", out)          # вырезали начало строки
+    out = re.sub(r"(?m)^[ \t]*[:—-]\s*$", "", out)
+    out = re.sub(r"(?m)^[,.;]\s*", "", out)        # осталась висячая запятая
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _buyer_text_leaks(text: str) -> List[str]:
+    """Что именно осталось от поставщика (для самопроверки и тестов)."""
+    low = (text or "").lower()
+    found = []
+    for needle in ("fazercards", "fazer cards", "фазеркардс", "fzr", "закупк"):
+        if needle in low:
+            found.append(needle)
+    return found
+
+
+def _send_buyer(c: "Cardinal", chat_id: Any, text: str, username: Optional[str] = None, watermark: bool = True) -> bool:
+    # единая точка отправки покупателю — здесь и вычищаем следы поставщика
+    text = _scrub_buyer_text(text)
+    leaks = _buyer_text_leaks(text)
+    if leaks:
+        # фильтр не справился: лучше залогировать и разобраться, чем молчать
+        logger.error("supplier mention leaked to buyer",
+                     extra={"chat_id": str(chat_id), "leaks": leaks})
+    try:
+        c.send_message(chat_id, text, username, watermark=watermark)
+        return True
+    except Exception as e:
+        logger.error("send_buyer failed", extra={"chat_id": str(chat_id), "error": repr(e)})
+        return False
+def _notify_admin(c: "Cardinal", text: str) -> None:
+    if not getattr(c, "telegram", None):
+        return
+    try:
+        c.telegram.send_notification(_esc(text))
+    except Exception as e:
+        logger.error("notify_admin failed", extra={"error": repr(e)})
+
+
+def _get_mapping_by_id(mapping_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return _db_get_mapping_by_id(mapping_id)
+
+
+def _ask_metadata_text(cfg: Dict[str, Any], mapping: Dict[str, Any]) -> str:
+    prompt = mapping.get("metadata_prompt") or ""
+    tpl = cfg["templates"]["ask_metadata"]
+    try:
+        return render_template(tpl, default=DEFAULT_CONFIG["templates"]["ask_metadata"], prompt=prompt)
+    except Exception:
+        return prompt or tpl
+# =============================================================================
+# order processing
+# =============================================================================
+
+
+def _first_metadata_value(metadata: Optional[Dict[str, str]]) -> str:
+    if not metadata:
+        return ""
+    return next(iter(metadata.values()), "")
+
+
+def _kind_supports_quantity(kind: str) -> bool:
+    """
+    Принимает ли эндпоинт /order поле quantity.
+
+    По схеме FazerCards API:
+      * giftcards / gamekeys / telegram-stars — есть quantity;
+      * steam-topup — есть amount;
+      * topups / manual-services — принимают ТОЛЬКО {category_id, offer_id, fields},
+        поэтому заказ на N штук нужно создавать N отдельными запросами;
+      * telegram-premium / steam-gifts — по своей природе всегда 1 шт.
+    """
+    return kind in ("giftcards", "gamekeys", "telegram-stars", "steam-topup")
+
+
+def _kind_needs_batch(kind: str) -> bool:
+    """Нужно ли эмулировать количество несколькими заказами."""
+    return kind in ("topups", "manual-services")
+
+
+def _pick_metadata(meta: Dict[str, str], *keys: str) -> str:
+    """
+    Достаёт значение по известным ключам, с откатом на первое непустое.
+
+    Нужно, когда у привязки несколько полей: брать «первое подряд» рискованно —
+    в steam-topup логин мог оказаться вторым, и в API уходило чужое значение.
+    """
+    for key in keys:
+        value = meta.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return str(_first_metadata_value(meta) or "").strip()
+
+
+def _build_fzr_payload(kind: str, category_id: str, offer_id: str, quantity: Union[int, float], metadata: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    meta = metadata or {}
+    if kind == "giftcards":
+        return {"category_id": category_id, "card_id": offer_id, "quantity": int(quantity)}
+    if kind == "gamekeys":
+        return {"game_id": category_id, "key_id": offer_id, "quantity": int(quantity)}
+    if kind == "topups":
+        return {"category_id": category_id, "offer_id": offer_id, "fields": meta}
+    if kind == "manual-services":
+        return {"manual_service_id": category_id, "product_id": offer_id, "fields": meta}
+    if kind == "telegram-stars":
+        return {"telegram_username": _pick_metadata(meta, "telegram_username", "username", "telegram"),
+                "quantity": int(quantity)}
+    if kind == "telegram-premium":
+        return {"telegram_username": _pick_metadata(meta, "telegram_username", "username", "telegram"),
+                "months": int(offer_id) or 3}
+    if kind == "steam-gifts":
+        sub_region = (offer_id or "").split(":", 1)
+        if len(sub_region) != 2:
+            raise FazerCardsAPIError("SKU Steam Gifts должен быть вида steam-gifts:<appid>:<sub_id>:<region>")
+        sub_id, region = sub_region
+        try:
+            app_id = int(category_id)
+            sub_id_int = int(sub_id)
+        except (TypeError, ValueError):
+            raise FazerCardsAPIError("Некорректный app_id или sub_id в SKU Steam Gifts")
+        invite = _normalize_metadata_value(
+            "steam_invite", _pick_metadata(meta, "invite_url", "url", "link"))
+        if not invite:
+            raise FazerCardsAPIError(
+                "Не указана ссылка-приглашение Steam (s.team/p/...). "
+                "Проверьте поля привязки."
+            )
+        return {"invite_url": invite,
+                "sub_id": sub_id_int, "app_id": app_id, "region": region}
+    if kind == "steam-topup":
+        login = _pick_metadata(meta, "steam_login", "steamLogin", "login")
+        if not login:
+            # без логина API вернёт 400 (steamLogin minLength=1) — падаем понятнее
+            raise FazerCardsAPIError(
+                "Не указан логин Steam. Проверьте, что в привязке есть поле "
+                "«Логин Steam» (пересоздайте её через каталог)."
+            )
+        # amount — СУММА пополнения в выбранной валюте, USD максимум 2 знака
+        amount = round(float(quantity), 2) if offer_id == "USD" else float(quantity)
+        if amount == int(amount):
+            amount = int(amount)
+        return {"steamLogin": login, "currency": offer_id, "amount": amount}
+    raise FazerCardsAPIError(f"Неподдерживаемый тип заказа: {kind}")
+
+
+def _metadata_dict(mapping: Dict[str, Any], metadata: Optional[Dict[str, str]]) -> Dict[str, str]:
+    return dict(metadata or {})
+
+
+def _resolve_order_sku(mapping: Dict[str, Any]) -> Tuple[str, str, str]:
+    kind = mapping.get("category_kind")
+    category_id = mapping.get("category_id")
+    offer_id = mapping.get("offer_id")
+    if kind and category_id and offer_id:
+        return kind, category_id, offer_id
+    sku = mapping.get("fzr_sku_id") or ""
+    parts = sku.split(":", 2)
+    if len(parts) < 3:
+        raise FazerCardsAPIError("Привязка неполная: не указаны category_kind/category_id/offer_id")
+    return parts[0], parts[1], parts[2]
+
+
+def _preorder_quantity_check(order_info: Dict[str, Any], max_q_cfg: int, offer_info: Dict[str, Any], kind: Optional[str] = None) -> Union[int, float]:
+    raw_amount = order_info.get("amount") or 1
+    if kind == "steam-topup":
+        try:
+            quantity = float(raw_amount)
+        except (TypeError, ValueError):
+            quantity = 1.0
+    else:
+        quantity = max(1, int(raw_amount))
+    min_quantity = float(offer_info.get("min_quantity", 1)) if kind == "steam-topup" else max(1, int(offer_info.get("min_quantity", 1)))
+    offer_max_q = offer_info.get("max_quantity")
+    if kind == "steam-topup":
+        max_quantity = float(offer_max_q) if offer_max_q is not None else 1000000.0
+    else:
+        max_quantity = min(int(offer_max_q), max_q_cfg) if offer_max_q is not None else max_q_cfg
+    if kind != "steam-topup" and quantity > max_q_cfg:
+        raise FazerCardsAPIError(f"Количество {quantity} превышает лимит {max_q_cfg}")
+    if quantity < min_quantity:
+        raise FazerCardsAPIError(f"Минимальное количество для этого товара: {min_quantity}")
+    if quantity > max_quantity:
+        raise FazerCardsAPIError(f"Количество {quantity} превышает максимально допустимое {max_quantity}")
+    stock = offer_info.get("stock")
+    if stock is not None and quantity > int(stock):
+        raise FazerCardsAPIError(f"Товара недостаточно на складе (доступно: {stock}, нужно: {quantity})")
+    return quantity
+
+
+def _preorder_balance_check(api: "FazerCardsAPI", offer_info: Dict[str, Any], quantity: Union[int, float], order_id: Any) -> None:
+    """
+    Проверка баланса ДО создания заказа.
+
+    При нехватке бросает InsufficientFundsError с числами (сколько есть,
+    сколько нужно) — вызывающий переводит заказ в ожидание пополнения,
+    а не в ошибку.
+    """
+    price_usd = offer_info.get("price_usd")
+    if price_usd is None:
+        return
+    try:
+        balance_resp = api.get_balance()
+        balance_usd = float(balance_resp.get("balance", balance_resp.get("balance_usd", 0)) or 0)
+    except FazerCardsAPIError:
+        raise
+    except Exception as e:
+        logger.warning("balance pre-check failed", extra={"funpay_order_id": order_id, "error": repr(e)})
+        return
+    cost_usd = float(price_usd) * quantity
+    if balance_usd < cost_usd:
+        raise InsufficientFundsError(
+            f"Недостаточно средств на балансе FazerCards: {balance_usd:.2f} USD, "
+            f"требуется {cost_usd:.2f} USD",
+            needed_usd=cost_usd, balance_usd=balance_usd)
+
+
+def _cancel_fzr_order_if_enabled(c: "Cardinal", funpay_order_id: str, fzr_order_id: Optional[str]) -> None:
+    if not fzr_order_id:
+        return
+    try:
+        cfg = load_config()
+        if not cfg["settings"].get("auto_cancel_fzr_order"):
+            return
+        if not cfg["api_key"]:
+            return
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        api.cancel_order(str(fzr_order_id))
+        _db_log_event(funpay_order_id, "fzr_order_cancelled", {"fzr_order_id": fzr_order_id, "reason": "funpay_refund_or_cancel"})
+        logger.info("fzr order cancelled", extra={"funpay_order_id": funpay_order_id, "fzr_order_id": fzr_order_id})
+        # v3.19: закупка отменена — деньги у поставщика вернулись, значит и в
+        # нашей книге долг должен уменьшиться. Иначе локальный баланс копил бы
+        # несуществующие траты.
+        try:
+            _balance_refund_order(c, funpay_order_id,
+                                  comment="возврат: заказ FazerCards отменён")
+        except Exception as e:
+            logger.warning("local balance refund failed",
+                           extra={"funpay_order_id": funpay_order_id, "error": repr(e)})
+    except Exception as ex:
+        logger.warning("fzr order cancel failed", extra={"funpay_order_id": funpay_order_id, "fzr_order_id": fzr_order_id, "error": _redact_sensitive(str(ex))})
+
+
+_OUT_OF_STOCK_KEYWORDS = (
+    "out of stock", "sold out", "нет в наличии", "закончился", "not enough stock",
+    "insufficient stock", "stock exceeded", "quantity exceeds stock", "unavailable",
+)
+
+
+def _is_out_of_stock_error(error_text: str) -> bool:
+    return any(kw in (error_text or "").lower() for kw in _OUT_OF_STOCK_KEYWORDS)
+
+
+def _fzr_disable_funpay_lot(c: "Cardinal", lot_id: Any) -> bool:
+    try:
+        if not c or not getattr(c, "account", None):
+            return False
+        lot_id_int = int(lot_id)
+        lf = c.account.get_lot_fields(lot_id_int)
+        if not getattr(lf, "active", True):
+            return True
+        lf.active = False
+        lf.renew_fields()
+        c.account.save_lot(lf)
+        logger.info("funpay lot deactivated", extra={"lot_id": lot_id_int})
+        return True
+    except Exception as ex:
+        logger.warning("funpay lot deactivation failed", extra={"lot_id": lot_id, "error": _redact_sensitive(str(ex))})
+        return False
+
+
+def _handle_out_of_stock(c: "Cardinal", mapping: Optional[Dict[str, Any]], reason: str) -> None:
+    if not mapping:
+        return
+    mapping_id = mapping.get("id")
+    if mapping_id:
+        try:
+            _db_connect().execute("UPDATE mappings SET enabled=0, updated_at=? WHERE id=?", (time.time(), mapping_id))
+        except Exception as e:
+            logger.warning("disable mapping failed", extra={"mapping_id": mapping_id, "error": repr(e)})
+    _notify_admin(c, f"⚠️ Mapping {mapping_id or '?'} отключён из-за отсутствия товара: {_esc(reason[:300])}")
+    if load_config()["settings"].get("auto_disable_lot") and mapping.get("funpay_lot_id"):
+        ok = _fzr_disable_funpay_lot(c, mapping["funpay_lot_id"])
+        _notify_admin(c, f"{'✅' if ok else '⚠️'} FunPay лот {mapping['funpay_lot_id']} {'деактивирован' if ok else 'не удалось деактивировать'}.")
+
+
+def _coerce_metadata_against_offer(
+    kind: str,
+    metadata: Dict[str, str],
+    offer_info: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Последняя проверка перед POST /order: значения select-полей должны быть из
+    актуального списка options (API: "for `select` use listed `options`").
+
+    Список берём из свежего ответа API (offer_info), с откатом на mapping['fields'].
+    Если покупатель прислал подпись варианта вместо value — подменяем на value.
+    Если значение отсутствует в списке — падаем ДО списания баланса FazerCards.
+    """
+    if kind not in ("topups", "manual-services"):
+        return metadata
+
+    raw_fields = offer_info.get("fields") or mapping.get("fields") or []
+    if not isinstance(raw_fields, list):
+        return metadata
+
+    result = dict(metadata)
+    for f in raw_fields:
+        if not isinstance(f, dict) or not _is_select_field(f):
+            continue
+        key = str(f.get("code") or f.get("key") or "")
+        if not key or key not in result:
+            continue
+        value, error = _resolve_select_value(f, str(result[key]))
+        if error:
+            allowed = ", ".join(o["value"] for o in _field_options(f)[:10]) or "—"
+            raise FazerCardsAPIError(
+                f"Некорректное значение поля «{f.get('label') or f.get('name') or key}»: "
+                f"{result[key]!r}. Допустимые варианты: {allowed}"
+            )
+        result[key] = value
+    return result
+
+
+_VALIDATE_ID_GAMES_TTL = 900.0
+_VALIDATE_ID_GAMES: Optional[Tuple[float, Dict[str, Dict[str, Any]]]] = None
+_VALIDATE_ID_LOCK = threading.RLock()
+
+
+def _get_validate_id_games(api: "FazerCardsAPI") -> Dict[str, Dict[str, Any]]:
+    """
+    Кэшированный список игр из GET /topups/validate-id: {category_id: описание}.
+    Список динамический, поэтому TTL, а не константа в коде.
+    """
+    global _VALIDATE_ID_GAMES
+    with _VALIDATE_ID_LOCK:
+        cached = _VALIDATE_ID_GAMES
+        if cached and time.time() - cached[0] < _VALIDATE_ID_GAMES_TTL:
+            return cached[1]
+    try:
+        resp = api.get_validate_id_games()
+        games = {str(it.get("category_id")): it for it in (resp.get("items") or []) if it.get("category_id")}
+    except Exception as e:
+        logger.warning("validate-id games fetch failed", extra={"error": _redact_sensitive(str(e))})
+        return {}
+    with _VALIDATE_ID_LOCK:
+        _VALIDATE_ID_GAMES = (time.time(), games)
+    return games
+
+
+def _validate_player_id_if_supported(
+    api: "FazerCardsAPI",
+    kind: str,
+    category_id: str,
+    metadata: Dict[str, str],
+    mapping: Dict[str, Any],
+    order_id: Any,
+) -> Optional[Dict[str, Any]]:
+    """
+    Проверяет Player ID через POST /topups/validate-id, если игра это поддерживает.
+
+    Возвращает данные ответа (player_name / region) либо None, если проверка
+    неприменима. Бросает FazerCardsAPIError, если ID точно неверный — тогда заказ
+    не создаётся и баланс не списывается.
+
+    Отключаемо на уровне привязки (mapping['validate_id'] = 0) и глобально
+    (settings.validate_player_id).
+    """
+    if kind != "topups":
+        return None
+    if mapping.get("validate_id") in (0, "0", False):
+        return None
+
+    games = _get_validate_id_games(api)
+    game = games.get(str(category_id))
+    if not game:
+        return None
+
+    required = [str(f.get("key") or f.get("code") or "") for f in (game.get("fields") or [])]
+    required = [k for k in required if k]
+    fields = {k: str(metadata[k]) for k in required if k in metadata and str(metadata.get(k, "")).strip()}
+    if not fields or len(fields) != len(required):
+        logger.info("validate-id skipped: not all fields collected",
+                    extra={"funpay_order_id": order_id, "category_id": category_id,
+                           "required": required, "have": list(fields)})
+        return None
+
+    try:
+        resp = api.validate_player_id(str(category_id), fields)
+    except FazerCardsAPIError as ex:
+        if ex.status_code == 422:
+            raise FazerCardsAPIError(
+                "Не удалось подтвердить ID игрока. Проверьте данные и свяжитесь с продавцом."
+            )
+        # прочие сбои (5xx, сеть, лимиты) не должны блокировать продажу
+        logger.warning("validate-id call failed, continuing",
+                       extra={"funpay_order_id": order_id, "category_id": category_id,
+                              "error": _redact_sensitive(str(ex))})
+        return None
+
+    if resp.get("valid") is False:
+        raise FazerCardsAPIError(
+            "ID игрока не найден в этой игре. Проверьте ID и свяжитесь с продавцом."
+        )
+
+    logger.info("player id validated", extra={
+        "funpay_order_id": order_id, "category_id": category_id,
+        "player_name": resp.get("player_name"), "region": resp.get("region")})
+    return resp
+
+
+def _create_order_batch(
+    api: "FazerCardsAPI",
+    kind: str,
+    category_id: str,
+    offer_id: str,
+    quantity: Union[int, float],
+    metadata: Dict[str, str],
+    order_id: Any,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Создаёт заказы в FazerCards с учётом количества.
+
+    topups / manual-services не принимают quantity, поэтому на заказ FunPay из
+    N единиц отправляем N отдельных запросов, каждый со СВОИМ Idempotency-Key
+    (`fpc-fzr-<order>-<i>`) — иначе API вернёт первый заказ повторно и покупатель
+    получит одну позицию вместо N.
+
+    Возвращает (список fzr_order_id, список сырых ответов). Если часть заказов
+    уже создана, а следующий упал — бросает исключение с уже созданными ID в
+    сообщении, чтобы продавец мог разобраться вручную.
+    """
+    payload = _build_fzr_payload(kind, category_id, offer_id, quantity, metadata)
+
+    if not _kind_needs_batch(kind):
+        idem = f"fpc-fzr-{order_id}"
+        resp = api.create_order(kind, payload, idempotency_key=idem)
+        return _extract_order_ids(resp, order_id), [resp]
+
+    count = max(1, int(quantity))
+    if count > _MAX_BATCH_ORDERS:
+        # страховка от опечатки в units_per_item / количестве: не отправляем
+        # сотни запросов и не сжигаем баланс молча
+        raise FazerCardsAPIError(
+            f"Требуется {count} отдельных заказов FazerCards (лимит {_MAX_BATCH_ORDERS}). "
+            f"Проверьте количество в заказе и номинал лота (units_per_item)."
+        )
+    ids: List[str] = []
+    responses: List[Dict[str, Any]] = []
+    for i in range(count):
+        idem = f"fpc-fzr-{order_id}-{i + 1}"
+        try:
+            resp = api.create_order(kind, payload, idempotency_key=idem)
+        except Exception as ex:
+            if ids:
+                # Часть заказов уже создана и деньги списаны. Здесь НЕЛЬЗЯ
+                # отдавать InsufficientFundsError: авто-повтор создал бы
+                # дубликаты уже купленных позиций. Нужен разбор вручную.
+                raise FazerCardsAPIError(
+                    f"Создано {len(ids)} из {count} заказов, следующий не удался: {ex}. "
+                    f"Созданные заказы FazerCards: {', '.join(ids)}"
+                )
+            raise
+        part_ids = _extract_order_ids(resp, order_id)
+        ids.extend(part_ids)
+        responses.append(resp)
+        if count > 1:
+            logger.info("batch order created", extra={
+                "funpay_order_id": order_id, "index": i + 1, "of": count,
+                "fzr_order_id": part_ids[0] if part_ids else None})
+    return ids, responses
+
+
+def _extract_order_ids(resp: Dict[str, Any], order_id: Any) -> List[str]:
+    order_resp = resp.get("order", resp)
+    fzr_order_id = order_resp.get("id") or order_resp.get("order_id") or resp.get("order_id")
+    if not fzr_order_id:
+        raise FazerCardsAPIError("Заказ создан, но ID отсутствует в ответе")
+    return [str(fzr_order_id)]
+
+
+def _check_steam_login_if_possible(
+    api: "FazerCardsAPI",
+    kind: str,
+    metadata: Dict[str, str],
+    mapping: Dict[str, Any],
+    order_id: Any,
+) -> Optional[Dict[str, Any]]:
+    """
+    Проверяет логин Steam через POST /steam-topup/check-login ДО списания баланса.
+
+    can_refill == False -> бросаем FazerCardsAPIError, заказ не создаётся.
+    Сетевые/серверные сбои проверку не блокируют (как и в validate-id).
+    Отключаемо: mapping['validate_id'] = 0 или settings.validate_player_id = False.
+    """
+    if kind != "steam-topup":
+        return None
+    if mapping.get("validate_id") in (0, "0", False):
+        return None
+
+    login = ""
+    for key in ("steam_login", "steamLogin", "login"):
+        if metadata.get(key):
+            login = str(metadata[key]).strip()
+            break
+    if not login:
+        login = str(_first_metadata_value(metadata) or "").strip()
+    if not login:
+        return None
+
+    try:
+        resp = api.check_steam_login(login)
+    except FazerCardsAPIError as ex:
+        if ex.status_code in (400, 404, 422):
+            raise FazerCardsAPIError(
+                f"Аккаунт Steam «{login}» не найден или не может принять пополнение. "
+                "Проверьте логин и свяжитесь с продавцом."
+            )
+        logger.warning("check-login failed, continuing",
+                       extra={"funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+        return None
+    except Exception as ex:
+        logger.warning("check-login unexpected error, continuing",
+                       extra={"funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+        return None
+
+    can = resp.get("can_refill")
+    if can is None:
+        can = resp.get("canRefill")
+    if can is False:
+        raise FazerCardsAPIError(
+            f"Аккаунт Steam «{login}» не может принять пополнение. "
+            "Проверьте логин (это логин для входа, не e-mail и не ник) "
+            "и свяжитесь с продавцом."
+        )
+    logger.info("steam login checked", extra={
+        "funpay_order_id": order_id, "steam_login": login, "can_refill": can})
+    return resp
+
+
+def _units_per_item(mapping: Dict[str, Any]) -> int:
+    """
+    Сколько единиц товара даёт одна купленная штука лота.
+
+    Нужно для steam-topup: в API `amount` — это СУММА пополнения, а не число
+    позиций. Лот «Steam 500 ₽» продаётся штуками, поэтому 1 шт должна давать
+    amount = 500, а не 1. Значение 1 (по умолчанию) сохраняет прежнее поведение
+    «лот за 1 единицу валюты».
+    """
+    try:
+        value = int(float(mapping.get("units_per_item") or 1))
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
+
+
+def _effective_units(mapping: Dict[str, Any], quantity: Union[int, float]) -> Union[int, float]:
+    """Итоговое значение для API: количество из заказа × номинал лота."""
+    multiplier = _units_per_item(mapping)
+    if multiplier == 1:
+        return quantity
+    return quantity * multiplier
+
+
+def _autofill_single_options(
+    fields: List[Dict[str, Any]],
+    values: Dict[str, str],
+) -> List[Tuple[str, str, str]]:
+    """
+    Подставляет значение для select-полей с ЕДИНСТВЕННЫМ вариантом.
+
+    В каталоге FazerCards таких категорий десяток (badlanders → «Global»,
+    heroes_evolved → «Follow the website» и т.п.). Спрашивать покупателя
+    «выберите 1. Global» бессмысленно, поэтому заполняем сами.
+
+    Возвращает список (key, value, label) подставленных полей — для лога и
+    сообщения продавцу. values мутируется на месте.
+    """
+    filled: List[Tuple[str, str, str]] = []
+    for f in fields:
+        key = str(f.get("key") or "")
+        if not key or key in values:
+            continue
+        if not _is_select_field(f):
+            continue
+        options = _field_options(f)
+        if len(options) != 1:
+            continue
+        values[key] = options[0]["value"]
+        filled.append((key, options[0]["value"], options[0]["label"]))
+    return filled
+
+
+def _next_unfilled_index(fields: List[Dict[str, Any]], values: Dict[str, str], start: int = 0) -> int:
+    """Индекс первого поля, которое ещё не заполнено (с учётом автоподстановки)."""
+    idx = start
+    while idx < len(fields) and str(fields[idx].get("key") or "") in values:
+        idx += 1
+    return idx
+
+
+def _unfilled_count(fields: List[Dict[str, Any]], values: Dict[str, str]) -> int:
+    """
+    Сколько полей реально спросим у покупателя.
+
+    Считаем только незаполненные: если один select подставился автоматически,
+    писать «шаг 1 из 3» неправильно — вопросов будет два.
+    """
+    return sum(1 for f in fields if str(f.get("key") or "") not in values)
+
+
+# -----------------------------------------------------------------------------
+# v3.14: поэтапное подтверждение введённых данных (+ / -)
+#
+# Зачем: покупатель присылает логин Steam с опечаткой, плагин его принимает
+# (формат-то верный) и пополнение уходит на чужой аккаунт — вернуть нельзя.
+# Поэтому после КАЖДОГО принятого значения показываем, что именно поняли,
+# и ждём «+» (верно) или «-» (ввести заново). Перед закупкой — сводка всех
+# значений одним сообщением.
+#
+# Ответы покупателей в реальных чатах: «+», «да», «ок», «верно», «+++»,
+# «👍», «-», «нет», «не верно», «исправить». Разбираем всё это.
+# -----------------------------------------------------------------------------
+_YES_TOKENS = {
+    "+", "++", "+++", "да", "дп", "ага", "угу", "ок", "окей", "окей", "хорошо",
+    "верно", "всеверно", "всёверно", "правильно", "подтверждаю", "подтверждаб",
+    "точно", "именно", "yes", "y", "yep", "yeah", "ok", "okay", "correct",
+    "confirm", "true", "1", "👍", "✅", "☑️", "✔️", "✔", "🆗", "+-",
+}
+_NO_TOKENS = {
+    "-", "--", "---", "нет", "не", "неа", "неверно", "неверное", "невено",
+    "исправить", "заново", "поменять", "изменить", "ошибка", "ошибся",
+    "ошиблась", "другое", "другой", "не то", "нето", "нетверно",
+    "no", "n", "nope", "wrong", "false", "0", "👎", "❌", "✖️", "🚫",
+}
+# всё, что не является ответом на вопрос: приветствия, благодарности, «?»
+_SMALLTALK_TOKENS = {
+    "привет", "приветик", "приветствую", "здравствуйте", "здравствуй", "здраствуйте",
+    "хай", "хэй", "хеллоу", "hi", "hello", "hey", "yo", "доброеутро",
+    "добрыйдень", "добрыйвечер", "добройночи", "доброго", "здорово", "здарова",
+    "спасибо", "спс", "благодарю", "пасиб", "пасибо", "thanks", "thx", "ty",
+    "пожалуйста", "плиз", "please", "ждупожалуйста",
+    "ку", "ало", "алло", "эй", "оk", "тут", "здесь", "я", "жду", "ожидаю",
+    "?", "??", "???", "!", "!!", "..", "...", "что", "как", "когда", "и",
+    "гдетовар", "гдезаказ", "гдеключ", "долго", "чтодальше", "непонял",
+    "непонятно", "help", "помощь", "sos",
+}
+# приветствие может быть в начале строки перед ответом: «привет, 76561198...»
+_SMALLTALK_PREFIX_RE = re.compile(
+    r"^\s*(привет(ик|ствую)?|здравствуйте|здравствуй|хай|hi|hello|hey|"
+    r"добрый\s+(день|вечер)|доброе\s+утро|спасибо|спс|благодарю|thanks)"
+    r"[\s,!.:;)-]*", re.IGNORECASE)
+
+
+def _norm_token(text: str) -> str:
+    """Нормализует короткий ответ: регистр, пробелы, знаки в конце."""
+    t = (text or "").strip().lower()
+    t = t.replace("ё", "е")
+    t = re.sub(r"[\s\u00a0]+", "", t)
+    t = t.strip(".,!;:)(")
+    return t
+
+
+def _parse_yes_no(text: str) -> Optional[bool]:
+    """
+    True — подтвердил, False — просит исправить, None — не понял.
+
+    Отдельно ловим «+» и «-» внутри короткой фразы («+ верно», «нет, -»),
+    но НЕ трогаем длинные тексты: там «-» может быть просто дефисом в значении.
+    """
+    t = _norm_token(text)
+    if not t:
+        return None
+    if t in _YES_TOKENS:
+        return True
+    if t in _NO_TOKENS:
+        return False
+    if len(t) <= 12:
+        # «+верно», «даверно», «нетнето»
+        if t.startswith("+") and not t.startswith("+7"):
+            return True
+        if t.startswith("-") and not t[1:2].isdigit():
+            return False
+        for tok in ("неверн", "исправ", "заново", "ошиб", "другой", "другое"):
+            if tok in t:
+                return False
+        for tok in ("верно", "правильн", "подтвержд", "согласен", "согласна"):
+            if tok in t:
+                return True
+    return None
+
+
+def _is_smalltalk(text: str) -> bool:
+    """
+    Похоже ли сообщение на болтовню, а не на ответ по делу.
+
+    Осторожно: НЕЛЬЗЯ считать болтовнёй всё короткое — «1» это выбор варианта
+    select, «RU» — регион. Поэтому список закрытый, а цифры и латиница
+    длиной 2+ никогда болтовнёй не считаются.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    t = _norm_token(raw)
+    if not t:
+        return True
+    # ответы вида «1», «2» — это выбор варианта, не болтовня
+    if t.isdigit():
+        return False
+    if t in _SMALLTALK_TOKENS:
+        return True
+    # «привет!!» / «спасибо))» уже покрыты strip выше; смайлы отдельно
+    if all(not ch.isalnum() for ch in t) and len(t) <= 4:
+        return True
+    return False
+
+
+def _strip_smalltalk_prefix(text: str) -> str:
+    """
+    Снимает приветствие перед реальным ответом.
+
+    Покупатели пишут «Привет, мой логин vasya_pupkin» — без этого значение
+    не проходит валидацию, и диалог зацикливается.
+    """
+    raw = (text or "").strip()
+    stripped = _SMALLTALK_PREFIX_RE.sub("", raw, count=1).strip()
+    # если после снятия приветствия ничего не осталось — значит это была
+    # именно болтовня, возвращаем исходник (его отфильтрует _is_smalltalk)
+    return stripped or raw
+
+
+def _confirm_question(field: Dict[str, Any], shown: Any) -> str:
+    """Вопрос «всё верно?» покупателю (plain text, чат FunPay)."""
+    label = field.get("label") or field.get("key") or "значение"
+    return (f"Проверьте, всё верно?\n"
+            f"{label}: {shown}\n\n"
+            f"Отправьте + если верно, или - чтобы ввести заново.")
+
+
+def _summary_question(fields: List[Dict[str, Any]], values: Dict[str, str],
+                      labels: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Финальная сводка перед закупкой.
+
+    Держим в пределах 20 строк (Cardinal.split_text): 2 строки заголовка +
+    по строке на поле + 2 строки хвоста. Больше 12 полей у привязок не бывает,
+    но на всякий случай лишние сворачиваем в одну строку.
+    """
+    labels = labels or {}
+    lines: List[str] = ["Проверьте данные заказа:"]
+    shown_fields = [f for f in fields if str(f.get("key") or "") in values]
+    head = shown_fields[:12]
+    for f in head:
+        key = str(f.get("key") or "")
+        label = f.get("label") or key
+        lines.append(f"{label}: {labels.get(key) or values.get(key)}")
+    if len(shown_fields) > len(head):
+        rest = shown_fields[len(head):]
+        lines.append("Ещё: " + "; ".join(
+            f"{(f.get('label') or f.get('key'))}: {labels.get(str(f.get('key') or '')) or values.get(str(f.get('key') or ''))}"
+            for f in rest))
+    lines.append("")
+    lines.append("Отправьте + чтобы я оформил заказ, или - чтобы ввести данные заново.")
+    return "\n".join(lines)
+
+
+def _confirm_enabled(cfg: Dict[str, Any], key: str = "confirm_metadata") -> bool:
+    return bool(cfg.get("settings", {}).get(key, True))
+
+
+def _greet_buyer(c: "Cardinal", cfg: Dict[str, Any], order: Any,
+                 mapping: Optional[Dict[str, Any]], quantity: int = 1,
+                 will_ask: bool = False) -> None:
+    """Приветствие покупателю сразу после оплаты (если включено)."""
+    if not cfg["settings"].get("greeting", True):
+        return
+    text = _greeting_text(cfg, mapping, quantity=quantity, will_ask=will_ask)
+    if not text:
+        return
+    chat_id = getattr(order, "chat_id", None)
+    if chat_id is None:
+        return
+    _send_buyer(c, chat_id, text, getattr(order, "buyer_username", None))
+
+
+def _refresh_mapping_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Тянет актуальные fields (и, значит, options) из API для привязки.
+
+    Серверы/регионы в каталоге меняются, а привязка могла быть создана месяц
+    назад — показывать покупателю устаревший список нельзя. При любой ошибке
+    возвращает поля из БД, чтобы диалог не срывался.
+    """
+    try:
+        cfg = load_config()
+        if not cfg.get("api_key") or not cfg["settings"].get("fresh_options", True):
+            return _build_metadata_fields(mapping)
+        kind = mapping.get("category_kind")
+        category_id = mapping.get("category_id")
+        offer_id = mapping.get("offer_id")
+        if not (kind and category_id and offer_id):
+            return _build_metadata_fields(mapping)
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        offer_info = _resolve_offer_info(api, str(kind), str(category_id), str(offer_id))
+        fresh = offer_info.get("fields")
+        if not fresh:
+            return _build_metadata_fields(mapping)
+        merged = dict(mapping)
+        merged["fields"] = fresh
+        # metadata_fields пересобираем от свежих полей, сохраняя ручные подписи
+        old_labels = {str(f.get("key")): f.get("label")
+                      for f in (mapping.get("metadata_fields") or []) if f.get("key")}
+        rebuilt: List[Dict[str, Any]] = []
+        for f in fresh:
+            key = str(f.get("code") or f.get("key") or "")
+            if not key:
+                continue
+            label = old_labels.get(key) or f.get("name") or f.get("label") or key
+            rebuilt.append(_make_metadata_field(key, label, f))
+        if rebuilt:
+            logger.info("mapping fields refreshed from API", extra={
+                "mapping_id": mapping.get("id"), "category_id": category_id,
+                "selects": [f["key"] for f in rebuilt if _is_select_field(f)]})
+            return rebuilt
+        return _build_metadata_fields(merged)
+    except Exception as e:
+        logger.warning("refresh mapping fields failed", extra={
+            "mapping_id": mapping.get("id"), "error": _redact_sensitive(str(e))})
+        return _build_metadata_fields(mapping)
+
+
+def _markup_own(mapping: Dict[str, Any], key: str) -> Optional[float]:
+    """
+    Своя наценка привязки или None, если наследуется из настроек.
+
+    v3.8: NULL/пусто = «наследовать», число (включая ровно 0) = своё значение.
+    До этого 0 трактовался как «не задано», и лот нельзя было продавать без
+    наценки, когда в настройках она не нулевая.
+    """
+    raw = mapping.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _markup_effective(mapping: Dict[str, Any], cfg: Dict[str, Any], key: str) -> float:
+    """Наценка, которая реально применится: своя, иначе глобальная."""
+    own = _markup_own(mapping, key)
+    if own is not None:
+        return own
+    try:
+        return float(cfg["settings"].get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_markup(price_usd: Union[str, float, None], mapping: Dict[str, Any], cfg: Dict[str, Any],
+                  rate: Optional[float] = None) -> Optional[float]:
+    """
+    Цена лота FunPay из цены FazerCards: USD → ₽ по курсу, затем наценка.
+
+    Наценка берётся из привязки, если она там задана (см. _markup_own), иначе
+    из глобальных настроек. Процент и фикс наследуются независимо.
+    Порядок: цена × курс × (1 + %/100) + фикс.
+    Возвращает None, если исходной цены или курса нет.
+    """
+    try:
+        base = float(price_usd) if price_usd not in (None, "") else None
+    except (TypeError, ValueError):
+        base = None
+    if base is None:
+        return None
+
+    if rate is None:
+        try:
+            rate = float(cfg["settings"].get("exchange_rate") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+    if not rate or rate <= 0:
+        return None
+
+    percent = _markup_effective(mapping, cfg, "markup_percent")
+    fixed = _markup_effective(mapping, cfg, "markup_fixed")
+
+    price = base * rate * (1.0 + percent / 100.0) + fixed
+    try:
+        digits = int(cfg["settings"].get("price_round", 2))
+    except (TypeError, ValueError):
+        digits = 2
+    return round(max(0.0, price), max(0, digits))
+
+
+def _markup_breakdown(price_usd: Union[str, float, None], mapping: Dict[str, Any],
+                      cfg: Dict[str, Any], rate: Optional[float] = None) -> Dict[str, Any]:
+    """Разбор расчёта цены — для показа продавцу и записи в БД."""
+    if rate is None:
+        try:
+            rate = float(cfg["settings"].get("exchange_rate") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+    final = _apply_markup(price_usd, mapping, cfg, rate)
+    return {
+        "price_usd": price_usd,
+        "rate": rate,
+        "markup_percent": _markup_effective(mapping, cfg, "markup_percent"),
+        "markup_fixed": _markup_effective(mapping, cfg, "markup_fixed"),
+        # откуда взялась наценка — нужно, чтобы в ПУ честно писать «своя/общая»
+        "markup_percent_own": _markup_own(mapping, "markup_percent"),
+        "markup_fixed_own": _markup_own(mapping, "markup_fixed"),
+        "price_rub": final,
+    }
+
+
+def _profit_breakdown(cfg: Dict[str, Any], order: Dict[str, Any],
+                      mapping: Optional[Dict[str, Any]],
+                      cost_usd: Optional[float] = None,
+                      quantity: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Считает прибыль по заказу (v3.18).
+
+    Что откуда:
+      * `price_rub` — сумма заказа на FunPay из события (то, что заплатил
+        покупатель; комиссию покупателя FunPay берёт сверху и в эту сумму она
+        не входит);
+      * `withdraw_fee` — комиссия вывода с FunPay (по умолчанию 3%), её платит
+        продавец, поэтому «на руки» приходит меньше суммы заказа;
+      * `cost_usd` — закупка на FazerCards за весь заказ (цена позиции × число
+        позиций), переводим в рубли по тому же курсу, что и цены лотов.
+
+    Прибыль = получено на руки − закупка в рублях.
+    """
+    out: Dict[str, Any] = {
+        "price_rub": None, "fee_percent": 0.0, "fee_rub": None, "net_rub": None,
+        "cost_usd": None, "cost_rub": None, "rate": 0.0,
+        "profit_rub": None, "margin_percent": None, "quantity": quantity,
+    }
+    try:
+        out["rate"] = float(cfg["settings"].get("exchange_rate") or 0)
+    except (TypeError, ValueError):
+        out["rate"] = 0.0
+    try:
+        out["fee_percent"] = float(cfg["settings"].get("withdraw_fee_percent") or 0)
+    except (TypeError, ValueError):
+        out["fee_percent"] = 0.0
+
+    info = order.get("order_info") or {}
+    price = info.get("price")
+    if price in (None, ""):
+        price = (order.get("order_json") and (_from_json(order["order_json"]) or {}).get("price"))
+    try:
+        out["price_rub"] = float(price) if price not in (None, "") else None
+    except (TypeError, ValueError):
+        out["price_rub"] = None
+
+    if cost_usd is None:
+        # запасной путь: закупка из привязки × количество
+        try:
+            unit = float((mapping or {}).get("price_usd") or 0) or None
+        except (TypeError, ValueError):
+            unit = None
+        if unit is not None:
+            qty = quantity or int(order.get("quantity") or 1) or 1
+            cost_usd = unit * qty
+    if cost_usd is not None:
+        try:
+            out["cost_usd"] = round(float(cost_usd), 4)
+        except (TypeError, ValueError):
+            out["cost_usd"] = None
+    if out["cost_usd"] is not None and out["rate"] > 0:
+        out["cost_rub"] = round(out["cost_usd"] * out["rate"], 2)
+
+    if out["price_rub"] is not None:
+        out["fee_rub"] = round(out["price_rub"] * out["fee_percent"] / 100.0, 2)
+        out["net_rub"] = round(out["price_rub"] - out["fee_rub"], 2)
+    if out["net_rub"] is not None and out["cost_rub"] is not None:
+        out["profit_rub"] = round(out["net_rub"] - out["cost_rub"], 2)
+        if out["cost_rub"] > 0:
+            # маржа считается от закупки: «сколько заработал на каждый вложенный рубль»
+            out["margin_percent"] = round(out["profit_rub"] / out["cost_rub"] * 100.0, 1)
+    return out
+
+
+def _profit_report_text(order_id: str, name: str, bd: Dict[str, Any],
+                        fzr_order_id: str = "", buyer: str = "",
+                        batch: int = 1, local_balance: Optional[float] = None) -> str:
+    """Сообщение продавцу о прибыли. Только для Telegram-панели, не покупателю."""
+    def _money(value: Optional[float], suffix: str = "₽") -> str:
+        if value is None:
+            return "—"
+        return f"{value:,.2f}".replace(",", " ").replace(".", ",") + f" {suffix}"
+
+    lines = [
+        "💰 <b>Заказ создан</b>",
+        f"Заказ FunPay: <code>{_esc(order_id)}</code>",
+        f"🛒 {_esc(name)}",
+    ]
+    if buyer:
+        lines.append(f"👤 Покупатель: {_esc(buyer)}")
+    if fzr_order_id:
+        lines.append(f"🧾 Закупка: <code>{_esc(fzr_order_id)}</code>"
+                     + (f" <i>(позиций: {batch})</i>" if batch > 1 else ""))
+    lines.append("")
+
+    cost_line = _money(bd.get("cost_rub"))
+    if bd.get("cost_usd") is not None:
+        rate = bd.get("rate") or 0
+        cost_line = (f"{_money(bd['cost_rub'])} "
+                     f"<i>({bd['cost_usd']:.2f} $"
+                     + (f" × {rate:.2f}" if rate else "")
+                     + ")</i>") if bd.get("cost_rub") is not None else f"{bd['cost_usd']:.2f} $"
+    fee_pct = bd.get("fee_percent") or 0
+    block = [
+        f"🏷 Цена на FunPay: <b>{_money(bd.get('price_rub'))}</b>",
+        f"➖ Комиссия вывода {fee_pct:g}%: {_money(bd.get('fee_rub'))}",
+        f"💵 Придёт на руки: <b>{_money(bd.get('net_rub'))}</b>",
+        f"📦 Себестоимость: {cost_line}",
+    ]
+    lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+
+    profit = bd.get("profit_rub")
+    if profit is None:
+        hint = ("<i>Прибыль не посчитал: "
+                + ("нет курса RUB/USD — задайте его в «Цены»."
+                   if not bd.get("rate") else
+                   "неизвестна цена закупки или сумма заказа.")
+                + "</i>")
+        lines.append(hint)
+    else:
+        icon = "📈" if profit > 0 else ("➖" if profit == 0 else "📉")
+        margin = bd.get("margin_percent")
+        margin_txt = f" <i>({margin:+g}% к закупке)</i>" if margin is not None else ""
+        lines.append(f"{icon} <b>Прибыль: {_money(profit)}</b>{margin_txt}")
+        if profit < 0:
+            lines.append("⚠️ <i>Заказ убыточный — проверьте наценку и курс.</i>")
+    # v3.19: сразу видно, сколько своих денег осталось внутри общего ключа
+    if local_balance is not None:
+        if local_balance < 0:
+            lines.append(f"🔴 <b>Локальный баланс: {_fmt_usd(local_balance)}</b> "
+                         f"<i>(в минусе)</i>")
+        else:
+            lines.append(f"💼 Локальный баланс: <b>{_fmt_usd(local_balance)}</b>")
+    return "\n".join(lines)
+
+
+def _notify_admin_profit(c: "Cardinal", order_id: str, mapping: Optional[Dict[str, Any]],
+                         cost_usd: Optional[float], fzr_order_id: str = "",
+                         quantity: Optional[int] = None, batch: int = 1) -> bool:
+    """
+    Отчёт о прибыли после создания заказа на FazerCards (v3.18).
+
+    Отправляем ровно один раз на заказ: создание может повториться после
+    нехватки баланса, а дубли в панели мешают.
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("profit_report", True):
+        return False
+    order = _db_get_order(order_id) or {}
+    if order.get("profit_report_sent"):
+        return False
+    bd = _profit_breakdown(cfg, order, mapping, cost_usd=cost_usd, quantity=quantity)
+    order_proxy = _order_proxy(order) if order else None
+    buyer = getattr(order_proxy, "buyer_username", "") if order_proxy else ""
+    name = _mapping_display_name(mapping) if mapping else _short_sku(order.get("sku_id"))
+    # локальный баланс показываем в том же сообщении: списание уже произошло
+    local_balance = _db_local_balance() if cfg["settings"].get("local_balance", True) else None
+    text = _profit_report_text(str(order_id), name, bd, fzr_order_id=fzr_order_id,
+                               buyer=buyer or "", batch=batch,
+                               local_balance=local_balance)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"),
+           _inline_button("📊 Метрики", callback_data=f"{CB_PREFIX}:metrics"))
+    if local_balance is not None:
+        kb.add(_inline_button("💼 Баланс", callback_data=f"{CB_PREFIX}:balance"))
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, text, reply_markup=kb,
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("profit report send failed",
+                           extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        # запасной канал — без кнопок, зато продавец увидит цифры
+        _notify_admin(c, re.sub(r"<[^>]+>", "", text))
+        sent = True
+    try:
+        _db_update_order(order_id, profit_report_sent=1,
+                         profit_json=_to_json(bd))
+    except Exception as e:
+        logger.warning("profit report flag failed",
+                       extra={"funpay_order_id": order_id, "error": repr(e)})
+    _db_log_event(order_id, "profit_report", {
+        "price_rub": bd.get("price_rub"), "cost_rub": bd.get("cost_rub"),
+        "profit_rub": bd.get("profit_rub"), "fee_percent": bd.get("fee_percent")})
+    logger.info("profit report sent", extra={
+        "funpay_order_id": order_id, "profit_rub": bd.get("profit_rub"),
+        "price_rub": bd.get("price_rub"), "cost_rub": bd.get("cost_rub")})
+    return sent
+
+
+# =============================================================================
+# локальный баланс продавца (v3.19)
+#
+# Зачем: один API-ключ FazerCards делят несколько человек, каждый закинул свои
+# деньги. Общий баланс ключа не отвечает на вопрос «сколько осталось МОИХ».
+# Поэтому плагин ведёт свою книгу: пополнения (+) и закупки (−).
+#
+# Главное правило: локальный баланс НИКОГДА не блокирует заказ. Покупатель уже
+# заплатил на FunPay — отказать ему из-за нашей внутренней бухгалтерии нельзя.
+# Баланс просто уходит в минус, а продавец получает уведомление.
+#
+# Баланс не хранится отдельным числом: он всегда SUM(amount_usd) по книге.
+# Так его нечем рассинхронизировать, и любую цифру можно объяснить строками.
+# =============================================================================
+
+_LEDGER_KINDS = {
+    "topup": "Пополнение",
+    "order": "Закупка",
+    "refund": "Возврат закупки",
+    "correction": "Корректировка",
+    "init": "Начальный баланс",
+}
+
+# чтобы уведомление о минусе не приходило на каждый заказ
+_BALANCE_ALERT_LOCK = threading.RLock()
+_BALANCE_ALERT_STATE: Dict[str, Any] = {"negative_since": None, "last_alert_at": 0.0,
+                                        "last_alert_balance": None}
+
+
+def _db_ledger_add(kind: str, amount_usd: float, op_key: Optional[str] = None,
+                   funpay_order_id: Optional[str] = None,
+                   fzr_order_id: Optional[str] = None,
+                   comment: str = "") -> Optional[float]:
+    """
+    Добавляет операцию в книгу баланса. Возвращает баланс ПОСЛЕ операции.
+
+    Если `op_key` уже был — операция не повторяется, возвращается None. Это и
+    есть защита от двойного списания: ключ строится из ID заказа.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    try:
+        amount = round(float(amount_usd), 6)
+    except (TypeError, ValueError):
+        logger.warning("ledger add: bad amount", extra={"amount": amount_usd})
+        return None
+    now = time.time()
+    with _DB_LOCK:
+        conn = _db_connect()
+        if op_key:
+            exists = conn.execute("SELECT 1 FROM balance_ledger WHERE op_key=?",
+                                  (op_key,)).fetchone()
+            if exists:
+                logger.info("ledger op already applied", extra={"op_key": op_key})
+                return None
+        row = conn.execute("SELECT COALESCE(SUM(amount_usd), 0) FROM balance_ledger").fetchone()
+        balance_after = round(float(row[0] or 0) + amount, 6)
+        conn.execute(
+            "INSERT INTO balance_ledger (op_key, kind, amount_usd, balance_after, "
+            "funpay_order_id, fzr_order_id, comment, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (op_key, kind, amount, balance_after,
+             str(funpay_order_id) if funpay_order_id else None,
+             str(fzr_order_id) if fzr_order_id else None, comment[:500], now))
+    logger.info("ledger op", extra={"kind": kind, "amount_usd": amount,
+                                    "balance_after": balance_after,
+                                    "funpay_order_id": funpay_order_id})
+    return balance_after
+
+
+def _db_local_balance() -> float:
+    """Локальный баланс = сумма книги. Может быть отрицательным — это норма."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute(
+            "SELECT COALESCE(SUM(amount_usd), 0) FROM balance_ledger").fetchone()
+    return round(float(row[0] or 0), 6)
+
+
+def _db_ledger_list(limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        rows = _db_connect().execute(
+            "SELECT id, op_key, kind, amount_usd, balance_after, funpay_order_id, "
+            "fzr_order_id, comment, created_at FROM balance_ledger "
+            "ORDER BY id DESC LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _db_ledger_count() -> int:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT COUNT(*) FROM balance_ledger").fetchone()
+    return int(row[0] or 0)
+
+
+def _db_ledger_totals(since: Optional[float] = None) -> Dict[str, float]:
+    """Сколько внесено и сколько потрачено — для сводки в панели."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    sql = ("SELECT kind, COALESCE(SUM(amount_usd), 0), COUNT(*) FROM balance_ledger "
+           + ("WHERE created_at >= ? " if since else "") + "GROUP BY kind")
+    with _DB_LOCK:
+        rows = _db_connect().execute(sql, (since,) if since else ()).fetchall()
+    out: Dict[str, float] = {}
+    for kind, total, cnt in rows:
+        out[str(kind)] = round(float(total or 0), 6)
+        out[f"{kind}_count"] = int(cnt or 0)
+    return out
+
+
+def _fmt_usd(value: Optional[Any], sign: bool = False) -> str:
+    """
+    USD для панели: минус виден сразу, плюс — только если попросили.
+
+    Формат русский («1 234,56 $»), как у рублёвых сумм в отчёте о прибыли —
+    иначе в одном сообщении两 разных стиля чисел.
+    """
+    if value in (None, ""):
+        return "—"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    text = f"{abs(num):,.2f}".replace(",", " ").replace(".", ",")
+    if num < 0:
+        return f"−{text} $"
+    return f"+{text} $" if sign else f"{text} $"
+
+
+def _balance_charge_order(c: "Cardinal", order_id: Any, cost_usd: Optional[float],
+                          fzr_order_id: str = "", comment: str = "") -> Optional[float]:
+    """
+    Списывает стоимость закупки с локального баланса (v3.19).
+
+    Вызывается ПОСЛЕ успешного создания заказа: деньги на стороне поставщика
+    уже потрачены, значит и в нашей книге они должны быть потрачены — даже если
+    баланс уходит в минус.
+
+    Идемпотентно по `order:<funpay_order_id>`: повтор заказа после нехватки
+    средств или второй проход не спишет дважды.
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("local_balance", True):
+        return None
+    if cost_usd in (None, ""):
+        # без цены закупки честнее не списывать ничего, чем списать 0 и создать
+        # у продавца ложное чувство, что всё учтено
+        logger.warning("local balance: unknown cost, skipping charge",
+                       extra={"funpay_order_id": order_id})
+        _notify_admin(c, f"⚠️ Заказ {order_id}: не удалось определить цену закупки, "
+                         f"локальный баланс не изменён. Поправьте его вручную "
+                         f"в разделе «Баланс».")
+        return None
+    try:
+        amount = float(cost_usd)
+    except (TypeError, ValueError):
+        return None
+    balance_after = _db_ledger_add(
+        "order", -abs(amount), op_key=f"order:{order_id}",
+        funpay_order_id=str(order_id), fzr_order_id=fzr_order_id or None,
+        comment=comment or "закупка по заказу FunPay")
+    if balance_after is None:
+        return None
+    _db_log_event(order_id, "balance_charged",
+                  {"amount_usd": -abs(amount), "balance_after": balance_after})
+    _balance_check_and_alert(c, balance_after, order_id=str(order_id))
+    return balance_after
+
+
+def _balance_refund_order(c: "Cardinal", order_id: Any, comment: str = "") -> Optional[float]:
+    """
+    Возвращает деньги в книгу, если закупка не состоялась (отмена/возврат).
+
+    Сумму берём из самой книги, а не из настроек: там записано ровно то, что
+    было списано. Идемпотентно по `refund:<order_id>`.
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("local_balance", True):
+        return None
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        row = _db_connect().execute(
+            "SELECT COALESCE(SUM(amount_usd), 0) FROM balance_ledger "
+            "WHERE funpay_order_id=? AND kind='order'", (str(order_id),)).fetchone()
+    charged = float(row[0] or 0)
+    if charged >= 0:
+        return None                      # ничего не списывали — возвращать нечего
+    balance_after = _db_ledger_add(
+        "refund", abs(charged), op_key=f"refund:{order_id}",
+        funpay_order_id=str(order_id),
+        comment=comment or "возврат: закупка отменена")
+    if balance_after is None:
+        return None
+    _db_log_event(order_id, "balance_refunded",
+                  {"amount_usd": abs(charged), "balance_after": balance_after})
+    return balance_after
+
+
+def _balance_alert_cooldown(cfg: Dict[str, Any]) -> float:
+    try:
+        minutes = float(cfg["settings"].get("balance_alert_cooldown", 60) or 0)
+    except (TypeError, ValueError):
+        minutes = 60.0
+    return max(0.0, minutes) * 60.0
+
+
+def _balance_check_and_alert(c: "Cardinal", balance: Optional[float] = None,
+                             order_id: str = "", force: bool = False) -> bool:
+    """
+    Уведомление о минусе и о низком балансе (v3.19).
+
+    Умное поведение вместо спама:
+      * первый переход в минус — сообщение сразу;
+      * дальше повтор не чаще `balance_alert_cooldown` минут ИЛИ когда долг
+        вырос заметно (ещё на порог) — иначе на серии заказов прилетит десяток
+        одинаковых сообщений;
+      * возврат в плюс сбрасывает состояние и присылает «баланс снова в плюсе».
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("local_balance", True):
+        return False
+    if balance is None:
+        balance = _db_local_balance()
+    try:
+        low = float(cfg["settings"].get("local_balance_low", 0) or 0)
+    except (TypeError, ValueError):
+        low = 0.0
+    now = time.time()
+    with _BALANCE_ALERT_LOCK:
+        state = _BALANCE_ALERT_STATE
+        was_negative = state.get("negative_since") is not None
+        cooldown = _balance_alert_cooldown(cfg)
+        step = max(1.0, low or 10.0)     # «долг вырос заметно» — на один порог
+
+        if balance < 0:
+            if not was_negative:
+                state["negative_since"] = now
+                state["last_alert_at"] = now
+                state["last_alert_balance"] = balance
+                _send_balance_alert(c, balance, first=True, order_id=order_id)
+                return True
+            last = state.get("last_alert_balance")
+            grown = last is not None and (balance <= float(last) - step)
+            aged = cooldown > 0 and (now - float(state.get("last_alert_at") or 0)) >= cooldown
+            if force or grown or aged:
+                state["last_alert_at"] = now
+                state["last_alert_balance"] = balance
+                _send_balance_alert(c, balance, first=False, order_id=order_id,
+                                    since=state.get("negative_since"))
+                return True
+            return False
+
+        # баланс неотрицательный
+        if was_negative:
+            state["negative_since"] = None
+            state["last_alert_at"] = now
+            state["last_alert_balance"] = balance
+            _notify_admin_balance_restored(c, balance)
+            return True
+        if low > 0 and balance < low:
+            aged = cooldown <= 0 or (now - float(state.get("last_alert_at") or 0)) >= cooldown
+            if force or aged:
+                state["last_alert_at"] = now
+                state["last_alert_balance"] = balance
+                _send_balance_alert(c, balance, first=False, low=low, order_id=order_id)
+                return True
+    return False
+
+
+def _balance_kb(with_menu: bool = True) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("➕ Пополнить", callback_data=f"{CB_PREFIX}:bal_topup"),
+           _inline_button("✏️ Корректировка", callback_data=f"{CB_PREFIX}:bal_correct"))
+    kb.add(_inline_button("📜 История", callback_data=f"{CB_PREFIX}:bal_history:0"),
+           _inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:balance"))
+    if with_menu:
+        kb.add(_inline_button("👤 Аккаунт FazerCards", callback_data=f"{CB_PREFIX}:account"),
+               _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _send_balance_alert(c: "Cardinal", balance: float, first: bool = False,
+                        low: float = 0.0, order_id: str = "",
+                        since: Optional[float] = None) -> None:
+    """Сообщение продавцу: баланс в минусе (или ниже порога)."""
+    negative = balance < 0
+    if negative:
+        head = ("🔴 <b>Локальный баланс ушёл в минус</b>" if first
+                else "🔴 <b>Долг по локальному балансу растёт</b>")
+    else:
+        head = "🟡 <b>Локальный баланс на исходе</b>"
+    lines = [head, ""]
+    block = [f"💰 Сейчас: <b>{_fmt_usd(balance)}</b>"]
+    if negative:
+        block.append(f"📉 Нужно внести: <b>{_fmt_usd(abs(balance))}</b>, чтобы выйти в ноль")
+    elif low > 0:
+        block.append(f"🔔 Порог: {_fmt_usd(low)}")
+    totals = _db_ledger_totals()
+    if totals.get("topup"):
+        block.append(f"➕ Всего пополнений: {_fmt_usd(totals.get('topup'))}")
+    if totals.get("order"):
+        block.append(f"➖ Всего закупок: {_fmt_usd(totals.get('order'))}")
+    if since:
+        block.append(f"🕐 В минусе: {_esc(_duration(time.time() - float(since)))}")
+    lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+    if order_id:
+        lines.append(f"<i>Последняя закупка: заказ {_esc(order_id)}</i>")
+    lines.append("")
+    lines.append("<i>Заказы продолжают создаваться и выдаваться — этот баланс "
+                 "только ваш учёт, он ничего не блокирует. Пополнили общий ключ — "
+                 "нажмите «Пополнить» и внесите сумму.</i>")
+    text = "\n".join(lines)
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, text, reply_markup=_balance_kb(),
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("balance alert failed",
+                           extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        _notify_admin(c, re.sub(r"<[^>]+>", "", text))
+    logger.info("balance alert sent", extra={"balance": balance, "negative": negative,
+                                             "first": first})
+
+
+def _notify_admin_balance_restored(c: "Cardinal", balance: float) -> None:
+    text = ("🟢 <b>Локальный баланс снова в плюсе</b>\n\n"
+            f"<blockquote>💰 Сейчас: <b>{_fmt_usd(balance)}</b></blockquote>")
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, text, reply_markup=_balance_kb(),
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("balance restore notify failed",
+                           extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        _notify_admin(c, re.sub(r"<[^>]+>", "", text))
+
+
+def _process_order_creation(
+    c: "Cardinal",
+    order_info: Dict[str, Any],
+    mapping: Dict[str, Any],
+    metadata_values: Optional[Dict[str, str]],
+) -> None:
+
+    order_id = order_info["id"]
+    cfg = load_config()
+    try:
+        if not cfg["api_key"]:
+            raise FazerCardsAPIError("API ключ не настроен")
+        kind, category_id, offer_id = _resolve_order_sku(mapping)
+        max_q = int(cfg["settings"].get("max_quantity", _MAX_QUANTITY))
+
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+
+        # Pre-order checks
+        offer_info = _resolve_offer_info(api, kind, category_id, offer_id)
+        for mapping_key in ("stock", "min_quantity", "max_quantity"):
+            if mapping.get(mapping_key) not in (None, ""):
+                try:
+                    offer_info.setdefault(mapping_key, int(mapping[mapping_key]))
+                except (TypeError, ValueError):
+                    pass
+        if mapping.get("price_usd") not in (None, ""):
+            try:
+                offer_info.setdefault("price_usd", float(mapping["price_usd"]))
+            except (TypeError, ValueError):
+                pass
+
+        quantity = _preorder_quantity_check(order_info, max_q, offer_info, kind=kind)
+
+        # Номинал лота: 1 шт лота = units_per_item единиц товара.
+        # Для steam-topup `amount` в API — СУММА пополнения, поэтому лот
+        # «Steam 500 ₽» должен давать amount=500 за одну купленную штуку.
+        units = _effective_units(mapping, quantity)
+        multiplier = _units_per_item(mapping)
+        if multiplier != 1:
+            logger.info("units multiplier applied", extra={
+                "funpay_order_id": order_id, "quantity": quantity,
+                "units_per_item": multiplier, "units": units})
+
+        # Потолок суммы пополнения — защита от опечатки в количестве у лота за 1 ₽
+        if kind == "steam-topup":
+            try:
+                max_topup = float(cfg["settings"].get("max_topup_amount", 0) or 0)
+            except (TypeError, ValueError):
+                max_topup = 0.0
+            if max_topup > 0 and float(units) > max_topup:
+                raise FazerCardsAPIError(
+                    f"Сумма пополнения {units} превышает лимит {max_topup:.0f} "
+                    f"({offer_id}). Увеличьте лимит в настройках или свяжитесь с продавцом."
+                )
+
+        _preorder_balance_check(api, offer_info, units, order_id)
+
+        # v3.18: цена закупки за весь заказ — понадобится для отчёта о прибыли.
+        # Берём ту же цифру, что и проверка баланса (offer_info живой из API).
+        cost_usd_total: Optional[float] = None
+        try:
+            unit_price = offer_info.get("price_usd")
+            if unit_price not in (None, ""):
+                cost_usd_total = float(unit_price) * float(units)
+        except (TypeError, ValueError):
+            cost_usd_total = None
+
+        metadata = metadata_values or {}
+        metadata = _coerce_metadata_against_offer(kind, metadata, offer_info, mapping)
+
+        # Проверка Player ID до списания баланса (PUBG / Free Fire / Mobile Legends и др.)
+        if cfg["settings"].get("validate_player_id", True):
+            validated = _validate_player_id_if_supported(api, kind, category_id, metadata, mapping, order_id)
+            if validated:
+                _db_log_event(order_id, "player_id_validated", {
+                    "player_name": validated.get("player_name"),
+                    "region": validated.get("region"),
+                })
+            # Логин Steam: can_refill=false -> не создаём заказ и не тратим баланс
+            checked = _check_steam_login_if_possible(api, kind, metadata, mapping, order_id)
+            if checked:
+                _db_log_event(order_id, "steam_login_checked",
+                              {"can_refill": checked.get("can_refill", checked.get("canRefill"))})
+
+        fzr_ids, responses = _create_order_batch(
+            api, kind, category_id, offer_id, units, metadata, order_id)
+        fzr_order_id = fzr_ids[0]
+        fzr_order = responses[0]
+        sku_id = f"{kind}:{category_id}:{offer_id}"
+        update_fields: Dict[str, Any] = dict(
+            fzr_order_id=fzr_order_id,
+            status="pending",
+            sku_id=sku_id,
+            result_json=_to_json(fzr_order),
+            metadata_json=_to_json(_metadata_dict(mapping, metadata)),
+        )
+        if len(fzr_ids) > 1:
+            # заказ FunPay на N штук => N заказов FazerCards, ждём и выдаём все
+            update_fields["batch_json"] = _to_json({"ids": fzr_ids, "delivered": [], "responses": responses})
+        _db_update_order(order_id, **update_fields)
+        _db_log_event(order_id, "fzr_order_created",
+                      {"fzr_order_id": fzr_order_id, "sku_id": sku_id,
+                       "batch": fzr_ids if len(fzr_ids) > 1 else None})
+        _inc_metric("orders_created", len(fzr_ids))
+        if len(fzr_ids) > 1:
+            logger.info("batch created", extra={"funpay_order_id": order_id, "count": len(fzr_ids)})
+            _notify_admin(c, f"🧾 Заказ {order_id}: создано {len(fzr_ids)} заказов FazerCards "
+                             f"(количество {quantity}).")
+        # v3.19: списываем закупку с локального баланса. Делается ПОСЛЕ
+        # создания заказа: деньги у поставщика уже ушли, значит и в нашей книге
+        # должны уйти — даже если баланс станет отрицательным.
+        try:
+            _balance_charge_order(c, order_id, cost_usd_total,
+                                  fzr_order_id=fzr_ids[0] if fzr_ids else "",
+                                  comment=f"{_mapping_display_name(mapping)}"
+                                          + (f" × {len(fzr_ids)}" if len(fzr_ids) > 1 else ""))
+        except Exception as ex:
+            logger.error("local balance charge failed", extra={
+                "funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+        # v3.18: отчёт продавцу — себестоимость, цена, прибыль за вычетом
+        # комиссии вывода. Отправляем ДО выдачи: если выдача упадёт, цифры по
+        # созданному заказу продавец уже увидит. Ошибка отчёта не должна
+        # мешать выдаче, поэтому в своём try.
+        try:
+            _notify_admin_profit(c, order_id, mapping, cost_usd_total,
+                                 fzr_order_id=", ".join(fzr_ids[:3]),
+                                 quantity=quantity, batch=len(fzr_ids))
+        except Exception as ex:
+            logger.error("profit report failed", extra={
+                "funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+        # v3.14: первый опрос делаем почти сразу — у giftcards/gamekeys код
+        # обычно готов уже в ответе на создание заказа, и ждать poll_interval
+        # (по умолчанию 5 с, у продавца могло стоять 30) незачем.
+        # Для батча (N заказов FazerCards) мгновенная выдача запрещена: там
+        # нужно дождаться ВСЕХ позиций, этим занимается _check_batch_order_status.
+        first_status = str((fzr_order.get("order") or fzr_order).get("status") or "").lower()
+        if first_status == "completed" and len(fzr_ids) == 1:
+            _deliver_order(c, order_id, fzr_order_id,
+                           fzr_order.get("order") or fzr_order, None)
+        else:
+            _schedule_poll(c, order_id, fzr_order_id, delay=0.5, attempt=1)
+    except InsufficientFundsError as ex:
+        # Особый случай: покупатель заплатил и данные дал, а у продавца нет
+        # денег на закупку. Заказ НЕ помечаем ошибкой — ставим в ожидание
+        # пополнения, чтобы его можно было докупить кнопкой или автоматически.
+        _handle_insufficient_funds(c, order_id, mapping, metadata_values or {}, ex)
+    except FazerCardsAPIError as ex:
+        err = str(ex)
+        public = _public_buyer_error(err)
+        logger.exception("process_order_creation API failed", extra={"funpay_order_id": order_id, "error": err})
+        if _is_out_of_stock_error(err):
+            _handle_out_of_stock(c, mapping, err)
+        elif "402" in err or "insufficient funds" in err.lower() or "недостаточно средств" in err.lower():
+            _notify_admin(c, f"⚠️ Недостаточно средств FazerCards для заказа {order_id}:\n{err}")
+        _inc_metric("api_errors")
+        _db_log_event(order_id, "fzr_create_failed", {"error": err, "public": public})
+        _mark_failed(c, order_id, "", err, public_error=public)
+    except Exception as ex:
+        err = str(ex)
+        public = _public_buyer_error(err)
+        logger.exception("process_order_creation failed", extra={"funpay_order_id": order_id, "error": err})
+        _db_log_event(order_id, "fzr_create_failed", {"error": err, "public": public})
+        _mark_failed(c, order_id, "", err, public_error=public)
+
+# =============================================================================
+# нехватка баланса FazerCards (v3.6)
+#
+# Ситуация: покупатель оплатил на FunPay, все данные ввёл, а на FazerCards
+# денег нет. Раньше заказ падал в failed, покупателю уходило «обратитесь к
+# продавцу», и продавцу приходилось создавать всё заново вручную.
+# Теперь заказ живой: статус awaiting_funds, покупателю понятное сообщение,
+# продавцу — кнопка «Повторить», плюс автоповтор, когда баланс пополнили.
+# =============================================================================
+
+_FUNDS_RETRY_MAX = 40                  # ~сутки при проверке раз в 30 минут
+
+
+def _funds_deficit_text(needed: Optional[float], balance: Optional[float]) -> str:
+    """Человеческая строка «нужно ещё X USD» для Telegram продавца."""
+    if needed is None or balance is None:
+        return "точную сумму определить не удалось"
+    return (f"нужно {needed:.2f} USD, на балансе {balance:.2f} USD "
+            f"→ не хватает {max(0.0, needed - balance):.2f} USD")
+
+
+def _handle_insufficient_funds(c: "Cardinal", order_id: Any, mapping: Dict[str, Any],
+                               metadata: Dict[str, str],
+                               ex: "InsufficientFundsError") -> None:
+    """
+    Заказ ждёт пополнения баланса.
+
+    Что делаем:
+      * статус awaiting_funds (не терминальный) + сохраняем данные покупателя,
+        чтобы повтор не спрашивал их заново;
+      * покупателю — понятное сообщение без слова «ошибка»: заказ принят,
+        идёт закупка, деньги не потеряны, возврат по запросу;
+      * продавцу — алерт с суммой нехватки и кнопкой «Повторить сейчас».
+    """
+    order_id = str(order_id)
+    order = _db_get_order(order_id)
+    if order and (_is_order_terminal(order.get("status"))
+                  or order.get("completed_notification_sent") == 2):
+        logger.warning("insufficient funds on already finished order",
+                       extra={"funpay_order_id": order_id, "status": order.get("status")})
+        return
+
+    funds = _from_json((order or {}).get("funds_json")) or {}
+    attempts = int(funds.get("attempts") or 0)
+    funds.update({
+        "needed_usd": ex.needed_usd,
+        "balance_usd": ex.balance_usd,
+        "deficit_usd": ex.deficit_usd,
+        "error": str(ex)[:500],
+        "since": funds.get("since") or time.time(),
+        "last_try_at": time.time(),
+        "attempts": attempts,
+        "notified_buyer": bool(funds.get("notified_buyer")),
+    })
+
+    update_fields: Dict[str, Any] = {
+        "_event": "awaiting_funds",
+        "status": OrderStatus.AWAITING_FUNDS.value,
+        "error": str(ex)[:500],
+        "funds_json": _to_json(funds),
+    }
+    # метаданные покупателя перезаписываем ТОЛЬКО если они есть: пустой dict
+    # затёр бы уже сохранённые данные (повтор после рестарта передаёт {})
+    if metadata:
+        update_fields["metadata_json"] = _to_json(_metadata_dict(mapping, metadata))
+    _db_force_update_order(order_id, **update_fields)
+    _db_log_event(order_id, "awaiting_funds_detail", {
+        "needed_usd": ex.needed_usd, "balance_usd": ex.balance_usd,
+        "deficit_usd": ex.deficit_usd})
+    _inc_metric("orders_awaiting_funds")
+    logger.warning("order awaiting funds", extra={
+        "funpay_order_id": order_id, "needed_usd": ex.needed_usd,
+        "balance_usd": ex.balance_usd})
+
+    # покупателю — один раз, чтобы повторные попытки не спамили в чат
+    if not funds.get("notified_buyer"):
+        _notify_buyer_awaiting_funds(c, order_id, mapping)
+        funds["notified_buyer"] = True
+        _db_force_update_order(order_id, funds_json=_to_json(funds))
+
+    _notify_admin_awaiting_funds(c, order_id, mapping, ex, attempts)
+
+
+def _notify_buyer_awaiting_funds(c: "Cardinal", order_id: str,
+                                 mapping: Optional[Dict[str, Any]]) -> None:
+    """
+    Сообщение покупателю: без паники и без слова «ошибка».
+
+    Покупателю не нужно знать про баланс продавца — ему важно, что заказ
+    принят, деньги в безопасности и что будет дальше.
+    """
+    order = _db_get_order(order_id)
+    if not order:
+        return
+    cfg = load_config()
+    proxy = _order_proxy(order)
+    chat_id = order.get("chat_id") or getattr(proxy, "chat_id", None)
+    buyer = order.get("buyer_username") or getattr(proxy, "buyer_username", "") or ""
+    name = _mapping_display_name(mapping) if mapping else "ваш заказ"
+    tpl = cfg["templates"].get("awaiting_funds") or DEFAULT_CONFIG["templates"]["awaiting_funds"]
+    try:
+        text = render_template(tpl, default=DEFAULT_CONFIG["templates"]["awaiting_funds"],
+                               sku_name=name, funpay_order_id=order_id, buyer=buyer,
+                               kind_name=_kind_profile((mapping or {}).get("category_kind"))["name"])
+    except Exception:
+        text = ("Спасибо за заказ! Оформляю закупку — это займёт немного больше "
+                "времени, чем обычно. Как только всё будет готово, сразу пришлю "
+                "сюда. Если ждать не хотите — напишите, оформим возврат.")
+    _send_buyer(c, chat_id, text, buyer)
+    _db_log_event(order_id, "awaiting_funds_buyer_notified", {})
+
+
+def _notify_admin_awaiting_funds(c: "Cardinal", order_id: str,
+                                 mapping: Optional[Dict[str, Any]],
+                                 ex: "InsufficientFundsError", attempts: int) -> None:
+    """Алерт продавцу с кнопкой повтора — главное в этой фиче."""
+    name = _mapping_display_name(mapping) if mapping else _short_sku(
+        (_db_get_order(order_id) or {}).get("sku_id"))
+    lines = [
+        "💸 <b>Не хватило баланса FazerCards</b>",
+        f"Заказ FunPay: <code>{_esc(order_id)}</code>",
+        f"🛒 {_esc(name)}",
+        "",
+        f"<blockquote>{_esc(_funds_deficit_text(ex.needed_usd, ex.balance_usd))}</blockquote>",
+        "<i>Заказ НЕ потерян: данные покупателя сохранены, покупателю отправлено "
+        "сообщение, что заказ в обработке.</i>",
+        "",
+        "Пополните баланс и нажмите «Повторить» — заказ будет создан "
+        "с теми же данными.",
+    ]
+    if attempts:
+        lines.append(f"<i>Автоповторов уже было: {attempts}</i>")
+    text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔄 Повторить сейчас",
+                          callback_data=f"{CB_PREFIX}:funds_retry:{order_id}"))
+    kb.add(_inline_button("👤 Баланс", callback_data=f"{CB_PREFIX}:account"),
+           _inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+    kb.add(_inline_button("💸 Все такие заказы", callback_data=f"{CB_PREFIX}:funds_list"))
+
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, text, reply_markup=kb,
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("awaiting funds notify failed",
+                           extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        # запасной канал: без кнопок, но продавец узнает
+        _notify_admin(c, f"Не хватило баланса FazerCards для заказа {order_id}: "
+                         f"{_funds_deficit_text(ex.needed_usd, ex.balance_usd)}. "
+                         f"Пополните баланс и нажмите «Повторить» в карточке заказа.")
+
+
+def _funds_orders(limit: int = 50) -> List[Dict[str, Any]]:
+    """Заказы, ждущие пополнения баланса (самые старые вверху — они горят)."""
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        rows = _db_connect().execute(
+            "SELECT * FROM orders WHERE status=? ORDER BY created_at ASC LIMIT ?",
+            (OrderStatus.AWAITING_FUNDS.value, limit)).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["metadata"] = _from_json(d.pop("metadata_json", None))
+        d["order_info"] = _from_json(d.pop("order_json", None))
+        d["funds"] = _from_json(d.get("funds_json"))
+        out.append(d)
+    return out
+
+
+def _retry_awaiting_funds_order(c: "Cardinal", order_id: str,
+                                manual: bool = True) -> Tuple[bool, str]:
+    """
+    Повторная попытка купить заказ, ждавший баланса.
+
+    Возвращает (запущено, сообщение). Ничего не создаёт напрямую: возвращает
+    заказ в очередь обработки с теми же данными покупателя, поэтому все
+    проверки (склад, лимиты, Player ID) выполняются заново — как при обычной
+    покупке. Idempotency-Key у FazerCards тот же (`fpc-fzr-<order>`), так что
+    двойного списания не будет, даже если заказ всё-таки успел создаться.
+    """
+    order = _db_get_order(order_id)
+    if not order:
+        return False, "Заказ не найден."
+    status = order.get("status")
+    if order.get("completed_notification_sent") == 2 or status == OrderStatus.COMPLETED.value:
+        return False, "Заказ уже выдан."
+    if order.get("fzr_order_id"):
+        # заказ всё-таки создался (например, повтор наложился) — просто ждём его
+        _db_force_update_order(order_id, status=OrderStatus.PENDING.value, error="")
+        _schedule_poll(c, order_id, order["fzr_order_id"], delay=2.0, attempt=1)
+        return True, "Заказ уже создан в FazerCards — возобновлён опрос статуса."
+    if status not in (OrderStatus.AWAITING_FUNDS.value, OrderStatus.FAILED.value,
+                      OrderStatus.NEEDS_REVIEW.value):
+        return False, f"Заказ в статусе «{_ORDER_STATUS_LABEL.get(status, status)}» — повтор не нужен."
+
+    mapping = (_get_mapping_by_id(order.get("mapping_id"))
+               or _db_get_mapping_by_sku_id(order.get("sku_id")))
+    if not mapping:
+        return False, "Не найдена привязка — восстановите её и повторите."
+    order_info = order.get("order_info") or {}
+    if not order_info:
+        return False, "Не удалось восстановить данные заказа."
+
+    funds = order.get("funds") or {}
+    funds["attempts"] = int(funds.get("attempts") or 0) + 1
+    funds["last_try_at"] = time.time()
+    funds["last_try_manual"] = bool(manual)
+    _db_force_update_order(order_id, _event="funds_retry",
+                           status=OrderStatus.PROCESSING.value, error="",
+                           funds_json=_to_json(funds))
+    _db_log_event(order_id, "funds_retry", {"manual": manual, "attempt": funds["attempts"]})
+    logger.info("funds retry started", extra={
+        "funpay_order_id": order_id, "manual": manual, "attempt": funds["attempts"]})
+    # метаданные берём из БД — покупателя ни о чём не спрашиваем повторно
+    _submit_task(_process_order_creation, c, order_info, mapping, order.get("metadata") or {})
+    return True, "Повторная обработка запущена."
+
+
+def _funds_watcher_tick(c: "Cardinal", cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Автоповтор заказов, ждущих баланса.
+
+    Логика простая и дешёвая: один запрос баланса на весь тик, дальше
+    повторяем те заказы, на которые денег уже хватает (от самых старых).
+    Так один пополненный баланс не расходуется на самый дорогой заказ,
+    оставляя первого покупателя ждать.
+    """
+    result = {"checked": 0, "retried": 0, "balance": None, "skipped": 0, "refunded": 0}
+    orders = _funds_orders()
+    if not orders:
+        return result
+    result["checked"] = len(orders)
+    if not cfg.get("api_key"):
+        return result
+    if not cfg["settings"].get("funds_auto_retry", True):
+        # автоповтор выключен, но за дедлайном возврата следим всё равно:
+        # иначе заказ просто зависнет с деньгами покупателя
+        for order in orders:
+            if _funds_refund_due(cfg, order) and _refund_awaiting_funds_order(c, order):
+                result["refunded"] += 1
+        return result
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        balance = float(api.get_balance().get("balance") or 0)
+    except Exception as ex:
+        logger.warning("funds watcher: balance fetch failed",
+                       extra={"error": _redact_sensitive(str(ex))})
+        # API недоступен — повторять нечего, но дедлайн возврата не ждёт
+        for order in orders:
+            if _funds_refund_due(cfg, order) and _refund_awaiting_funds_order(c, order):
+                result["refunded"] += 1
+        return result
+    result["balance"] = balance
+
+    available = balance
+    for order in orders:
+        funds = order.get("funds") or {}
+        needed = funds.get("needed_usd")
+        attempts = int(funds.get("attempts") or 0)
+        order_id = order["funpay_order_id"]
+        # v3.7: сначала проверяем дедлайн — держать деньги покупателя
+        # бесконечно нельзя, это прямой путь к спору на FunPay
+        if _funds_refund_due(cfg, order):
+            if _refund_awaiting_funds_order(c, order, reason="timeout"):
+                result["refunded"] += 1
+                continue
+        if attempts >= _FUNDS_RETRY_MAX:
+            # хватит долбить API: продавец явно не пополняет, нужен ручной разбор
+            _db_force_update_order(order_id, _event="funds_retry_failed",
+                                   status=OrderStatus.NEEDS_REVIEW.value,
+                                   error="Баланс не пополнен, лимит автоповторов исчерпан")
+            _db_log_event(order_id, "funds_retry_failed", {"attempts": attempts})
+            _notify_admin(c, f"⚠️ Заказ {order_id} ждёт баланса слишком долго "
+                             f"({attempts} попыток) — переведён на ручную проверку. "
+                             f"Разберитесь: выдать вручную или вернуть деньги.")
+            continue
+        if needed is not None and available < float(needed):
+            result["skipped"] += 1
+            # предупреждаем покупателя заранее, если возврат уже близко
+            _funds_maybe_warn_buyer(c, cfg, order)
+            continue
+        ok, _msg = _retry_awaiting_funds_order(c, order_id, manual=False)
+        if ok:
+            result["retried"] += 1
+            if needed is not None:
+                # резервируем сумму под этот заказ, чтобы не запустить разом
+                # больше заказов, чем позволяет баланс
+                available -= float(needed)
+    if result["retried"] or result["refunded"]:
+        logger.info("funds watcher tick", extra={
+            "retried": result["retried"], "refunded": result["refunded"],
+            "balance": balance})
+    return result
+
+
+# -----------------------------------------------------------------------------
+# автовозврат (v3.7)
+#
+# Если баланс так и не пополнили, деньги покупателя нельзя держать вечно:
+# на FunPay это заканчивается спором и штрафом. Поэтому по истечении
+# настроенного времени оформляем полный возврат сами — с предупреждением
+# покупателя и уведомлением продавца.
+# -----------------------------------------------------------------------------
+
+def _funds_refund_deadline(cfg: Dict[str, Any], order: Dict[str, Any]) -> Optional[float]:
+    """Unix-время, после которого заказ нужно вернуть. None — автовозврат выключен."""
+    if not cfg["settings"].get("funds_auto_refund"):
+        return None
+    try:
+        minutes = float(cfg["settings"].get("funds_refund_after") or 0)
+    except (TypeError, ValueError):
+        minutes = 0.0
+    if minutes <= 0:
+        return None
+    funds = order.get("funds") or {}
+    since = funds.get("since") or order.get("created_at") or time.time()
+    return float(since) + minutes * 60.0
+
+
+def _funds_refund_due(cfg: Dict[str, Any], order: Dict[str, Any]) -> bool:
+    deadline = _funds_refund_deadline(cfg, order)
+    return deadline is not None and time.time() >= deadline
+
+
+def _funds_maybe_warn_buyer(c: "Cardinal", cfg: Dict[str, Any],
+                            order: Dict[str, Any]) -> bool:
+    """
+    Предупредить покупателя, что возврат близко (за ~25% времени до дедлайна).
+
+    Одно сообщение на заказ: покупателю важно знать, что его не бросили,
+    но три одинаковых напоминания раздражают.
+    """
+    if not cfg["settings"].get("funds_refund_warn_buyer", True):
+        return False
+    deadline = _funds_refund_deadline(cfg, order)
+    if deadline is None:
+        return False
+    funds = order.get("funds") or {}
+    if funds.get("warned_buyer"):
+        return False
+    since = float(funds.get("since") or order.get("created_at") or time.time())
+    total = max(1.0, deadline - since)
+    if time.time() < deadline - total * 0.25:
+        return False
+    order_id = order["funpay_order_id"]
+    left_min = max(1, int((deadline - time.time()) / 60))
+    _send_buyer(
+        c, order.get("chat_id"),
+        f"Заказ всё ещё в обработке — задержка на стороне поставщика.\n"
+        f"Если в течение ~{left_min} мин выдать не получится, я автоматически "
+        f"оформлю полный возврат средств, ничего делать не нужно.\n"
+        f"Спасибо за терпение!",
+        order.get("buyer_username"))
+    funds["warned_buyer"] = True
+    _db_force_update_order(order_id, funds_json=_to_json(funds))
+    _db_log_event(order_id, "funds_refund_warned", {"left_min": left_min})
+    return True
+
+
+def _refund_awaiting_funds_order(c: "Cardinal", order: Dict[str, Any],
+                                 reason: str = "timeout") -> bool:
+    """
+    Полный возврат заказа FunPay.
+
+    Порядок важен: сначала возврат через FunPay (единственное необратимое
+    действие), и только при успехе меняем статус и пишем покупателю. Если
+    FunPay откажет — заказ уходит на ручную проверку, а не «зависает»
+    в ожидании навсегда.
+    """
+    order_id = str(order["funpay_order_id"])
+    cfg = load_config()
+    funds = order.get("funds") or {}
+    # заказ мог уже уйти в работу между тиками
+    fresh = _db_get_order(order_id) or {}
+    if fresh.get("status") != OrderStatus.AWAITING_FUNDS.value:
+        return False
+    if fresh.get("fzr_order_id"):
+        # товар всё-таки куплен — возвращать деньги нельзя
+        logger.warning("refund skipped: fzr order exists",
+                       extra={"funpay_order_id": order_id})
+        return False
+
+    try:
+        c.account.refund(order_id)
+    except Exception as ex:
+        err = _redact_sensitive(str(ex))
+        logger.error("auto refund failed", extra={"funpay_order_id": order_id, "error": err})
+        _db_log_event(order_id, "funds_refund_failed", {"error": err[:300]})
+        _db_force_update_order(order_id, _event="funds_refund_failed",
+                               status=OrderStatus.NEEDS_REVIEW.value,
+                               error=f"Автовозврат не удался: {err}"[:500])
+        _notify_admin(c, f"❌ Не удалось оформить автовозврат по заказу {order_id}:\n{err}\n"
+                         f"Верните деньги вручную на FunPay или выдайте товар.")
+        return False
+
+    funds["refunded_at"] = time.time()
+    funds["refund_reason"] = reason
+    _db_force_update_order(order_id, _event="funds_refunded",
+                           status=OrderStatus.REFUNDED.value,
+                           error="Автовозврат: баланс FazerCards не пополнен",
+                           funds_json=_to_json(funds))
+    _db_log_event(order_id, "funds_refunded", {"reason": reason,
+                                               "needed_usd": funds.get("needed_usd")})
+    _inc_metric("orders_refunded")
+
+    mapping = (_get_mapping_by_id(fresh.get("mapping_id"))
+               or _db_get_mapping_by_sku_id(fresh.get("sku_id")))
+    name = _mapping_display_name(mapping) if mapping else _short_sku(fresh.get("sku_id"))
+    tpl = cfg["templates"].get("refunded") or DEFAULT_CONFIG["templates"]["refunded"]
+    try:
+        text = render_template(tpl, default=DEFAULT_CONFIG["templates"]["refunded"],
+                               sku_name=name, funpay_order_id=order_id,
+                               buyer=fresh.get("buyer_username") or "")
+    except Exception:
+        text = ("К сожалению, выдать заказ не получилось. Я оформил полный возврат "
+                "средств — деньги вернутся на ваш баланс FunPay.")
+    _send_buyer(c, fresh.get("chat_id"), text, fresh.get("buyer_username"))
+
+    waited = ""
+    if funds.get("since"):
+        waited = f" (ждал {_duration(time.time() - float(funds['since']))})"
+    _notify_admin(c, f"↩️ Автовозврат по заказу {order_id}{waited}\n"
+                     f"🛒 {name}\n"
+                     f"Причина: баланс FazerCards не пополнен "
+                     f"({_funds_deficit_text(funds.get('needed_usd'), funds.get('balance_usd'))}).\n"
+                     f"Деньги возвращены покупателю, заказ закрыт.")
+    logger.info("order auto refunded", extra={"funpay_order_id": order_id, "reason": reason})
+    return True
+
+
+def _mark_failed(c: "Cardinal", order_id: Any, fzr_order_id: Optional[str], error_text: str, public_error: Optional[str] = None) -> None:
+    order_id = str(order_id)
+    order = _db_get_order(order_id)
+    if order:
+        if _is_order_terminal(order.get("status")) or order.get("completed_notification_sent") == 2:
+            logger.warning("mark_failed skipped: order already terminal or delivered", extra={"funpay_order_id": order_id, "status": order.get("status"), "sent": order.get("completed_notification_sent")})
+            return
+    _inc_metric("orders_failed")
+    _db_update_order(
+        order_id,
+        fzr_order_id=fzr_order_id or "",
+        status="failed",
+        error=str(error_text)[:500],
+    )
+    _db_log_event(order_id, "order_failed", {"fzr_order_id": fzr_order_id or "", "error": str(error_text)[:500]})
+    order = _db_get_order(order_id)
+    if not order:
+        return
+    cfg = load_config()
+    tpl = cfg["templates"]["error"]
+    public = public_error or _public_buyer_error(error_text)
+    order_proxy = _order_proxy(order)
+    buyer = getattr(order_proxy, "buyer_username", "") or ""
+    text = render_template(
+        tpl,
+        default=DEFAULT_CONFIG["templates"]["error"],
+        error=public,
+        fzr_order_id=fzr_order_id or "",
+        funpay_order_id=order_id,
+        buyer=buyer,
+    )
+    _send_buyer(c, getattr(order_proxy, "chat_id", None), text, buyer)
+    if cfg["settings"]["notify_on_error"]:
+        _notify_admin(
+            c,
+            f"FazerCards: выдача не удалась\n"
+            f"FunPay заказ: {order_id}\n"
+            f"FazerCards: {fzr_order_id or '—'}\n"
+            f"Ошибка: {error_text}",
+        )
+def _fzr_refund_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
+                     *, order_id: str = "", fzr_order_id: str = "",
+                     buyer: str = "", reason: str = "") -> str:
+    """
+    Текст покупателю, когда поставщик вернул деньги за заказ (v3.20).
+
+    Свой текст задаётся у каждой привязки (`refund_template`) — у разных игр
+    разные причины и разные альтернативы, один общий текст тут не годится.
+    Причину отказа поставщика покупателю НЕ пересылаем: там бывает название
+    поставщика и внутренние коды.
+    """
+    tpl = (mapping or {}).get("refund_template") or cfg["templates"].get("refund_notice") or ""
+    if not tpl.strip():
+        return ""
+    name = _mapping_display_name(mapping) if mapping else "заказ"
+    try:
+        return render_template(
+            tpl, default=DEFAULT_CONFIG["templates"]["refund_notice"],
+            sku_name=name, funpay_order_id=str(order_id or ""),
+            order_number=fzr_order_id, fzr_order_id=fzr_order_id,
+            buyer=buyer or "", order_link=_funpay_order_url(order_id))
+    except Exception:
+        return DEFAULT_CONFIG["templates"]["refund_notice"].replace("{sku_name}", name)
+
+
+def _fzr_refund_allowed(cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Можно ли автоматически вернуть деньги покупателю (v3.21).
+
+    Возврат — необратимое действие с чужими деньгами, поэтому решает ОБЩИЙ
+    тумблер «Автовозврат покупателю» (`funds_auto_refund`): пока продавец его
+    не включил, плагин сам ничего не возвращает — ни по таймауту баланса,
+    ни по возврату от поставщика. `refund_on_fzr_refund` — уточнение уже
+    внутри автовозврата (можно оставить автовозврат по таймауту, но отключить
+    реакцию на возврат поставщика).
+
+    Возвращает (можно, причина отказа для лога/алерта).
+    """
+    s = cfg.get("settings") or {}
+    if not s.get("funds_auto_refund"):
+        return False, ("автовозврат покупателю выключен "
+                       "(Настройки → Проверки → «Автовозврат»)")
+    if not s.get("refund_on_fzr_refund", True):
+        return False, ("реакция на возврат поставщика выключена "
+                       "(Настройки → Интеграции)")
+    return True, ""
+
+
+def _handle_fzr_refunded(c: "Cardinal", order_id: str, fzr_order_id: str,
+                         reason: str = "") -> bool:
+    """
+    Поставщик вернул деньги за заказ — статус «Возврат» (v3.20).
+
+    Что делаем по порядку:
+      1. возвращаем деньги покупателю на FunPay (единственное необратимое
+         действие — делаем первым, чтобы не написать «деньги вернулись», если
+         возврат не прошёл);
+      2. статус `refunded`, пишем покупателю текст про отмену (свой на товар);
+      3. возвращаем закупку в книгу локального баланса — деньги у поставщика
+         тоже вернулись;
+      4. уведомляем продавца.
+
+    Если FunPay откажет в возврате — заказ уходит в `needs_review` с алертом:
+    молча оставлять оплаченный, но невыполнимый заказ нельзя.
+    """
+    order_id = str(order_id)
+    cfg = load_config()
+    order = _db_get_order(order_id) or {}
+    if order.get("status") == OrderStatus.REFUNDED.value:
+        return False                       # уже обработали
+    if order.get("completed_notification_sent") == 2:
+        # товар уже выдан покупателю: возврат тут был бы подарком
+        logger.warning("fzr refund on delivered order",
+                       extra={"funpay_order_id": order_id})
+        _notify_admin(c, f"⚠️ Поставщик вернул деньги за заказ {order_id}, "
+                         f"но товар покупателю уже выдан. Разберитесь вручную: "
+                         f"деньги покупателю НЕ возвращены.")
+        return False
+
+    mapping = (_get_mapping_by_id(order.get("mapping_id"))
+               or _db_get_mapping_by_sku_id(order.get("sku_id")))
+    name = _mapping_display_name(mapping) if mapping else _short_sku(order.get("sku_id"))
+    buyer = order.get("buyer_username") or ""
+
+    allowed, deny_reason = _fzr_refund_allowed(cfg)
+    if not allowed:
+        # Сами деньги НЕ возвращаем: это чужие деньги и необратимое действие,
+        # решение за продавцом. Заказ уводим на ручной разбор с внятной причиной.
+        _mark_failed(c, order_id, fzr_order_id,
+                     f"Поставщик вернул деньги: {reason or 'статус refunded'}",
+                     public_error="Товар оказался недоступен, свяжитесь со мной.")
+        _notify_admin(c, f"↩️ Поставщик вернул деньги за заказ {order_id} ({name}).\n"
+                         f"Плагин возврат НЕ оформлял: {deny_reason}.\n"
+                         f"Верните оплату покупателю вручную на FunPay.")
+        logger.info("fzr refund: auto refund disabled",
+                    extra={"funpay_order_id": order_id, "reason": deny_reason})
+        return False
+    refunded = False
+    refund_error = ""
+    try:
+        c.account.refund(order_id)
+        refunded = True
+    except Exception as ex:
+        refund_error = _redact_sensitive(str(ex))
+        logger.error("funpay refund after fzr refund failed",
+                     extra={"funpay_order_id": order_id, "error": refund_error})
+
+    if not refunded:
+        _db_log_event(order_id, "fzr_refund_funpay_failed", {"error": refund_error[:300]})
+        _db_force_update_order(order_id, _event="fzr_refunded_manual",
+                               status=OrderStatus.NEEDS_REVIEW.value,
+                               error=f"Поставщик вернул деньги, возврат на FunPay "
+                                     f"не удался: {refund_error}"[:500])
+        _notify_admin(c, f"❌ Заказ {order_id} ({name}): поставщик вернул деньги, "
+                         f"но возврат покупателю на FunPay не прошёл:\n{refund_error}\n"
+                         f"Верните оплату вручную — покупатель ждёт.")
+        return False
+
+    funds = order.get("funds") or {}
+    funds["refunded_at"] = time.time()
+    funds["refund_reason"] = "fzr_refunded"
+    _db_force_update_order(order_id, _event="fzr_refunded",
+                           status=OrderStatus.REFUNDED.value,
+                           fzr_order_id=fzr_order_id or order.get("fzr_order_id") or "",
+                           error=f"Поставщик вернул деньги: {reason or 'refunded'}"[:500],
+                           funds_json=_to_json(funds))
+    _db_log_event(order_id, "fzr_refunded", {"fzr_order_id": fzr_order_id,
+                                             "reason": str(reason)[:300]})
+    _inc_metric("orders_refunded")
+
+    text = _fzr_refund_text(cfg, mapping, order_id=order_id,
+                            fzr_order_id=fzr_order_id, buyer=buyer, reason=reason)
+    if text:
+        _send_buyer(c, order.get("chat_id"), text, buyer)
+
+    # деньги у поставщика вернулись — вернём их и в свою книгу
+    try:
+        _balance_refund_order(c, order_id, comment="возврат: поставщик вернул деньги")
+    except Exception as e:
+        logger.warning("local balance refund on fzr refund failed",
+                       extra={"funpay_order_id": order_id, "error": repr(e)})
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+    if mapping:
+        kb.add(_inline_button("📝 Текст при возврате",
+                              callback_data=f"{CB_PREFIX}:mapping_refund:{mapping['id']}"))
+    alert = (f"↩️ <b>Возврат по заказу</b> <code>{_esc(order_id)}</code>\n"
+             f"🛒 {_esc(name)}\n\n"
+             f"<blockquote>Поставщик вернул деньги за закупку"
+             + (f"\n<i>{_esc(str(reason)[:200])}</i>" if reason else "")
+             + "\n\nПокупателю оформлен полный возврат на FunPay"
+             + (" и отправлено сообщение об отмене." if text
+                else ". <b>Сообщение покупателю не настроено</b> — он не знает, "
+                     "что произошло.")
+             + "</blockquote>")
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, alert, reply_markup=kb,
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("fzr refund alert failed",
+                           extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        _notify_admin(c, re.sub(r"<[^>]+>", "", alert))
+    logger.info("fzr refund handled", extra={"funpay_order_id": order_id,
+                                             "fzr_order_id": fzr_order_id})
+    return True
+
+
+def _funpay_order_url(funpay_order_id: Any) -> str:
+    """
+    Ссылка на страницу заказа FunPay.
+
+    Именно там кнопки «Подтвердить выполнение заказа» и «Оставить отзыв».
+    ID заказа в событии — без решётки, а в URL он идёт как есть.
+    """
+    oid = str(funpay_order_id or "").strip().lstrip("#")
+    if not oid:
+        return ""
+    return f"https://funpay.com/orders/{oid}/"
+
+
+def _review_request_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
+                         *, funpay_order_id: str = "", buyer: str = "",
+                         fzr_order_id: str = "") -> str:
+    """
+    Просьба подтвердить заказ и оставить отзыв (v3.17).
+
+    Отдельным сообщением после выдачи: покупатель копирует код из предыдущего
+    сообщения, и просьба в том же тексте либо теряется, либо попадает в буфер
+    вместе с кодом.
+    """
+    link = _funpay_order_url(funpay_order_id)
+    tpl = (mapping or {}).get("review_template") or cfg["templates"].get("review_request") or ""
+    if not tpl.strip():
+        return ""
+    text = render_template(
+        tpl, default=DEFAULT_CONFIG["templates"]["review_request"],
+        order_link=link, funpay_order_id=str(funpay_order_id or ""),
+        order_number=fzr_order_id, fzr_order_id=fzr_order_id,
+        buyer=buyer, sku_name=_mapping_display_name(mapping))
+    if link and link not in text:
+        # шаблон продавца мог потерять {order_link} — ссылка нужна всегда,
+        # иначе покупателю придётся искать заказ руками
+        text = f"{text.rstrip()}\n{link}"
+    return text.strip()
+
+
+def _send_review_request(c: "Cardinal", order: Dict[str, Any],
+                         mapping: Optional[Dict[str, Any]],
+                         fzr_order_id: str = "") -> bool:
+    """
+    Отправляет просьбу подтвердить заказ. Возвращает True, если отправлено.
+
+    Второе сообщение отправляется только после успешной выдачи и только один
+    раз — повтор отмечаем в БД (`review_request_sent`).
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("review_request", True):
+        return False
+    order_id = str(order.get("funpay_order_id") or "")
+    if order.get("review_request_sent"):
+        logger.info("review request already sent", extra={"funpay_order_id": order_id})
+        return False
+    order_proxy = _order_proxy(order)
+    chat_id = getattr(order_proxy, "chat_id", None)
+    if not chat_id:
+        return False
+    buyer = getattr(order_proxy, "buyer_username", "") or ""
+    text = _review_request_text(cfg, mapping, funpay_order_id=order_id,
+                                buyer=buyer, fzr_order_id=fzr_order_id)
+    if not text:
+        return False
+    try:
+        delay = float(cfg["settings"].get("review_request_delay", 3) or 0)
+    except (TypeError, ValueError):
+        delay = 3.0
+    # небольшая пауза: два сообщения подряд в FunPay склеиваются в одно
+    # уведомление, и покупатель видит только первое
+    if delay > 0:
+        _SHUTDOWN_EVENT.wait(min(delay, 30.0))
+    # watermark=False: водяной знак уже был в сообщении о выдаче
+    sent = _send_buyer(c, chat_id, text, buyer, watermark=False)
+    if sent:
+        _db_update_order(order_id, review_request_sent=1)
+        _db_log_event(order_id, "review_requested", {"link": _funpay_order_url(order_id)})
+        logger.info("review request sent", extra={"funpay_order_id": order_id})
+    else:
+        logger.warning("review request not sent", extra={"funpay_order_id": order_id})
+    return sent
+
+
+def _deliver_order(c: "Cardinal", order_id: Any, fzr_order_id: str, status_data: Dict[str, Any], job: Optional[Dict[str, Any]] = None) -> None:
+    order_id = str(order_id)
+    order = _db_get_order(order_id)
+    if not order:
+        return
+    if order.get("completed_notification_sent"):
+        return
+    cfg = load_config()
+    mapping = _get_mapping_by_id(order.get("mapping_id"))
+    order_obj = status_data.get("order", status_data)
+    codes = _extract_codes(status_data)
+    code = "\n".join(codes) if codes else "—"
+    order_proxy = _order_proxy(order)
+    buyer = getattr(order_proxy, "buyer_username", "") or ""
+    chat_id = getattr(order_proxy, "chat_id", None)
+    sku = order.get("sku_id") or ""
+    codes_str = "\n".join(str(x) for x in codes)
+    text = _delivery_text(cfg, mapping, codes,
+                          fzr_order_id=fzr_order_id, funpay_order_id=order_id,
+                          buyer=buyer, sku=sku, metadata=order.get("metadata") or {})
+    rows = _db_claim_delivery(order_id, fzr_order_id, _to_json(status_data))
+    if rows == 0:
+        logger.warning("order delivery already claimed", extra={"funpay_order_id": order_id})
+        return
+    sent = _send_buyer(c, chat_id, text, buyer, watermark=False)
+    if sent:
+        _db_update_order(order_id, completed_notification_sent=2)
+        _db_log_event(order_id, "order_delivered", {"fzr_order_id": fzr_order_id})
+        _inc_metric("orders_delivered")
+        logger.info("order delivered", extra={"funpay_order_id": order_id, "fzr_order_id": fzr_order_id})
+        # v3.17: вторым сообщением — просьба подтвердить заказ и оставить отзыв.
+        # Читаем заказ заново: нужен актуальный review_request_sent.
+        try:
+            fresh = _db_get_order(order_id) or order
+            try:
+                _delay = float(cfg["settings"].get("review_request_delay", 3) or 0)
+            except (TypeError, ValueError):
+                _delay = 3.0
+            if _delay > 0:
+                # пауза не должна занимать воркер опроса: при пачке заказов это
+                # добавляло бы delay к каждому
+                _submit_task(_send_review_request, c, fresh, mapping, fzr_order_id)
+            else:
+                _send_review_request(c, fresh, mapping, fzr_order_id)
+        except Exception as e:
+            # просьба об отзыве не должна ломать успешную выдачу
+            logger.error("review request failed", extra={"funpay_order_id": order_id,
+                                                        "error": _redact_sensitive(str(e))})
+    else:
+        _db_update_order(order_id, completed_notification_sent=0)
+        delivery_attempt = (job.get("delivery_attempt") if job else 0) or 0
+        if delivery_attempt < _MAX_DELIVERY_ATTEMPTS:
+            _notify_admin(c, f"⚠️ Код получен, но не доставлен по заказу {order_id}. Повторная попытка {delivery_attempt + 1}/{_MAX_DELIVERY_ATTEMPTS}.")
+            _schedule_poll(
+                c,
+                order_id,
+                fzr_order_id,
+                delay=_DELIVERY_RETRY_DELAY * (delivery_attempt + 1),
+                attempt=1,
+                delivery_attempt=delivery_attempt + 1,
+                deadline=job.get("deadline") if job else None,
+            )
+        else:
+            _db_update_order(order_id, status="delivery_failed", error="max delivery retries exceeded")
+            _db_log_event(order_id, "delivery_failed", {"fzr_order_id": fzr_order_id, "reason": "max delivery retries exceeded"})
+            _inc_metric("delivery_failures")
+            public = _public_buyer_error("delivery failed")
+            retry_text = render_template(
+                cfg["templates"]["error"],
+                default=DEFAULT_CONFIG["templates"]["error"],
+                error=public,
+                fzr_order_id=fzr_order_id,
+                funpay_order_id=order_id,
+                buyer=buyer,
+            )
+            _send_buyer(c, chat_id, retry_text, buyer)
+            _notify_admin(c, f"FazerCards: не удалось доставить заказ {order_id} после {_MAX_DELIVERY_ATTEMPTS} попыток.")
+
+def _poll_delay(cfg: Dict[str, Any], attempt: int) -> float:
+    """
+    Интервал до следующего опроса статуса заказа.
+
+    Раньше был один poll_interval (по умолчанию 5 с) на все попытки, и при
+    poll_interval=30 в настройках покупатель ждал код полминуты уже после того,
+    как FazerCards его отдал. Теперь первые poll_fast_attempts попыток идут
+    часто (poll_interval_fast), дальше — обычным интервалом.
+    """
+    s = cfg.get("settings", {})
+    try:
+        fast_attempts = int(s.get("poll_fast_attempts", 12) or 0)
+    except (TypeError, ValueError):
+        fast_attempts = 12
+    try:
+        base = float(s.get("poll_interval", 5) or 5)
+    except (TypeError, ValueError):
+        base = 5.0
+    if attempt <= fast_attempts:
+        try:
+            fast = float(s.get("poll_interval_fast", 2) or 2)
+        except (TypeError, ValueError):
+            fast = 2.0
+        return max(1.0, min(fast, base if base >= 1 else fast))
+    return max(1.0, base)
+
+
+def _schedule_poll(
+    c: "Cardinal",
+    funpay_order_id: Any,
+    fzr_order_id: str,
+    delay: float = 0.0,
+    attempt: int = 1,
+    delivery_attempt: int = 0,
+    deadline: Optional[float] = None,
+) -> None:
+    if _SHUTDOWN_EVENT.is_set():
+        return
+    if deadline is None:
+        try:
+            cfg = load_config()
+            deadline = time.time() + float(cfg["settings"].get("poll_timeout", 300))
+        except Exception:
+            deadline = time.time() + 300.0
+    with _POLL_LOCK:
+        _POLL_QUEUE[str(funpay_order_id)] = {
+            "next_ts": time.time() + max(0.0, delay),
+            "fzr_order_id": str(fzr_order_id),
+            "funpay_order_id": str(funpay_order_id),
+            "attempt": attempt,
+            "delivery_attempt": delivery_attempt,
+            "deadline": deadline,
+        }
+    _start_poll_worker(c)
+    # воркер спит до конца тика: будим его, чтобы новый заказ пошёл в опрос
+    # сразу, а не через POLL_TICK/старый sleep
+    _POLL_WAKE.set()
+def _start_poll_worker(c: "Cardinal") -> None:
+    global _POLL_THREAD
+    with _POLL_LOCK:
+        if _POLL_THREAD and _POLL_THREAD.is_alive():
+            return
+        _POLL_THREAD = threading.Thread(
+            target=_poll_worker_loop,
+            args=(c,),
+            daemon=True,
+            name="fzr_order_poll_worker",
+        )
+        _POLL_THREAD.start()
+
+
+def _run_poll_job(c: "Cardinal", job: Dict[str, Any]) -> None:
+    """
+    Один опрос статуса. Вынесено отдельно, чтобы задания можно было выполнять
+    параллельно: раньше 10 заказов в очереди опрашивались строго по одному,
+    и при медленном ответе API последний покупатель ждал N × время запроса.
+    """
+    oid = str(job.get("funpay_order_id"))
+    with _POLL_LOCK:
+        if oid in _POLL_INFLIGHT:
+            return
+        _POLL_INFLIGHT.add(oid)
+    try:
+        _check_order_status(c, job)
+    except Exception as e:
+        logger.exception("poll_worker job failed", extra={"funpay_order_id": oid, "error": repr(e)})
+        job["errors"] = job.get("errors", 0) + 1
+        if job["errors"] < _MAX_POLL_JOB_ERRORS:
+            job["next_ts"] = time.time() + 10.0 * job["errors"]
+            job["attempt"] = job.get("attempt", 1)
+            with _POLL_LOCK:
+                _POLL_QUEUE[oid] = job
+            logger.warning("poll job requeued", extra={"funpay_order_id": oid, "errors": job["errors"]})
+        else:
+            _mark_failed(c, oid, job.get("fzr_order_id"), "max poll job errors")
+    finally:
+        with _POLL_LOCK:
+            _POLL_INFLIGHT.discard(oid)
+
+
+def _poll_worker_loop(c: "Cardinal") -> None:
+    logger.info("poll_worker started")
+    while not _SHUTDOWN_EVENT.is_set():
+        now = time.time()
+        with _POLL_LOCK:
+            if _POLL_QUEUE:
+                wait_time = min(POLL_TICK, max(0.05, min(j["next_ts"] for j in _POLL_QUEUE.values()) - now))
+            else:
+                wait_time = POLL_TICK
+        # ждём либо тик, либо появления нового job (_POLL_WAKE), либо остановки
+        if _SHUTDOWN_EVENT.wait(0):
+            break
+        _POLL_WAKE.wait(wait_time)
+        _POLL_WAKE.clear()
+        if _SHUTDOWN_EVENT.is_set():
+            break
+        now = time.time()
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        with _POLL_LOCK:
+            for oid, job in list(_POLL_QUEUE.items()):
+                if job["next_ts"] <= now and oid not in _POLL_INFLIGHT:
+                    due.append((oid, job))
+                    _POLL_QUEUE.pop(oid, None)
+        if not due:
+            continue
+        parallel = True
+        try:
+            parallel = bool(load_config()["settings"].get("poll_parallel", True))
+        except Exception:
+            pass
+        if parallel and len(due) > 1:
+            # заказы независимы: раскидываем по общему пулу потоков
+            for _, job in due:
+                if _SHUTDOWN_EVENT.is_set():
+                    break
+                _submit_task(_run_poll_job, c, job)
+        else:
+            for _, job in due:
+                if _SHUTDOWN_EVENT.is_set():
+                    break
+                _run_poll_job(c, job)
+    logger.info("poll_worker finished")
+def _extract_codes(order_obj: Dict[str, Any]) -> List[str]:
+    """Достаёт коды/ключи из ответа FazerCards по одному заказу."""
+    order_obj = order_obj.get("order", order_obj)
+    codes: List[str] = []
+
+    def add_code(value: Any) -> None:
+        if isinstance(value, dict):
+            value = (value.get("code") or value.get("key") or
+                     value.get("card") or value.get("value"))
+        if value in (None, ""):
+            return
+        text = str(value)
+        if text not in codes:
+            codes.append(text)
+
+    for field in ("cards", "codes", "keys"):
+        values = order_obj.get(field)
+        if values in (None, ""):
+            continue
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        for value in values:
+            add_code(value)
+
+    single_codes: List[str] = []
+    for field in ("code", "key"):
+        value = order_obj.get(field)
+        if value not in (None, "") and str(value) not in single_codes:
+            single_codes.append(str(value))
+    codes = single_codes + [code for code in codes if code not in single_codes]
+    return codes
+
+
+def _check_batch_order_status(c: "Cardinal", job: Dict[str, Any], batch: Dict[str, Any]) -> bool:
+    """
+    Опрашивает ВСЕ заказы FazerCards из батча (заказ FunPay на N штук).
+
+    Возвращает True, если обработка батча завершена (выдано или упало) —
+    тогда обычная одиночная логика не нужна. False — продолжаем ждать.
+    """
+    funpay_order_id = job["funpay_order_id"]
+    ids: List[str] = [str(i) for i in (batch.get("ids") or [])]
+    if len(ids) <= 1:
+        return False
+
+    cfg = load_config()
+    if not cfg["api_key"]:
+        _mark_failed(c, funpay_order_id, ids[0], "API ключ не настроен")
+        return True
+
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+    codes: List[str] = []
+    statuses: Dict[str, str] = {}
+    failed: List[Tuple[str, str]] = []
+    pending = 0
+
+    # v3.14: батч из 20 позиций опрашивался последовательно — 20 × время запроса
+    # на каждый тик. Запросы независимы, поэтому идём параллельно (не больше
+    # 8 одновременно, чтобы не ловить 429 от API).
+    def _fetch(fzr_id: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            return fzr_id, api.get_order(fzr_id), None
+        except Exception as ex:
+            return fzr_id, None, repr(ex)
+
+    results: List[Tuple[str, Optional[Dict[str, Any]], Optional[str]]] = []
+    use_parallel = len(ids) > 1 and bool(cfg["settings"].get("poll_parallel", True))
+    if use_parallel:
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(ids)),
+                                    thread_name_prefix="fzr_batch") as pool:
+                results = list(pool.map(_fetch, ids))
+        except Exception as ex:
+            logger.warning("batch parallel poll failed, falling back",
+                           extra={"funpay_order_id": funpay_order_id, "error": repr(ex)})
+            results = []
+    if not results:
+        results = [_fetch(fzr_id) for fzr_id in ids]
+
+    for fzr_id, data, err in results:
+        if data is None:
+            logger.warning("batch get_order failed", extra={
+                "funpay_order_id": funpay_order_id, "fzr_order_id": fzr_id, "error": err})
+            pending += 1
+            continue
+        obj = data.get("order", data)
+        st = obj.get("status") or data.get("status") or "unknown"
+        statuses[fzr_id] = st
+        if st == "completed":
+            codes.extend(_extract_codes(obj))
+        elif st in ("failed", "refunded", "refund", "returned", "canceled", "cancelled"):
+            failed.append((fzr_id, obj.get("error") or obj.get("reason") or st))
+        else:
+            pending += 1
+
+    if pending and time.time() <= job.get("deadline", float("inf")):
+        next_attempt = job["attempt"] + 1
+        _schedule_poll(c, funpay_order_id, ids[0],
+                       delay=_poll_delay(cfg, next_attempt),
+                       attempt=next_attempt,
+                       delivery_attempt=job.get("delivery_attempt", 0),
+                       deadline=job.get("deadline"))
+        return True
+
+    if failed:
+        # часть позиций не выдана — не выдаём молча половину, зовём продавца
+        detail = "; ".join(f"{fid}: {reason}" for fid, reason in failed[:5])
+        done = len(codes)
+        _db_update_order(funpay_order_id, status="needs_review",
+                         error=f"batch partial: {len(failed)} из {len(ids)} не выполнены ({detail})")
+        _db_log_event(funpay_order_id, "batch_partial_failure",
+                      {"failed": failed, "statuses": statuses, "codes_ready": done})
+        _notify_admin(c, f"⚠️ Заказ {funpay_order_id}: из {len(ids)} заказов FazerCards "
+                         f"не выполнены {len(failed)}. Готовых кодов: {done}.\n{_esc(detail[:400])}")
+        return True
+
+    if pending:
+        _mark_failed(c, funpay_order_id, ids[0],
+                     f"Таймаут: {pending} из {len(ids)} заказов не завершены")
+        return True
+
+    synthetic = {"codes": codes, "batch_ids": ids, "statuses": statuses}
+    _deliver_order(c, funpay_order_id, ", ".join(ids), synthetic, job)
+    return True
+
+
+def _check_order_status(c: "Cardinal", job: Dict[str, Any]) -> None:
+    funpay_order_id = job["funpay_order_id"]
+    fzr_order_id = job["fzr_order_id"]
+    order = _db_get_order(funpay_order_id)
+    if not order:
+        return
+    status = order.get("status")
+    if status in ("failed", "timeout", "no_mapping", "needs_review", "delivery_failed", "refunded"):
+        return
+    if status == "completed" and order.get("completed_notification_sent"):
+        return
+    if status == "completed" and not order.get("completed_notification_sent"):
+        result = _from_json(order.get("result_json"))
+        if result:
+            _deliver_order(c, funpay_order_id, fzr_order_id, result, job)
+        else:
+            logger.error("completed order missing result_json", extra={"funpay_order_id": funpay_order_id})
+        return
+
+    # заказ FunPay на N штук => N заказов FazerCards, ждём все
+    batch = _from_json(order.get("batch_json"))
+    if isinstance(batch, dict) and len(batch.get("ids") or []) > 1:
+        if _check_batch_order_status(c, job, batch):
+            return
+
+    cfg = load_config()
+    if not cfg["api_key"]:
+        _mark_failed(c, funpay_order_id, fzr_order_id, "API ключ не настроен")
+        return
+    if time.time() > job.get("deadline", float("inf")):
+        _mark_failed(c, funpay_order_id, fzr_order_id, "Таймаут ожидания готовности заказа")
+        return
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+    try:
+        status_data = api.get_order(fzr_order_id)
+    except Exception as ex:
+        logger.error("get_order failed", extra={"funpay_order_id": funpay_order_id, "fzr_order_id": fzr_order_id, "error": repr(ex)})
+        if time.time() > job.get("deadline", float("inf")):
+            _mark_failed(c, funpay_order_id, fzr_order_id, f"Ошибка опроса статуса: {ex}")
+        else:
+            next_attempt = job["attempt"] + 1
+            _schedule_poll(c, funpay_order_id, fzr_order_id,
+                           delay=_poll_delay(cfg, next_attempt), attempt=next_attempt,
+                           delivery_attempt=job.get("delivery_attempt", 0), deadline=job.get("deadline"))
+        return
+
+    order_obj = status_data.get("order", status_data)
+    status = order_obj.get("status") or status_data.get("status")
+    if status == "completed":
+        _deliver_order(c, funpay_order_id, fzr_order_id, order_obj, job)
+    elif status in ("refunded", "refund", "returned"):
+        # v3.20: поставщик вернул деньги — это не «ошибка выдачи», а отмена.
+        # Покупателю нужен возврат на FunPay и понятный текст, а не «обратитесь
+        # к продавцу»: товара не будет, держать оплату нельзя.
+        reason = (order_obj.get("error") or order_obj.get("reason")
+                  or status_data.get("error") or "")
+        _handle_fzr_refunded(c, funpay_order_id, fzr_order_id, reason=str(reason))
+    elif status in ("failed", "canceled", "cancelled"):
+        reason = order_obj.get("error") or order_obj.get("reason") or status_data.get("error") or status
+        public = _public_buyer_error(reason)
+        _mark_failed(c, funpay_order_id, fzr_order_id, f"Статус заказа: {status}. {reason}", public_error=public)
+    else:
+        if time.time() > job.get("deadline", float("inf")):
+            _mark_failed(c, funpay_order_id, fzr_order_id, "Таймаут ожидания готовности заказа")
+        else:
+            next_attempt = job["attempt"] + 1
+            _schedule_poll(c, funpay_order_id, fzr_order_id,
+                           delay=_poll_delay(cfg, next_attempt), attempt=next_attempt,
+                           delivery_attempt=job.get("delivery_attempt", 0), deadline=job.get("deadline"))
+
+# =============================================================================
+# manual services chat watcher (v3.4)
+#
+# Ручные услуги выполняет человек на стороне FazerCards: он может задать
+# вопрос («пришлите пароль», «аккаунт с 2FA?») или прислать результат картинкой.
+# API отдаёт этот чат только по запросу (GET .../chat), вебхуков на сообщения
+# нет — значит нужен опрос. Чтобы не долбить API:
+#   * опрашиваем ТОЛЬКО заказы manual-services, которые ещё живы
+#     (+ grace-период после выдачи: исполнитель часто пишет уже после);
+#   * интервал адаптивный: пришло сообщение — опрашиваем часто, тишина —
+#     разъезжаемся по экспоненте до 8× базового;
+#   * дедупликация по msg_hash, поэтому повторные ответы API безвредны.
+# =============================================================================
+
+_MANUAL_CHAT_GRACE = 3600.0        # сколько ещё следить после выдачи заказа
+_MANUAL_CHAT_MAX_BACKOFF = 4       # максимум множителя интервала (v3.14: было 8)
+# «живые» статусы + reserving: исполнитель может написать сразу после создания
+_MANUAL_ACTIVE_STATUSES = _ACTIVE_STATUSES + ("needs_review",)
+
+
+def _manual_chat_grace(cfg: Optional[Dict[str, Any]] = None) -> float:
+    """
+    Сколько следить за чатом после закрытия заказа.
+
+    v3.14: час оказался мало — исполнитель ручной услуги нередко пишет уже
+    после выдачи (уточнение, скриншот), и продавец этих сообщений не видел.
+    Теперь настраивается (manual_chat_grace_hours, по умолчанию 24 ч).
+    """
+    try:
+        hours = float((cfg or load_config())["settings"].get("manual_chat_grace_hours", 24) or 24)
+    except Exception:
+        hours = 24.0
+    return max(_MANUAL_CHAT_GRACE, min(hours, 168.0) * 3600.0)
+
+
+def _manual_chat_candidates(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    Заказы, чей чат стоит опросить.
+
+    Берём только manual-services: у остальных типов чата нет, и лишние
+    запросы просто съедали бы лимиты API.
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    now = time.time()
+    with _DB_LOCK:
+        rows = _db_connect().execute(
+            "SELECT funpay_order_id, fzr_order_id, status, sku_id, updated_at, "
+            "       buyer_username, chat_id, order_json "
+            "FROM orders WHERE sku_id LIKE 'manual-services:%' AND fzr_order_id != '' "
+            "  AND updated_at > ? ORDER BY updated_at DESC LIMIT 50",
+            (now - _MANUAL_CHAT_MAX_AGE,),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    grace = _manual_chat_grace(cfg)
+    for r in rows:
+        d = dict(r)
+        status = str(d.get("status") or "")
+        updated = float(d.get("updated_at") or 0)
+        alive = status in _MANUAL_ACTIVE_STATUSES
+        # после выдачи/ошибки следим ещё grace: исполнитель часто пишет позже
+        recently_closed = (now - updated) < grace
+        if alive or recently_closed:
+            out.append(d)
+    return out
+
+
+def _manual_chat_due(order_id: str, cfg: Dict[str, Any]) -> bool:
+    """Пора ли опрашивать этот заказ (адаптивный интервал)."""
+    try:
+        base = float(cfg["settings"].get("manual_chat_interval", 60) or 60)
+    except (TypeError, ValueError):
+        base = 60.0
+    # v3.14: минимум опустили с 15 до 5 с — «сообщения приходят медленно»
+    base = max(5.0, base)
+    with _MANUAL_CHAT_LOCK:
+        st = _MANUAL_CHAT_STATE.setdefault(order_id, {"next_ts": 0.0, "backoff": 1})
+        if time.time() < st["next_ts"]:
+            return False
+        st["next_ts"] = time.time() + base * st["backoff"]
+    return True
+
+
+def _manual_chat_mark(order_id: str, got_messages: bool) -> None:
+    """Есть сообщения — опрашиваем чаще, тишина — реже."""
+    with _MANUAL_CHAT_LOCK:
+        st = _MANUAL_CHAT_STATE.setdefault(order_id, {"next_ts": 0.0, "backoff": 1})
+        if got_messages:
+            st["backoff"] = 1
+            st["next_ts"] = 0.0   # следующий тик — сразу, диалог активен
+        else:
+            st["backoff"] = min(_MANUAL_CHAT_MAX_BACKOFF, st["backoff"] * 2)
+
+
+def _manual_chat_forget(order_id: str) -> None:
+    with _MANUAL_CHAT_LOCK:
+        _MANUAL_CHAT_STATE.pop(order_id, None)
+
+
+def _is_seller_message(sender: str) -> bool:
+    """Наши же сообщения не пересылаем обратно (API отдаёт их в общей истории)."""
+    s = (sender or "").strip().lower()
+    return s in ("you", "me", "seller", "client", "customer", "buyer", "reseller", "вы", "я")
+
+
+def _manual_chat_notify(c: "Cardinal", order: Dict[str, Any],
+                        fresh: List[Dict[str, Any]], chat_info: Dict[str, Any]) -> None:
+    """Уведомление продавцу в Telegram + кнопка «Ответить»."""
+    order_id = str(order["funpay_order_id"])
+    fzr_id = str(order.get("fzr_order_id") or "")
+    incoming = [m for m in fresh if not _is_seller_message(m.get("sender", ""))]
+    if not incoming:
+        return
+
+    lines = [f"💬 <b>Сообщение по ручному заказу</b>",
+             f"FunPay: <code>{_esc(order_id)}</code> · FZR: <code>{_esc(fzr_id)}</code>",
+             f"🛒 {_esc(_short_sku(order.get('sku_id')))}"]
+    buyer = order.get("buyer_username")
+    if buyer:
+        lines.append(f"👤 покупатель: <b>{_esc(buyer)}</b>")
+    header = "\n".join(lines) + "\n"
+
+    blocks = []
+    for m in incoming[:5]:
+        who = _esc(m.get("sender") or "исполнитель")
+        body = _esc(str(m.get("body") or "").strip()[:700]) or "<i>(без текста)</i>"
+        block = f"<blockquote><b>{who}</b>\n{body}"
+        for url in (m.get("images") or [])[:3]:
+            block += f"\n🖼 {_esc(url)}"
+        blocks.append(block + "</blockquote>")
+    if len(incoming) > 5:
+        blocks.append(f"<i>…и ещё {len(incoming) - 5}</i>")
+
+    read_only = bool(chat_info.get("chat_read_only")) or bool(chat_info.get("chat_frozen"))
+    if read_only:
+        blocks.append("🔒 <i>Чат закрыт для ответа.</i>")
+    text = _fit_blocks(header, blocks)
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    if not read_only:
+        kb.add(_inline_button("✍️ Ответить", callback_data=f"{CB_PREFIX}:mchat_reply:{order_id}"))
+    kb.add(_inline_button("💬 История", callback_data=f"{CB_PREFIX}:mchat:{order_id}"),
+           _inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+    if buyer and order.get("chat_id"):
+        kb.add(_inline_button("📨 Переслать покупателю",
+                              callback_data=f"{CB_PREFIX}:mchat_relay:{order_id}"))
+
+    sent = False
+    for chat_id in _admin_chat_ids(c):
+        try:
+            c.telegram.bot.send_message(chat_id, text, reply_markup=kb,
+                                        parse_mode="HTML", disable_web_page_preview=True)
+            sent = True
+        except Exception as e:
+            logger.warning("manual chat notify failed", extra={"chat_id": chat_id, "error": repr(e)})
+    if not sent:
+        # хотя бы обычным уведомлением, если кнопки отправить не вышло
+        _notify_admin(c, f"Сообщение по ручному заказу {order_id}: "
+                         f"{incoming[0].get('body') or '(вложение)'}")
+
+
+def _admin_chat_ids(c: "Cardinal") -> List[int]:
+    """Чаты, которым можно писать с кнопками (авторизованные пользователи ПУ)."""
+    tg = getattr(c, "telegram", None)
+    if not tg:
+        return []
+    ids = getattr(tg, "authorized_users", None) or []
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return []
+
+
+def _manual_chat_relay_to_buyer(c: "Cardinal", order: Dict[str, Any],
+                               messages: List[Dict[str, Any]]) -> int:
+    """
+    Пересылает сообщения исполнителя покупателю в чат FunPay.
+
+    Автоматически — только если продавец включил manual_chat_autorelay;
+    вручную — кнопкой из уведомления. Ссылки на картинки отдаём как текст:
+    чат FunPay не рендерит вложения из внешнего API.
+    """
+    order_proxy = _order_proxy(order)
+    chat_id = order.get("chat_id") or getattr(order_proxy, "chat_id", None)
+    buyer = order.get("buyer_username") or getattr(order_proxy, "buyer_username", "") or ""
+    if not chat_id:
+        return 0
+    relayed = 0
+    for m in messages:
+        if _is_seller_message(m.get("sender", "")):
+            continue
+        body = str(m.get("body") or "").strip()
+        images = m.get("images") or []
+        parts = ["Сообщение от исполнителя по вашему заказу:"]
+        if body:
+            parts.append(body[:1500])
+        for url in images[:3]:
+            parts.append(str(url))
+        if _send_buyer(c, chat_id, "\n".join(parts), buyer):
+            relayed += 1
+            with _DB_LOCK:
+                _db_connect().execute(
+                    "UPDATE manual_chat SET relayed_to_buyer=1 WHERE msg_hash=?",
+                    (m.get("hash") or "",))
+    if relayed:
+        _db_log_event(order["funpay_order_id"], "manual_chat_relayed", {"count": relayed})
+    return relayed
+
+
+def _manual_chat_poll_once(c: "Cardinal", cfg: Dict[str, Any]) -> None:
+    """Один проход по заказам ручных услуг."""
+    if not cfg.get("api_key"):
+        return
+    candidates = _manual_chat_candidates(cfg)
+    if not candidates:
+        return
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+    autorelay = bool(cfg["settings"].get("manual_chat_autorelay"))
+
+    # v3.14: раньше все заказы опрашивались в один поток по очереди — при 10
+    # активных ручных услугах и ответе API ~1 с сообщение исполнителя доходило
+    # до продавца через десятки секунд. Теперь запросы идут параллельно, а
+    # разбор результатов — по-прежнему последовательно (SQLite + уведомления).
+    due: List[Dict[str, Any]] = []
+    for order in candidates:
+        order_id = str(order["funpay_order_id"])
+        fzr_id = str(order.get("fzr_order_id") or "")
+        if not fzr_id:
+            continue
+        with _MANUAL_CHAT_LOCK:
+            if order_id in _MANUAL_CHAT_SKIP:
+                continue
+        if not _manual_chat_due(order_id, cfg):
+            continue
+        due.append(order)
+    if not due:
+        return
+
+    def _fetch(order: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[BaseException]]:
+        try:
+            return order, api.get_manual_chat(str(order.get("fzr_order_id") or "")), None
+        except BaseException as ex:      # noqa: BLE001 — разбираем ниже
+            return order, None, ex
+
+    results: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[BaseException]]] = []
+    if len(due) > 1:
+        try:
+            with ThreadPoolExecutor(max_workers=min(6, len(due)),
+                                    thread_name_prefix="fzr_mchat") as pool:
+                results = list(pool.map(_fetch, due))
+        except Exception as ex:
+            logger.warning("manual chat parallel poll failed, falling back",
+                           extra={"error": repr(ex)})
+            results = []
+    if not results:
+        results = [_fetch(order) for order in due]
+
+    for order, data, ex in results:
+        order_id = str(order["funpay_order_id"])
+        fzr_id = str(order.get("fzr_order_id") or "")
+        if ex is not None:
+            if isinstance(ex, FazerCardsAPIError):
+                # Проверено на живом API:
+                #   400 «must match pattern ^ord-[0-9]+$» — id не того формата,
+                #       повторять бессмысленно;
+                #   404 «Order not found» — у обычных topup/steam_gift чата нет,
+                #       НО у ручной услуги чат создаётся не сразу, поэтому
+                #       снимаем с опроса только после нескольких 404 подряд.
+                #       До v3.14 первый же 404 навсегда выключал заказ — из-за
+                #       этого сообщения исполнителя не приходили вообще.
+                if ex.status_code in (400, 403):
+                    _manual_chat_forget(order_id)
+                    with _MANUAL_CHAT_LOCK:
+                        _MANUAL_CHAT_SKIP.add(order_id)
+                    logger.info("manual chat unavailable", extra={
+                        "funpay_order_id": order_id, "status": ex.status_code})
+                elif ex.status_code == 404:
+                    with _MANUAL_CHAT_LOCK:
+                        hits = _MANUAL_CHAT_404.get(order_id, 0) + 1
+                        _MANUAL_CHAT_404[order_id] = hits
+                        give_up = hits >= _MANUAL_CHAT_404_MAX
+                        if give_up:
+                            _MANUAL_CHAT_SKIP.add(order_id)
+                    if give_up:
+                        _manual_chat_forget(order_id)
+                        with _MANUAL_CHAT_LOCK:
+                            _MANUAL_CHAT_404.pop(order_id, None)
+                        logger.info("manual chat still 404, giving up", extra={
+                            "funpay_order_id": order_id, "attempts": hits})
+                    else:
+                        _manual_chat_mark(order_id, False)
+                else:
+                    logger.warning("manual chat poll failed", extra={
+                        "funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+                    _manual_chat_mark(order_id, False)
+            else:
+                logger.warning("manual chat poll error", extra={
+                    "funpay_order_id": order_id, "error": repr(ex)})
+                _manual_chat_mark(order_id, False)
+            continue
+
+        # чат ответил — сбрасываем счётчик 404
+        with _MANUAL_CHAT_LOCK:
+            _MANUAL_CHAT_404.pop(order_id, None)
+
+        messages = (data or {}).get("messages") or []
+        fresh = _db_manual_chat_new(order_id, fzr_id, messages)
+        incoming = [m for m in fresh if not _is_seller_message(m.get("sender", ""))]
+        _manual_chat_mark(order_id, bool(incoming))
+        if not incoming:
+            continue
+
+        logger.info("manual chat new messages", extra={
+            "funpay_order_id": order_id, "fzr_order_id": fzr_id, "count": len(incoming)})
+        _db_log_event(order_id, "manual_chat_message",
+                      {"count": len(incoming),
+                       "senders": sorted({m.get("sender") for m in incoming})})
+        _manual_chat_notify(c, order, fresh, data or {})
+        if autorelay:
+            _manual_chat_relay_to_buyer(c, order, incoming)
+
+
+def _manual_chat_watcher_loop(c: "Cardinal") -> None:
+    logger.info("manual_chat_watcher started")
+    while not _SHUTDOWN_EVENT.is_set():
+        if _SHUTDOWN_EVENT.wait(_MANUAL_CHAT_TICK):
+            break
+        try:
+            cfg = load_config()
+            if not cfg["settings"].get("manual_chat_watch", True):
+                continue
+            _manual_chat_poll_once(c, cfg)
+        except Exception as e:
+            logger.exception("manual_chat_watcher error", extra={"error": repr(e)})
+    logger.info("manual_chat_watcher finished")
+
+
+def _start_manual_chat_watcher(c: "Cardinal") -> None:
+    global _MANUAL_CHAT_THREAD
+    if _MANUAL_CHAT_THREAD and _MANUAL_CHAT_THREAD.is_alive():
+        return
+    _MANUAL_CHAT_THREAD = threading.Thread(
+        target=_manual_chat_watcher_loop,
+        args=(c,),
+        daemon=True,
+        name="fzr_manual_chat_watcher",
+    )
+    _MANUAL_CHAT_THREAD.start()
+
+
+# =============================================================================
+# health watcher (v3.5): подписка FazerCards, баланс, синхронизация цен
+#
+# Зачем: подписка кончится -> API перестанет отвечать и посыпятся ВСЕ заказы
+# разом; курс уйдёт или FazerCards поднимет закупку -> лоты будут продаваться
+# в минус. Оба события молчаливые, поэтому нужен отдельный наблюдатель.
+# =============================================================================
+
+_HEALTH_THREAD: Optional[threading.Thread] = None
+_HEALTH_TICK = 300.0                  # раз в 5 минут просыпаемся
+_SUB_CHECK_INTERVAL = 6 * 3600.0      # подписку проверяем 4 раза в сутки
+_HEALTH_STATE: Dict[str, Any] = {
+    "sub_checked_at": 0.0,
+    "sub_alerted_day": None,          # за какой «остаток дней» уже алертили
+    "sub_expired_alerted": False,
+    "balance_alerted_at": 0.0,
+    "price_synced_at": 0.0,
+    "funds_checked_at": 0.0,
+}
+_HEALTH_LOCK = threading.RLock()
+_BALANCE_ALERT_COOLDOWN = 12 * 3600.0
+# по каждой привязке об аномальной цене напоминаем не чаще раза в сутки
+_PRICE_REVIEW_ALERTED: Dict[str, float] = {}
+_PRICE_REVIEW_COOLDOWN = 24 * 3600.0
+
+
+def _parse_iso_dt(value: Any) -> Optional[float]:
+    """
+    ISO-8601 из API в unix-время.
+
+    Живой ответ: "2026-09-17T17:38:07.847Z" — datetime.fromisoformat в Python
+    3.10 не умеет 'Z', поэтому заменяем на +00:00.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt.timestamp()
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _days_left(expires_at: Any) -> Optional[float]:
+    ts = _parse_iso_dt(expires_at)
+    if ts is None:
+        return None
+    return (ts - time.time()) / 86400.0
+
+
+def _fmt_date(value: Any) -> str:
+    ts = _parse_iso_dt(value)
+    if ts is None:
+        return str(value or "—")
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+
+
+def _check_subscription(c: "Cardinal", cfg: Dict[str, Any], force: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Проверяет подписку FazerCards и предупреждает заранее.
+
+    Алерт отправляется один раз на каждый «порог дней», иначе при интервале
+    в 6 часов продавец получал бы одно и то же сообщение 4 раза в сутки.
+    """
+    if not cfg.get("api_key"):
+        return None
+    now = time.time()
+    with _HEALTH_LOCK:
+        if not force and now - _HEALTH_STATE["sub_checked_at"] < _SUB_CHECK_INTERVAL:
+            return None
+        _HEALTH_STATE["sub_checked_at"] = now
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        data = api.get_subscription()
+    except Exception as ex:
+        logger.warning("subscription check failed", extra={"error": _redact_sensitive(str(ex))})
+        return None
+
+    plan = str(data.get("plan") or "—")
+    expires = data.get("planExpiresAt")
+    active = bool(data.get("subscriptionActive"))
+    auto_renew = bool(data.get("planAutoRenew"))
+    left = _days_left(expires)
+    logger.info("subscription checked", extra={
+        "plan": plan, "active": active, "auto_renew": auto_renew,
+        "days_left": round(left, 2) if left is not None else None})
+
+    if not cfg["settings"].get("sub_alert", True):
+        return data
+
+    # подписка уже кончилась — самое важное сообщение
+    if not active or (left is not None and left <= 0):
+        with _HEALTH_LOCK:
+            already = _HEALTH_STATE["sub_expired_alerted"]
+            _HEALTH_STATE["sub_expired_alerted"] = True
+        if not already:
+            _notify_admin(
+                c,
+                "🔴 Подписка FazerCards неактивна!\n"
+                f"План: {plan}, срок: {_fmt_date(expires)}\n"
+                "API откажет в заказах — автовыдача остановится. "
+                "Продлите подписку в панели FazerCards.")
+        return data
+
+    with _HEALTH_LOCK:
+        _HEALTH_STATE["sub_expired_alerted"] = False
+
+    try:
+        threshold = float(cfg["settings"].get("sub_alert_days", 5) or 5)
+    except (TypeError, ValueError):
+        threshold = 5.0
+    if left is None or left > threshold:
+        return data
+
+    # округляем ВВЕРХ: за 2.99 дня честнее сказать «3 дн.», чем «2 дн.»
+    bucket = 0 if left < 1 else int(math.ceil(left))
+    with _HEALTH_LOCK:
+        if _HEALTH_STATE["sub_alerted_day"] == bucket:
+            return data
+        _HEALTH_STATE["sub_alerted_day"] = bucket
+
+    when = "меньше суток" if bucket == 0 else f"{bucket} дн."
+    renew = ("автопродление включено — списание произойдёт само"
+             if auto_renew else
+             "⚠️ автопродление ВЫКЛЮЧЕНО — продлевать нужно вручную")
+    _notify_admin(
+        c,
+        f"🟡 Подписка FazerCards истекает: осталось {when}\n"
+        f"План: {plan}, до {_fmt_date(expires)}\n"
+        f"{renew}\n"
+        "После истечения автовыдача остановится: API перестанет принимать заказы.")
+    return data
+
+
+def _check_low_balance(c: "Cardinal", cfg: Dict[str, Any]) -> Optional[float]:
+    """Предупреждение о низком балансе — до того, как заказ упадёт."""
+    try:
+        threshold = float(cfg["settings"].get("low_balance_threshold", 0) or 0)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0 or not cfg.get("api_key"):
+        return None
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        data = api.get_balance()
+        balance = float(data.get("balance") or 0)
+    except Exception as ex:
+        logger.warning("balance check failed", extra={"error": _redact_sensitive(str(ex))})
+        return None
+    if balance >= threshold:
+        return balance
+    now = time.time()
+    with _HEALTH_LOCK:
+        if now - _HEALTH_STATE["balance_alerted_at"] < _BALANCE_ALERT_COOLDOWN:
+            return balance
+        _HEALTH_STATE["balance_alerted_at"] = now
+    _notify_admin(
+        c,
+        f"🟡 Баланс FazerCards низкий: {balance:.2f} USD (порог {threshold:.2f}).\n"
+        "Заказы начнут падать с ошибкой «недостаточно средств». Пополните баланс.")
+    return balance
+
+
+# -----------------------------------------------------------------------------
+# синхронизация цен лотов (v3.5)
+#
+# Цена лота = закупка(USD) × курс × (1+наценка) + фикс. Изменится ЛЮБОЙ из
+# множителей — и лот продаётся не по той цене. Раньше плагин обновлял только
+# курс в конфиге, а цены лотов на FunPay оставались старыми.
+# Поэтому синхронизация учитывает обе причины:
+#   1) курс RUB/USD (обновляется автоматически);
+#   2) закупочную цену на FazerCards (её меняют без предупреждения).
+# Защиты: порог (не дёргать лот из-за копеек), максимальный шаг (защита от
+# ошибочной цены в каталоге), dry-run (сначала посмотреть, потом включить).
+# -----------------------------------------------------------------------------
+
+def _fetch_current_price_usd(api: "FazerCardsAPI", mapping: Dict[str, Any]) -> Optional[str]:
+    """
+    Актуальная закупка из каталога FazerCards для привязки.
+
+    Возвращает строку как её отдаёт API (чтобы сравнивать без потерь точности)
+    или None, если предложение не найдено — тогда цену не трогаем.
+
+    У steam-gifts offer_id имеет вид "<sub_id>:<REGION>", и список регионов
+    отдаётся только при указании edition_id — иначе нормализация вернёт
+    список изданий без цен.
+    """
+    kind = str(mapping.get("category_kind") or "")
+    category_id = str(mapping.get("category_id") or "")
+    offer_id = str(mapping.get("offer_id") or "")
+    if not kind or not category_id or not offer_id:
+        return None
+    edition_id = offer_id.split(":")[0] if kind == "steam-gifts" else None
+    try:
+        raw = api.get_offers(kind, category_id)
+    except Exception as ex:
+        logger.warning("price sync: offers fetch failed", extra={
+            "mapping_id": mapping.get("id"), "error": _redact_sensitive(str(ex))})
+        return None
+    page = _normalize_catalog_page(kind, raw, is_categories=False, edition_id=edition_id)
+    for item in page.get("items") or []:
+        if str(item.get("id")) == offer_id:
+            price = item.get("price_usd")
+            return None if price in (None, "", "—") else str(price)
+    logger.info("price sync: offer not found in catalog", extra={
+        "mapping_id": mapping.get("id"), "kind": kind, "offer_id": offer_id})
+    return None
+
+
+def _price_sync_candidates() -> List[Dict[str, Any]]:
+    """Привязки, у которых включена синхронизация и есть лот."""
+    return [m for m in _db_get_mappings()
+            if m.get("price_sync") and m.get("funpay_lot_id")]
+
+
+def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
+                       fresh_usd: Optional[str]) -> Dict[str, Any]:
+    """
+    Считает новую цену лота и решает, надо ли её менять.
+
+    Возвращает dict с полями: skip (причина отказа), old/new (цена),
+    delta_pct, reason (курс/закупка/наценка), usd.
+    """
+    usd = fresh_usd if fresh_usd is not None else mapping.get("price_usd")
+    try:
+        rate = float(cfg["settings"].get("exchange_rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    target = _apply_markup(usd, mapping, cfg, rate)
+    result: Dict[str, Any] = {"usd": usd, "rate": rate, "new": target,
+                              "old": None, "delta_pct": None, "skip": None,
+                              "reasons": []}
+    if target is None:
+        result["skip"] = "нет цены закупки или курса"
+        return result
+
+    # с чем сравниваем: с ценой, которую сами ставили в прошлый раз
+    try:
+        last_lot = float(mapping.get("last_lot_price") or 0) or None
+    except (TypeError, ValueError):
+        last_lot = None
+    result["old"] = last_lot
+
+    # что именно изменилось — для внятного сообщения продавцу
+    old_usd = str(mapping.get("last_price_usd") or "")
+    if fresh_usd is not None and old_usd and str(fresh_usd) != old_usd:
+        result["reasons"].append(f"закупка {old_usd} → {fresh_usd} USD")
+    if last_lot is not None and target != last_lot:
+        result["reasons"].append(f"курс {rate:.2f}")
+
+    if last_lot is None:
+        # первая синхронизация: цену знаем, но с чем сравнивать — нет
+        result["delta_pct"] = None
+        return result
+
+    if last_lot <= 0:
+        result["skip"] = "прошлая цена нулевая"
+        return result
+
+    delta_pct = (target - last_lot) / last_lot * 100.0
+    result["delta_pct"] = delta_pct
+
+    try:
+        threshold = float(cfg["settings"].get("price_sync_threshold", 1.0) or 0)
+    except (TypeError, ValueError):
+        threshold = 1.0
+    if abs(delta_pct) < threshold:
+        result["skip"] = f"отклонение {delta_pct:+.2f}% меньше порога {threshold}%"
+        return result
+
+    try:
+        max_step = float(cfg["settings"].get("price_sync_max_step", 30.0) or 0)
+    except (TypeError, ValueError):
+        max_step = 30.0
+    if max_step > 0 and abs(delta_pct) > max_step:
+        # скорее всего в каталоге аномалия — молча менять цену опасно
+        result["skip"] = (f"скачок {delta_pct:+.1f}% больше лимита {max_step}% "
+                          f"— нужна ручная проверка")
+        result["needs_review"] = True
+        return result
+    return result
+
+
+def _apply_lot_price(c: "Cardinal", mapping: Dict[str, Any], new_price: float) -> Tuple[bool, Optional[str]]:
+    """Ставит новую цену лоту на FunPay (читаем поля, меняем price, сохраняем)."""
+    lot_id = mapping.get("funpay_lot_id")
+    try:
+        lot_id_int = int(lot_id)
+    except (TypeError, ValueError):
+        return False, f"некорректный ID лота: {lot_id}"
+    try:
+        lf = c.account.get_lot_fields(lot_id_int)
+    except Exception as ex:
+        return False, f"не удалось получить лот: {_redact_sensitive(str(ex))}"
+    try:
+        lf.price = new_price
+        lf.renew_fields()
+    except Exception as ex:
+        return False, f"не удалось изменить поля лота: {_redact_sensitive(str(ex))}"
+    ok, err, _bad = _fzr_save_lot_fields(c, lf, attempts=2)
+    return ok, err
+
+
+def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
+                     force: bool = False, only_mapping_id: Optional[str] = None
+                     ) -> Dict[str, Any]:
+    """
+    Один проход синхронизации цен.
+
+    force=True — запуск из ПУ («Проверить сейчас»), игнорирует интервал.
+    only_mapping_id — пересчитать одну привязку (кнопка в её карточке).
+    """
+    report: Dict[str, Any] = {"checked": 0, "changed": [], "skipped": [],
+                              "failed": [], "review": [], "dry_run": False}
+    if not cfg.get("api_key"):
+        report["error"] = "API-ключ не задан"
+        return report
+
+    mappings = _price_sync_candidates()
+    if only_mapping_id:
+        mappings = [m for m in _db_get_mappings() if m.get("id") == only_mapping_id]
+    if not mappings:
+        return report
+
+    dry_run = bool(cfg["settings"].get("price_sync_dry_run"))
+    report["dry_run"] = dry_run
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+
+    for mapping in mappings:
+        report["checked"] += 1
+        name = _mapping_display_name(mapping)
+        fresh_usd = _fetch_current_price_usd(api, mapping)
+        plan = _plan_price_change(mapping, cfg, fresh_usd)
+        new_price = plan["new"]
+
+        if plan["skip"]:
+            entry = {"name": name, "id": mapping.get("id"), "reason": plan["skip"],
+                     "old": plan["old"], "new": new_price}
+            if plan.get("needs_review"):
+                report["review"].append(entry)
+                # аномалия — сообщаем, но не чаще раза в сутки на привязку,
+                # иначе при интервале 6 ч алерт повторялся бы 4 раза
+                mid = str(mapping.get("id"))
+                now = time.time()
+                with _HEALTH_LOCK:
+                    last = _PRICE_REVIEW_ALERTED.get(mid, 0.0)
+                    notify = now - last >= _PRICE_REVIEW_COOLDOWN
+                    if notify:
+                        _PRICE_REVIEW_ALERTED[mid] = now
+                if notify:
+                    _notify_admin(
+                        c,
+                        f"⚠️ Цена лота требует проверки: {name}\n"
+                        f"Лот {mapping.get('funpay_lot_id')}: {plan['old']}₽ → {new_price}₽\n"
+                        f"{plan['skip']}\n"
+                        "Проверьте цену в каталоге FazerCards и обновите вручную.")
+                # last_price_usd НЕ обновляем: иначе аномальная закупка станет
+                # «прошлой» и в следующем отчёте причина будет наоборот
+                continue
+            report["skipped"].append(entry)
+            # цену не меняем, но свежую закупку запоминаем — чтобы в следующий
+            # раз «причина» показывала реальное изменение
+            if fresh_usd is not None and str(fresh_usd) != str(mapping.get("last_price_usd") or ""):
+                _db_save_mapping({**mapping, "last_price_usd": str(fresh_usd)})
+            continue
+
+        first_run = plan["old"] is None
+        if dry_run:
+            report["skipped"].append({"name": name, "id": mapping.get("id"),
+                                      "reason": "dry-run: цена не менялась",
+                                      "old": plan["old"], "new": new_price})
+            continue
+
+        ok, err = _apply_lot_price(c, mapping, new_price)
+        if not ok:
+            report["failed"].append({"name": name, "id": mapping.get("id"),
+                                     "error": err, "new": new_price})
+            logger.warning("price sync failed", extra={
+                "mapping_id": mapping.get("id"), "lot_id": mapping.get("funpay_lot_id"),
+                "error": err})
+            continue
+
+        _db_save_mapping({**mapping,
+                          "last_price_usd": str(fresh_usd if fresh_usd is not None
+                                                else mapping.get("price_usd") or ""),
+                          "price_usd": str(fresh_usd) if fresh_usd is not None else mapping.get("price_usd"),
+                          "last_lot_price": new_price,
+                          "price_synced_at": time.time()})
+        entry = {"name": name, "id": mapping.get("id"),
+                 "lot_id": mapping.get("funpay_lot_id"),
+                 "old": plan["old"], "new": new_price,
+                 "delta_pct": plan["delta_pct"],
+                 "reasons": plan["reasons"], "first_run": first_run}
+        report["changed"].append(entry)
+        logger.info("lot price synced", extra={
+            "mapping_id": mapping.get("id"), "lot_id": mapping.get("funpay_lot_id"),
+            "old": plan["old"], "new": new_price,
+            "delta_pct": round(plan["delta_pct"], 2) if plan["delta_pct"] is not None else None})
+
+    if report["changed"] and not force:
+        _notify_admin(c, _price_sync_summary(report))
+    return report
+
+
+def _sync_lot_prices_after_setting_change(c: "Cardinal",
+                                          cfg: Dict[str, Any],
+                                          setting: str) -> None:
+    report = _sync_lot_prices(c, cfg, force=True)
+    logger.info("price sync after setting change", extra={
+        "setting": setting,
+        "checked": report.get("checked", 0),
+        "changed": len(report.get("changed") or []),
+        "failed": len(report.get("failed") or []),
+        "error": report.get("error"),
+    })
+    if report.get("error") or report.get("failed"):
+        _notify_admin(c, _price_sync_report_html(report))
+
+
+def _price_sync_summary(report: Dict[str, Any]) -> str:
+    """Короткий отчёт о синхронизации для Telegram."""
+    lines = ["💱 Цены лотов обновлены"]
+    for item in report["changed"][:10]:
+        old = item.get("old")
+        delta = item.get("delta_pct")
+        if item.get("first_run") or old is None:
+            lines.append(f"• {item['name']}: → {item['new']}₽ (первая синхронизация)")
+        else:
+            arrow = "↑" if delta and delta > 0 else "↓"
+            lines.append(f"• {item['name']}: {old}₽ → {item['new']}₽ "
+                         f"({arrow}{abs(delta):.1f}%)")
+        reasons = item.get("reasons") or []
+        if reasons:
+            lines.append(f"   причина: {', '.join(reasons)}")
+    if len(report["changed"]) > 10:
+        lines.append(f"…и ещё {len(report['changed']) - 10}")
+    if report["failed"]:
+        lines.append(f"❌ не удалось обновить: {len(report['failed'])}")
+    return "\n".join(lines)
+
+
+def _health_watcher_loop(c: "Cardinal") -> None:
+    logger.info("health_watcher started")
+    while not _SHUTDOWN_EVENT.is_set():
+        if _SHUTDOWN_EVENT.wait(_HEALTH_TICK):
+            break
+        try:
+            cfg = load_config()
+            # v3.15: сторож для потока курса. Если он умер, автообновление
+            # молча не работало до перезапуска FunPayCardinal.
+            if cfg["settings"].get("auto_update_exchange_rate"):
+                if _ensure_exchange_rate_updater(c):
+                    _notify_admin(c, "💱 Поток автообновления курса не работал — перезапустил.")
+            _check_subscription(c, cfg)
+            _check_low_balance(c, cfg)
+            # v3.19: напоминание о долге по локальному балансу. Проверяем
+            # регулярно, а не только в момент заказа: продавец мог закрыть
+            # уведомление и забыть, а cooldown сам не даст спамить.
+            if cfg["settings"].get("local_balance", True):
+                try:
+                    _balance_check_and_alert(c)
+                except Exception as e:
+                    logger.warning("balance watcher failed", extra={"error": repr(e)})
+            # v3.6: заказы, ждущие пополнения баланса — повторяем, когда деньги есть
+            try:
+                funds_interval = float(cfg["settings"].get("funds_retry_interval", 1800) or 1800)
+            except (TypeError, ValueError):
+                funds_interval = 1800.0
+            funds_interval = max(300.0, funds_interval)
+            now = time.time()
+            with _HEALTH_LOCK:
+                funds_due = now - _HEALTH_STATE["funds_checked_at"] >= funds_interval
+                if funds_due:
+                    _HEALTH_STATE["funds_checked_at"] = now
+            if funds_due:
+                _funds_watcher_tick(c, cfg)
+            # синхронизация цен по своему интервалу
+            if cfg["settings"].get("price_sync"):
+                try:
+                    interval = float(cfg["settings"].get("price_sync_interval", 21600) or 21600)
+                except (TypeError, ValueError):
+                    interval = 21600.0
+                interval = max(600.0, interval)
+                now = time.time()
+                with _HEALTH_LOCK:
+                    due = now - _HEALTH_STATE["price_synced_at"] >= interval
+                    if due:
+                        _HEALTH_STATE["price_synced_at"] = now
+                if due:
+                    _sync_lot_prices(c, cfg)
+        except Exception as e:
+            logger.exception("health_watcher error", extra={"error": repr(e)})
+    logger.info("health_watcher finished")
+
+
+def _start_health_watcher(c: "Cardinal") -> None:
+    global _HEALTH_THREAD
+    if _HEALTH_THREAD and _HEALTH_THREAD.is_alive():
+        return
+    _HEALTH_THREAD = threading.Thread(
+        target=_health_watcher_loop, args=(c,), daemon=True,
+        name="fzr_health_watcher")
+    _HEALTH_THREAD.start()
+
+
+def _dialog_last_activity(p: Dict[str, Any], now: Optional[float] = None) -> float:
+    """
+    Когда с покупателем последний раз общались.
+
+    v3.14: таймаут диалога считался от СОЗДАНИЯ заказа. С поэтапным
+    подтверждением шагов стало больше, и заказ мог отмениться посреди живого
+    диалога («данные не поступили», хотя покупатель отвечал минуту назад).
+    Теперь окно скользящее — от последнего сообщения покупателя или нашего
+    вопроса.
+
+    created_at берём ТОЛЬКО как fallback: если считать max(created_at, ...),
+    то у свежесозданной записи created_at всегда самый большой и окно
+    никогда не сдвигается — таймаут не наступит вообще.
+    """
+    now = now or time.time()
+    data = p.get("data") or {}
+    stamps: List[float] = []
+    for key in ("prompt_sent_at", "last_buyer_msg_at"):
+        try:
+            value = float(data.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            stamps.append(value)
+    if not stamps:
+        try:
+            stamps.append(float(p.get("created_at") or 0))
+        except (TypeError, ValueError):
+            pass
+    latest = max(stamps) if stamps else 0.0
+    # защита от «часов из будущего» в старой записи
+    return min(latest, now) if latest else now
+
+
+def _dialog_timeout_watcher_loop(c: "Cardinal") -> None:
+    logger.info("dialog_timeout_watcher started")
+    while not _SHUTDOWN_EVENT.is_set():
+        if _SHUTDOWN_EVENT.wait(DIALOG_WATCHER_INTERVAL):
+            break
+        try:
+            now = time.time()
+            cfg = load_config()
+            timeout = cfg["settings"]["dialog_timeout"]
+            reminder = cfg["settings"]["dialog_reminder"]
+            pending = _db_list_pending_dialogs()
+            for p in pending:
+                age = now - _dialog_last_activity(p, now)
+                # Скользящее окно нельзя растягивать бесконечно: покупатель,
+                # который раз в минуту пишет «?», иначе держал бы свою оплату
+                # в подвешенном состоянии сутками. Жёсткий потолок — от создания.
+                total_age = now - float(p.get("created_at") or now)
+                if age >= timeout or total_age >= timeout * _DIALOG_MAX_EXTENSION:
+                    _handle_dialog_timeout(c, p, cfg)
+                elif age >= reminder and not p.get("reminded_at"):
+                    _send_dialog_reminder(c, p, cfg)
+        except Exception as e:
+            logger.exception("dialog_timeout_watcher error", extra={"error": repr(e)})
+    logger.info("dialog_timeout_watcher finished")
+
+
+def _start_dialog_timeout_watcher(c: "Cardinal") -> None:
+    global _DIALOG_WATCHER_THREAD
+    if _DIALOG_WATCHER_THREAD and _DIALOG_WATCHER_THREAD.is_alive():
+        return
+    _DIALOG_WATCHER_THREAD = threading.Thread(
+        target=_dialog_timeout_watcher_loop,
+        args=(c,),
+        daemon=True,
+        name="fzr_dialog_timeout_watcher",
+    )
+    _DIALOG_WATCHER_THREAD.start()
+
+
+def _send_dialog_reminder(c: "Cardinal", p: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+    funpay_order_id = p["funpay_order_id"]
+    order = _db_get_order(funpay_order_id)
+    if not order or order.get("status") != "awaiting_metadata":
+        return
+    mapping = _get_mapping_by_id(order.get("mapping_id"))
+    data = p.get("data") or {}
+    meta_fields = data.get("metadata_fields") or (_build_metadata_fields(mapping) if mapping else [])
+    values = data.get("metadata_values") or {}
+    labels = data.get("metadata_labels") or {}
+    idx = data.get("metadata_index", 0)
+    # v3.14: диалог мог остановиться на подтверждении — напоминаем именно о нём,
+    # иначе покупатель получает вопрос о поле, которое он уже прислал
+    if data.get("awaiting_summary"):
+        prompt = _summary_question(meta_fields, values, labels)
+    elif isinstance(data.get("awaiting_confirm"), dict) and meta_fields:
+        confirm = data["awaiting_confirm"]
+        c_idx = int(confirm.get("index", idx) or 0)
+        field = meta_fields[c_idx] if 0 <= c_idx < len(meta_fields) else meta_fields[0]
+        prompt = _confirm_question(field, confirm.get("shown"))
+    elif meta_fields:
+        # напоминаем про поле, на котором реально остановились
+        if not (0 <= idx < len(meta_fields)):
+            idx = _next_unfilled_index(meta_fields, values)
+        field = meta_fields[idx] if idx < len(meta_fields) else meta_fields[0]
+        prompt = _format_metadata_prompt(cfg, field)
+    else:
+        prompt = cfg["templates"]["ask_metadata"]
+    order_proxy = _order_proxy(order)
+    buyer = getattr(order_proxy, "buyer_username", "") or ""
+    text = f"⏳ Напоминание: {prompt}\n\nЕсли данные не поступят, заказ будет отменён."
+    _send_buyer(c, getattr(order_proxy, "chat_id", None), text, buyer)
+    data["prompt_sent_at"] = time.time()
+    _db_upsert_pending({**p, "data": data})
+    _db_update_pending_reminded(funpay_order_id)
+def _handle_dialog_timeout(c: "Cardinal", p: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+    funpay_order_id = p["funpay_order_id"]
+    order = _db_get_order(funpay_order_id)
+    if not order or order.get("status") != "awaiting_metadata":
+        _db_remove_pending(funpay_order_id)
+        return
+    order_proxy = _order_proxy(order)
+    buyer = getattr(order_proxy, "buyer_username", "") or ""
+    chat_id = getattr(order_proxy, "chat_id", None)
+    tpl = cfg["templates"]["error"]
+    public = _public_buyer_error("dialog timeout")
+    text = render_template(
+        tpl,
+        default=DEFAULT_CONFIG["templates"]["error"],
+        error=public,
+        fzr_order_id="",
+        funpay_order_id=funpay_order_id,
+        buyer=buyer,
+    )
+    _send_buyer(c, chat_id, text, buyer)
+    _db_update_order(funpay_order_id, status="timeout", error="dialog timeout")
+    _db_remove_pending(funpay_order_id)
+    if cfg["settings"]["notify_on_error"]:
+        _notify_admin(c, f"FazerCards: таймаут диалога с покупателем\nЗаказ: {funpay_order_id}")
+# =============================================================================
+# event handlers
+# =============================================================================
+
+def _handle_new_order_inner(c: "Cardinal", e: NewOrderEvent) -> None:
+    cfg = load_config()
+    if not cfg["settings"]["auto_delivery"]:
+        return
+    if not cfg["api_key"]:
+        logger.warning("NEW_ORDER without API key")
+        if cfg["settings"]["notify_on_error"]:
+            _notify_admin(c, "FazerCards: получен NEW_ORDER, но API-ключ не настроен.")
+        return
+
+    order = e.order
+    order_id = str(order.id)
+    order_info = _serialize_order(order)
+    quantity = int(order.amount or 1)
+
+    mapping = find_mapping(e, c)
+    inserted = _db_insert_order({
+        "funpay_order_id": order_id,
+        "status": "reserving",
+        "buyer_id": order.buyer_id,
+        "buyer_username": _safe_username(order.buyer_username),
+        "chat_id": order.chat_id,
+        "quantity": quantity,
+        "order_info": order_info,
+    })
+    if not inserted:
+        logger.warning("duplicate NewOrderEvent", extra={"funpay_order_id": order_id, "event": "duplicate"})
+        return
+
+    _inc_metric("orders_received")
+
+    if not mapping:
+        _db_update_order(order_id, status="no_mapping")
+        _db_log_event(order_id, "no_mapping", {"description": order_info.get("description"), "lot_id": order_info.get("lot_id")})
+        logger.info("no mapping for order", extra={"funpay_order_id": order_id, "description": order_info.get("description")})
+        return
+
+    _db_update_order(order_id, mapping_id=mapping.get("id"), sku_id=mapping.get("fzr_sku_id"))
+    _db_log_event(order_id, "mapping_matched", {"mapping_id": mapping.get("id"), "sku_id": mapping.get("fzr_sku_id")})
+    _inc_metric("orders_matched")
+    logger.info("order matched to mapping", extra={"funpay_order_id": order_id, "mapping_id": mapping.get("id"), "sku_id": mapping.get("fzr_sku_id")})
+
+    if cfg["settings"]["ask_metadata"]:
+        # свежие options из API: серверы/регионы могли поменяться после привязки
+        meta_fields = _refresh_mapping_fields(mapping)
+        if meta_fields:
+            values: Dict[str, str] = {}
+            # select с единственным вариантом не спрашиваем
+            autofilled: List[Tuple[str, str, str]] = []
+            if cfg["settings"].get("auto_select_single", True):
+                autofilled = _autofill_single_options(meta_fields, values)
+                if autofilled:
+                    logger.info("select autofilled", extra={
+                        "funpay_order_id": order_id,
+                        "fields": [{"key": k, "value": v} for k, v, _ in autofilled]})
+                    _db_log_event(order_id, "select_autofilled",
+                                  {"fields": [{"key": k, "value": v, "label": l} for k, v, l in autofilled]})
+
+            idx = _next_unfilled_index(meta_fields, values)
+            if idx >= len(meta_fields):
+                # все поля закрылись автоподстановкой — спрашивать нечего
+                _greet_buyer(c, cfg, order, mapping, quantity, will_ask=False)
+                _db_update_order(order_id, status="processing", metadata_json=_to_json(values))
+                _submit_task(_process_order_creation, c, order_info, mapping, values)
+                return
+
+            # сначала приветствие («заказ принят, сейчас спрошу»), потом вопрос
+            _greet_buyer(c, cfg, order, mapping, quantity, will_ask=True)
+            asked = _unfilled_count(meta_fields, values)
+            prompt_text = _format_metadata_prompt(cfg, meta_fields[idx], mapping,
+                                                  index=0, total=asked)
+            _send_buyer(c, order.chat_id, prompt_text, order.buyer_username)
+            _db_upsert_pending({
+                "funpay_order_id": order_id,
+                "buyer_id": order.buyer_id,
+                "chat_id": order.chat_id,
+                "mapping_id": mapping["id"],
+                "step": "await_metadata",
+                "data": {"metadata_fields": meta_fields, "metadata_index": idx,
+                         "metadata_values": values, "metadata_labels": {},
+                         # какие поля закрыла автоподстановка: при «-» на сводке
+                         # их не нужно спрашивать заново
+                         "autofilled_keys": [k for k, _v, _l in autofilled],
+                         "prompt_sent_at": time.time()},
+            })
+            _db_update_order(order_id, status="awaiting_metadata")
+            logger.info("awaiting metadata", extra={"funpay_order_id": order_id, "fields": [f.get("key") for f in meta_fields]})
+            return
+
+    _greet_buyer(c, cfg, order, mapping, quantity, will_ask=False)
+    _db_update_order(order_id, status="processing")
+    _submit_task(_process_order_creation, c, order_info, mapping, {})
+def handle_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
+    try:
+        _handle_new_order_inner(c, e)
+    except Exception as ex:
+        logger.exception("handle_new_order crashed", extra={"error": repr(ex)})
+        try:
+            order = getattr(e, "order", None)
+            if order:
+                _send_buyer(c, getattr(order, "chat_id", None), "Извините, произошёл сбой при обработке заказа. Продавец уведомлен.", getattr(order, "buyer_username", None))
+                cfg = load_config()
+                if cfg["settings"]["notify_on_error"]:
+                    _notify_admin(c, f"FazerCards: handle_new_order crashed\n{ex}")
+        except Exception:
+            pass
+
+
+def _finish_metadata_dialog(c: "Cardinal", cfg: Dict[str, Any], mapping: Dict[str, Any],
+                            funpay_order_id: Any, order_info: Dict[str, Any],
+                            chat_id: Any, buyer: str,
+                            metadata_values: Dict[str, str],
+                            labels: Optional[Dict[str, Any]] = None,
+                            prefix: str = "") -> None:
+    """Данные собраны и подтверждены — запускаем закупку."""
+    _db_remove_pending(funpay_order_id)
+    _db_update_order(funpay_order_id, status="processing",
+                     metadata_json=_to_json(metadata_values))
+    _db_log_event(funpay_order_id, "metadata_collected",
+                  {"metadata": _redact_sensitive(metadata_values),
+                   "labels": labels or {}})
+    logger.info("metadata collected, submitting order",
+                extra={"funpay_order_id": funpay_order_id,
+                       "metadata": _redact_sensitive(metadata_values)})
+    progress = _progress_text(cfg, mapping)
+    parts = [p for p in (prefix, progress) if p]
+    if parts:
+        _send_buyer(c, chat_id, "\n\n".join(parts), buyer)
+    _submit_task(_process_order_creation, c, order_info, mapping, metadata_values)
+
+
+def _save_pending(funpay_order_id: Any, buyer_id: Any, chat_id: Any,
+                  mapping_id: Any, data: Dict[str, Any]) -> None:
+    _db_upsert_pending({
+        "funpay_order_id": funpay_order_id,
+        "buyer_id": buyer_id,
+        "chat_id": chat_id,
+        "mapping_id": mapping_id,
+        "step": "await_metadata",
+        "data": data,
+    })
+    # покупатель снова в диалоге: разрешаем следующее напоминание
+    _db_clear_pending_reminded(funpay_order_id)
+
+
+def _ask_field(c: "Cardinal", cfg: Dict[str, Any], mapping: Dict[str, Any],
+               meta_fields: List[Dict[str, Any]], values: Dict[str, str],
+               idx: int, chat_id: Any, buyer: str, prefix: str = "") -> None:
+    """Задаёт вопрос по полю idx с корректным счётчиком шагов."""
+    total_asked = _unfilled_count(meta_fields, {}) or len(meta_fields)
+    answered = sum(1 for f in meta_fields if str(f.get("key") or "") in values)
+    prompt = _format_metadata_prompt(cfg, meta_fields[idx], mapping,
+                                     index=answered, total=total_asked)
+    text = f"{prefix}\n\n{prompt}" if prefix else prompt
+    _send_buyer(c, chat_id, text, buyer)
+
+
+def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
+    msg = e.message
+    if not msg.text or not msg.text.strip():
+        return
+    # Системные сообщения FunPay («заказ оплачен», «отзыв изменён») и наши же
+    # ответы через FPC не должны считаться ответом покупателя: без этого
+    # фильтра плагин «съедает» шаг диалога системным текстом.
+    msg_type = getattr(msg, "type", None)
+    non_system = getattr(getattr(fp_enums, "MessageTypes", None), "NON_SYSTEM", None)
+    if msg_type is not None and non_system is not None and msg_type is not non_system:
+        return
+    if getattr(msg, "by_bot", False):
+        return
+    if msg.author_id == 0:      # арбитраж / поддержка FunPay
+        return
+    if msg.author_id and c.account and msg.author_id == c.account.id:
+        return
+
+    text = msg.text.strip()
+    buyer_id = msg.author_id
+    chat_id = getattr(msg, "chat_id", None)
+
+    if text.startswith("/") and text.lower() != "/cancel":
+        return
+    pending = _db_get_pending_by_buyer(buyer_id, chat_id)
+    if not pending:
+        return
+
+    # Sync chat_id: messages arrive with numeric chat_id, orders store chat_id as string.
+    if chat_id is not None:
+        pending["chat_id"] = chat_id
+
+    mapping_id = pending.get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        logger.info("new_message mapping missing, removing pending", extra={"funpay_order_id": pending["funpay_order_id"]})
+        _db_remove_pending(pending["funpay_order_id"])
+        return
+
+    funpay_order_id = pending["funpay_order_id"]
+    order = _db_get_order(funpay_order_id)
+    if not order:
+        logger.info("new_message order missing, removing pending", extra={"funpay_order_id": funpay_order_id})
+        _db_remove_pending(funpay_order_id)
+        return
+
+    if _is_order_terminal(order.get("status")) or order.get("completed_notification_sent") == 2:
+        logger.info("new_message order terminal or delivered", extra={"funpay_order_id": funpay_order_id, "status": order.get("status")})
+        _db_remove_pending(funpay_order_id)
+        return
+
+    if order.get("status") != "awaiting_metadata":
+        logger.info("new_message order not awaiting metadata", extra={"funpay_order_id": funpay_order_id, "status": order.get("status")})
+        return
+
+    order_info = order.get("order_info") or {}
+    buyer = order.get("buyer_username") or ""
+    cfg = load_config()
+    data = pending.get("data") or {}
+    meta_fields = data.get("metadata_fields") or []
+    idx = data.get("metadata_index", 0)
+
+    # Диалоги, начатые версией <= 2.9.9, сохранены без type/options —
+    # поднимаем варианты из mapping['fields'], чтобы select заработал на лету.
+    if meta_fields:
+        enriched = _enrich_fields_with_options(meta_fields, mapping)
+        if enriched != meta_fields:
+            meta_fields = enriched
+            data["metadata_fields"] = meta_fields
+
+    # legacy pending without fields
+    if not meta_fields and mapping.get("metadata_key"):
+        key = mapping["metadata_key"]
+        label = mapping.get("metadata_prompt") or key
+        meta_fields = _enrich_fields_with_options(
+            [{"key": key, "label": label, "validation": _infer_validation(key, label)}], mapping)
+        data["metadata_fields"] = meta_fields
+        data["metadata_index"] = idx = 0
+        data["metadata_values"] = {}
+
+    if not meta_fields:
+        _db_remove_pending(funpay_order_id)
+        _db_update_order(funpay_order_id, status="processing")
+        _submit_task(_process_order_creation, c, order_info, mapping, {})
+        return
+
+    if text.lower() == "/cancel":
+        _db_remove_pending(funpay_order_id)
+        _mark_failed(c, funpay_order_id, order.get("fzr_order_id") or "", "buyer cancelled metadata input", public_error="Ввод данных отменён. Свяжитесь с продавцом, если это ошибка.")
+        return
+
+    metadata_values: Dict[str, str] = data.get("metadata_values", {}) or {}
+    labels: Dict[str, Any] = data.get("metadata_labels") or {}
+    autofilled_keys = set(data.get("autofilled_keys") or [])
+    # Скользящее окно таймаута: покупатель только что писал — заказ отменять
+    # нельзя. Записываем сразу, потому что часть ветвей ниже выходит по return
+    # (ошибка валидации, непонятный ответ) и до финального _save_pending не
+    # доходит — раньше такие диалоги умирали по таймауту «от создания заказа».
+    data["last_buyer_msg_at"] = time.time()
+    _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+
+    # -------------------------------------------------------------------------
+    # v3.14, шаг 1: ждём подтверждение финальной сводки
+    # -------------------------------------------------------------------------
+    if data.get("awaiting_summary"):
+        answer = _parse_yes_no(text)
+        if answer is True:
+            data.pop("awaiting_summary", None)
+            _db_log_event(funpay_order_id, "buyer_confirmed_summary", {})
+            _finish_metadata_dialog(c, cfg, mapping, funpay_order_id, order_info,
+                                    chat_id, buyer, metadata_values, labels,
+                                    prefix="Спасибо, данные подтверждены.")
+            return
+        if answer is False:
+            # сбрасываем всё, что вводил покупатель; автоподстановки оставляем
+            kept = {k: v for k, v in metadata_values.items() if k in autofilled_keys}
+            kept_labels = {k: v for k, v in labels.items() if k in autofilled_keys}
+            data["metadata_values"] = kept
+            data["metadata_labels"] = kept_labels
+            data.pop("awaiting_summary", None)
+            data.pop("awaiting_confirm", None)
+            new_idx = _next_unfilled_index(meta_fields, kept, 0)
+            data["metadata_index"] = new_idx
+            data["prompt_sent_at"] = time.time()
+            _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+            _db_log_event(funpay_order_id, "buyer_rejected_summary", {})
+            if new_idx < len(meta_fields):
+                _ask_field(c, cfg, mapping, meta_fields, kept, new_idx, chat_id, buyer,
+                           prefix="Хорошо, начнём заново.")
+            return
+        if _is_smalltalk(text) and cfg["settings"].get("smalltalk_filter", True):
+            return
+        _send_buyer(c, chat_id,
+                    _summary_question(meta_fields, metadata_values, labels), buyer)
+        return
+
+    # -------------------------------------------------------------------------
+    # v3.14, шаг 2: ждём подтверждение одного значения
+    # -------------------------------------------------------------------------
+    confirm = data.get("awaiting_confirm")
+    if isinstance(confirm, dict):
+        c_idx = int(confirm.get("index", idx) or 0)
+        if not (0 <= c_idx < len(meta_fields)):
+            data.pop("awaiting_confirm", None)
+        else:
+            field = meta_fields[c_idx]
+            answer = _parse_yes_no(text)
+            if answer is True:
+                data.pop("awaiting_confirm", None)
+                metadata_values[str(field.get("key") or "")] = confirm.get("value")
+                data["metadata_values"] = metadata_values
+                _db_log_event(funpay_order_id, "buyer_confirmed_value",
+                              {"key": field.get("key")})
+                next_idx = _next_unfilled_index(meta_fields, metadata_values, c_idx + 1)
+                if next_idx < len(meta_fields):
+                    data["metadata_index"] = next_idx
+                    data["prompt_sent_at"] = time.time()
+                    _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+                    _ask_field(c, cfg, mapping, meta_fields, metadata_values,
+                               next_idx, chat_id, buyer, prefix="Принято.")
+                    return
+                # все поля собраны: сводка или сразу закупка
+                if _confirm_enabled(cfg, "confirm_summary") and len(meta_fields) > 1:
+                    data["awaiting_summary"] = True
+                    data["metadata_index"] = len(meta_fields)
+                    data["prompt_sent_at"] = time.time()
+                    _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+                    _send_buyer(c, chat_id,
+                                _summary_question(meta_fields, metadata_values, labels),
+                                buyer)
+                    return
+                _finish_metadata_dialog(c, cfg, mapping, funpay_order_id, order_info,
+                                        chat_id, buyer, metadata_values, labels,
+                                        prefix="Принято.")
+                return
+            if answer is False:
+                data.pop("awaiting_confirm", None)
+                data["metadata_index"] = c_idx
+                data["prompt_sent_at"] = time.time()
+                _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+                _db_log_event(funpay_order_id, "buyer_rejected_value",
+                              {"key": field.get("key")})
+                _ask_field(c, cfg, mapping, meta_fields, metadata_values, c_idx,
+                           chat_id, buyer, prefix="Хорошо, пришлите значение заново.")
+                return
+            # Не «+» и не «-». Покупатель мог сразу прислать исправленное
+            # значение — принимаем его и снова спрашиваем подтверждение.
+            candidate = _strip_smalltalk_prefix(text)
+            if _is_smalltalk(candidate) and cfg["settings"].get("smalltalk_filter", True):
+                _send_buyer(c, chat_id, _confirm_question(field, confirm.get("shown")), buyer)
+                return
+            if _is_select_field(field):
+                resolved, error = _resolve_select_value(field, candidate)
+            else:
+                error = _validate_metadata_value(field.get("key", ""),
+                                                 candidate, field.get("validation"))
+                resolved = _normalize_metadata_value(field.get("validation"), candidate) if not error else None
+            if error or resolved in (None, ""):
+                _send_buyer(c, chat_id,
+                            "Не понял ответ.\n\n" + _confirm_question(field, confirm.get("shown")),
+                            buyer)
+                return
+            shown = resolved
+            if _is_select_field(field):
+                shown = next((o["label"] for o in _field_options(field)
+                              if o["value"] == resolved), resolved)
+                labels[str(field.get("key") or "")] = shown
+                data["metadata_labels"] = labels
+            data["awaiting_confirm"] = {"index": c_idx, "key": field.get("key"),
+                                        "value": resolved, "shown": shown}
+            data["prompt_sent_at"] = time.time()
+            _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+            _send_buyer(c, chat_id, _confirm_question(field, shown), buyer)
+            return
+
+    if idx >= len(meta_fields):
+        # all collected already; process
+        _finish_metadata_dialog(c, cfg, mapping, funpay_order_id, order_info,
+                                chat_id, buyer, metadata_values, labels)
+        return
+
+    # -------------------------------------------------------------------------
+    # обычный ввод значения
+    # -------------------------------------------------------------------------
+    field = meta_fields[idx]
+    # «Привет», «спасибо», «?» — не ответ на вопрос. Молча игнорируем, чтобы
+    # не показывать покупателю «❌ некорректное значение» на приветствие.
+    if cfg["settings"].get("smalltalk_filter", True) and _is_smalltalk(text):
+        logger.info("smalltalk ignored", extra={"funpay_order_id": funpay_order_id})
+        # раз в диалоге мягко напоминаем, что именно от него ждём
+        if not data.get("smalltalk_hinted"):
+            data["smalltalk_hinted"] = True
+            _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+            _ask_field(c, cfg, mapping, meta_fields, metadata_values, idx,
+                       chat_id, buyer, prefix="Здравствуйте! Жду данные для выдачи.")
+        return
+    # «привет, vasya_pupkin» — снимаем приветствие и берём остаток
+    text = _strip_smalltalk_prefix(text)
+
+    if _is_select_field(field):
+        resolved, error = _resolve_select_value(field, text)
+        if error:
+            options_text = _format_select_options(field)
+            hint = f"\n\n{options_text}" if options_text else ""
+            _send_buyer(c, chat_id, f"❌ {error}{hint}", buyer)
+            return
+        value_to_store = resolved
+        # сохраняем и подпись выбора: в поддержке важно знать, что видел покупатель
+        chosen_label = next((o["label"] for o in _field_options(field) if o["value"] == resolved), resolved)
+        labels[field["key"]] = chosen_label
+        data["metadata_labels"] = labels
+    else:
+        validation = field.get("validation")
+        error = _validate_metadata_value(field.get("key", ""), text, validation)
+        if error:
+            # к ошибке добавляем подсказку про формат — без неё покупатель
+            # присылает то же самое второй раз
+            hint = _field_hint(field)
+            suffix = f"\n\n{hint}" if hint else "\n\nПопробуйте ещё раз."
+            _send_buyer(c, chat_id, f"❌ {error}{suffix}", buyer)
+            return
+        # ссылку вытаскиваем из текста, @ и мусор из ника убираем
+        value_to_store = _normalize_metadata_value(validation, text)
+        if value_to_store != text.strip():
+            logger.info("metadata value normalized", extra={
+                "funpay_order_id": funpay_order_id, "key": field.get("key"),
+                "validation": validation})
+
+    logger.info("metadata value received", extra={"funpay_order_id": funpay_order_id, "key": field.get("key"), "index": idx + 1})
+    shown = labels.get(field["key"]) or value_to_store
+
+    # v3.14: поэтапное подтверждение. Значение пока НЕ считается принятым —
+    # ждём «+». Ошибка в логине Steam необратима, поэтому лучше один вопрос.
+    if _confirm_enabled(cfg, "confirm_metadata"):
+        data["awaiting_confirm"] = {"index": idx, "key": field.get("key"),
+                                    "value": value_to_store, "shown": shown}
+        data["metadata_index"] = idx
+        data["prompt_sent_at"] = time.time()
+        _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+        _send_buyer(c, chat_id, _confirm_question(field, shown), buyer)
+        return
+
+    metadata_values[field["key"]] = value_to_store
+    accepted = f"✔ {field.get('label') or field['key']}: {shown}"
+    # пропускаем поля, уже закрытые автоподстановкой
+    idx = _next_unfilled_index(meta_fields, metadata_values, idx + 1)
+    if idx < len(meta_fields):
+        data["metadata_index"] = idx
+        data["metadata_values"] = metadata_values
+        data["prompt_sent_at"] = time.time()
+        _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+        _ask_field(c, cfg, mapping, meta_fields, metadata_values, idx,
+                   chat_id, buyer, prefix=accepted)
+        return
+
+    if _confirm_enabled(cfg, "confirm_summary") and len(meta_fields) > 1:
+        data["metadata_values"] = metadata_values
+        data["awaiting_summary"] = True
+        data["metadata_index"] = len(meta_fields)
+        data["prompt_sent_at"] = time.time()
+        _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+        _send_buyer(c, chat_id,
+                    f"{accepted}\n\n" + _summary_question(meta_fields, metadata_values, labels),
+                    buyer)
+        return
+
+    _finish_metadata_dialog(c, cfg, mapping, funpay_order_id, order_info,
+                            chat_id, buyer, metadata_values, labels, prefix=accepted)
+
+
+def handle_new_message(c: "Cardinal", e: NewMessageEvent) -> None:
+    try:
+        _handle_new_message_inner(c, e)
+    except Exception as ex:
+        logger.exception("handle_new_message crashed", extra={"error": repr(ex)})
+
+
+def _handle_order_status_changed_inner(c: "Cardinal", e: OrderStatusChangedEvent) -> None:
+    order_id = getattr(e.order, "id", None)
+    if order_id is None:
+        return
+    order_id = str(order_id)
+    order = _db_get_order(order_id)
+    if not order:
+        return
+    if _is_order_terminal(order.get("status")) or order.get("completed_notification_sent") == 2:
+        logger.info("order_status_changed ignored: order terminal or delivered", extra={"funpay_order_id": order_id, "status": order.get("status")})
+        return
+    fp_status = getattr(e.order, "status", None)
+    if fp_status is None:
+        return
+    if fp_status in (fp_enums.OrderStatuses.REFUNDED, fp_enums.OrderStatuses.PARTIALLY_REFUNDED, fp_enums.OrderStatuses.UNPAID):
+        _db_log_event(order_id, "funpay_status_changed", {"fp_status": str(fp_status), "reason": "cancelled_or_refunded"})
+        _cancel_fzr_order_if_enabled(c, order_id, order.get("fzr_order_id") or None)
+        _mark_failed(c, order_id, order.get("fzr_order_id") or "", "FunPay order cancelled or refunded", public_error="Заказ отменён или возвращён.")
+    elif fp_status == fp_enums.OrderStatuses.CLOSED:
+        if order.get("status") != "completed" and order.get("completed_notification_sent") != 2:
+            _db_update_order(order_id, status="needs_review", error="FunPay order closed before delivery confirmation")
+            _db_log_event(order_id, "funpay_status_changed", {"fp_status": str(fp_status), "reason": "closed_before_delivery"})
+            _notify_admin(c, f"⚠️ FunPay заказ {order_id} закрыт до подтверждения выдачи. Проверьте вручную.")
+            logger.info("FunPay order closed before delivery confirmation, marked for review", extra={"funpay_order_id": order_id, "fzr_status": order.get("status")})
+        else:
+            _db_log_event(order_id, "funpay_status_changed", {"fp_status": str(fp_status), "reason": "closed_after_delivery"})
+            logger.info("FunPay order closed after delivery", extra={"funpay_order_id": order_id})
+
+
+def handle_order_status_changed(c: "Cardinal", e: OrderStatusChangedEvent) -> None:
+    try:
+        _handle_order_status_changed_inner(c, e)
+    except Exception as ex:
+        logger.exception("handle_order_status_changed crashed", extra={"error": repr(ex)})
+
+
+# =============================================================================
+# Telegram UI
+# =============================================================================
+
+def _balance_button_label(cfg: Dict[str, Any]) -> str:
+    """
+    Подпись кнопки баланса в главном меню (v3.19).
+
+    Минус выносим прямо на кнопку: продавец видит долг, не заходя в раздел.
+    """
+    if not cfg["settings"].get("local_balance", True):
+        return "💰 Баланс"
+    try:
+        balance = _db_local_balance()
+    except Exception:
+        return "💰 Баланс"
+    if balance < 0:
+        return f"🔴 Баланс: {_fmt_usd(balance)}"
+    try:
+        low = float(cfg["settings"].get("local_balance_low", 0) or 0)
+    except (TypeError, ValueError):
+        low = 0.0
+    if low > 0 and balance < low:
+        return f"🟡 Баланс: {_fmt_usd(balance)}"
+    return f"💼 Баланс: {_fmt_usd(balance)}"
+
+
+def _main_keyboard() -> InlineKeyboardMarkup:
+    cfg = load_config()
+    counts = _db_status_counts()
+    active = sum(counts.get(k, 0) for k in _ACTIVE_STATUSES)
+    problems = sum(counts.get(k, 0) for k in _PROBLEM_STATUSES)
+    mappings = get_mappings()
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    # первый ряд — то, без чего плагин не работает
+    kb.add(
+        _inline_button("🔑 API ключ" + ("" if cfg.get("api_key") else " ⚠️"),
+                       callback_data=f"{CB_PREFIX}:apikey"),
+        _inline_button(_balance_button_label(cfg), callback_data=f"{CB_PREFIX}:balance"),
+    )
+    kb.add(
+        _inline_button("📦 Каталог", callback_data=f"{CB_PREFIX}:catalog:"),
+        _inline_button("🆕 Создать лот", callback_data=f"{CB_PREFIX}:create_lot"),
+    )
+    kb.add(
+        _inline_button(f"🔗 Привязки ({len(mappings)})", callback_data=f"{CB_PREFIX}:mappings"),
+        _inline_button("➕ Добавить", callback_data=f"{CB_PREFIX}:mapping_add"),
+    )
+    orders_label = "📋 Заказы"
+    if active:
+        orders_label += f" · ⏳{active}"
+    kb.add(
+        _inline_button(orders_label, callback_data=f"{CB_PREFIX}:orders:all:0"),
+        _inline_button("⚙️ Настройки", callback_data=f"{CB_PREFIX}:settings"),
+    )
+    # проблемные заказы — отдельной кнопкой, чтобы не искать их фильтром
+    if problems:
+        kb.add(_inline_button(f"⚠️ Проблемные заказы ({problems})",
+                              callback_data=f"{CB_PREFIX}:orders:problems:0", style="danger"))
+    # ждут баланса — отдельно от прочих проблем: тут нужно просто пополнить
+    # и нажать «Повторить», а не разбираться в причине
+    awaiting_funds = counts.get(OrderStatus.AWAITING_FUNDS.value, 0)
+    if awaiting_funds:
+        kb.add(_inline_button(f"💸 Ждут баланса ({awaiting_funds})",
+                              callback_data=f"{CB_PREFIX}:funds_list", style="danger"))
+    # чаты ручных услуг — только если переписка вообще есть
+    manual_chats = _db_manual_chat_orders()
+    if manual_chats:
+        kb.add(_inline_button(f"💬 Чаты ручных услуг ({len(manual_chats)})",
+                              callback_data=f"{CB_PREFIX}:mchat_list"))
+    kb.add(
+        _inline_button("📊 Метрики", callback_data=f"{CB_PREFIX}:metrics"),
+        _inline_button("❌ Закрыть", callback_data=f"{CB_PREFIX}:close"),
+    )
+    return kb
+
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+_ORDER_STATUS_EMOJI = {
+    "reserving": "⏳",
+    "awaiting_metadata": "💬",
+    "processing": "🔄",
+    "awaiting_funds": "💸",
+    "pending": "⏳",
+    "completed": "✅",
+    "failed": "❌",
+    "timeout": "⏰",
+    "no_mapping": "❓",
+    "needs_review": "🔍",
+    "delivery_failed": "📤",
+    "refunded": "↩️",
+}
+
+_ORDER_STATUS_LABEL = {
+    "reserving": "получен",
+    "awaiting_metadata": "ожидает данных",
+    "processing": "обработка",
+    "awaiting_funds": "нужен баланс",
+    "pending": "FZR pending",
+    "completed": "выдан",
+    "failed": "ошибка",
+    "timeout": "таймаут",
+    "no_mapping": "лот не привязан",
+    "needs_review": "на проверке",
+    "delivery_failed": "не доставлено",
+    "refunded": "возврат",
+    # псевдо-фильтры списка заказов
+    "all": "все",
+    "active": "в работе",
+    "problems": "требуют внимания",
+    "foreign": "чужие лоты",
+}
+
+
+def _order_profit_block(order: Dict[str, Any]) -> str:
+    """
+    Блок «экономика заказа» в карточке (v3.18).
+
+    Показываем сохранённый расчёт; если его нет (заказ до обновления или отчёт
+    выключен) — считаем на месте по текущему курсу и настройкам, но помечаем
+    это, чтобы цифры не воспринимались как «зафиксированные при закупке».
+    """
+    bd = _from_json(order.get("profit_json")) if order.get("profit_json") else None
+    live = False
+    if not isinstance(bd, dict) or bd.get("price_rub") is None:
+        mapping = _get_mapping_by_id(order.get("mapping_id"))
+        bd = _profit_breakdown(load_config(), order, mapping)
+        live = True
+    if bd.get("price_rub") is None and bd.get("cost_rub") is None:
+        return ""
+
+    def _money(value: Optional[Any]) -> str:
+        if value in (None, ""):
+            return "—"
+        try:
+            return f"{float(value):,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+        except (TypeError, ValueError):
+            return "—"
+
+    fee_pct = bd.get("fee_percent") or 0
+    lines = [
+        f"🏷 Цена на FunPay: <b>{_money(bd.get('price_rub'))}</b>",
+        f"➖ Комиссия вывода {fee_pct:g}%: {_money(bd.get('fee_rub'))}",
+        f"💵 На руки: <b>{_money(bd.get('net_rub'))}</b>",
+        f"📦 Себестоимость: {_money(bd.get('cost_rub'))}"
+        + (f" <i>({float(bd['cost_usd']):.2f} $)</i>" if bd.get("cost_usd") not in (None, "") else ""),
+    ]
+    profit = bd.get("profit_rub")
+    if profit is not None:
+        icon = "📈" if float(profit) > 0 else ("➖" if float(profit) == 0 else "📉")
+        margin = bd.get("margin_percent")
+        lines.append(f"{icon} <b>Прибыль: {_money(profit)}</b>"
+                     + (f" <i>({float(margin):+g}%)</i>" if margin is not None else ""))
+    note = ("\n<i>Расчёт по текущему курсу — при закупке он мог быть другим.</i>"
+            if live else "")
+    return f"\n<blockquote><b>💰 Экономика заказа</b>\n" + "\n".join(lines) + f"{note}</blockquote>\n"
+
+
+def _order_status_text(status: Optional[str]) -> str:
+    return f"{_ORDER_STATUS_EMOJI.get(status, '❔')} {_ORDER_STATUS_LABEL.get(status, status or 'unknown')}"
+
+
+# Человеческие названия событий для карточки заказа
+_EVENT_LABELS = {
+    "order_received": "заказ получен",
+    "mapping_matched": "найдена привязка",
+    "no_mapping": "нет привязки",
+    "select_autofilled": "вариант подставлен автоматически",
+    "metadata_collected": "данные получены",
+    "player_id_validated": "ID игрока подтверждён",
+    "steam_login_checked": "логин Steam проверен",
+    "fzr_order_created": "заказ создан в FazerCards",
+    "fzr_create_failed": "ошибка создания заказа",
+    "order_delivered": "выдано покупателю",
+    "batch_partial_failure": "часть заказов не выполнена",
+    "fzr_order_cancelled": "заказ FazerCards отменён",
+    "order_cancelled": "отменён",
+    "admin_retry": "повтор администратором",
+    "awaiting_funds": "не хватило баланса — ждём пополнения",
+    "awaiting_funds_detail": "расчёт нехватки средств",
+    "awaiting_funds_buyer_notified": "покупатель предупреждён о задержке",
+    "order_created": "заказ зарегистрирован",
+    "order_status_forced": "статус изменён вручную",
+    "funds_retry": "повторная попытка после пополнения",
+    "funds_retry_failed": "повтор не удался: баланса всё ещё не хватает",
+    "funds_refund_warned": "покупатель предупреждён о возможном возврате",
+    "funds_refunded": "оформлен автовозврат",
+    "funds_refund_failed": "автовозврат не удался",
+    "status_forced": "статус изменён вручную",
+    "delivery_failed": "не удалось доставить",
+    "dialog_timeout": "покупатель не ответил",
+}
+
+
+def _orders_filter_sql(status: Optional[str]) -> Tuple[str, List[Any]]:
+    """
+    WHERE-часть для фильтра списка заказов.
+
+    Кроме конкретного статуса поддерживает псевдо-фильтры:
+    'problems' — всё, что требует вмешательства продавца, 'active' — в работе,
+    'foreign' — заказы чужих (непривязанных) лотов.
+
+    'all' намеренно исключает чужие заказы: продавец торгует не только через
+    FazerCards, и его собственные лоты не должны тонуть в чужих.
+    """
+    if not status or status == "all":
+        marks = ",".join("?" * len(_FOREIGN_STATUSES))
+        return f" WHERE status NOT IN ({marks})", list(_FOREIGN_STATUSES)
+    if status == "problems":
+        marks = ",".join("?" * len(_PROBLEM_STATUSES))
+        return f" WHERE status IN ({marks})", list(_PROBLEM_STATUSES)
+    if status == "active":
+        marks = ",".join("?" * len(_ACTIVE_STATUSES))
+        return f" WHERE status IN ({marks})", list(_ACTIVE_STATUSES)
+    if status == "foreign":
+        marks = ",".join("?" * len(_FOREIGN_STATUSES))
+        return f" WHERE status IN ({marks})", list(_FOREIGN_STATUSES)
+    return " WHERE status=?", [status]
+
+
+def _db_get_orders(status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    if not _DB_INITIALIZED:
+        _db_init()
+    where, params = _orders_filter_sql(status)
+    sql = "SELECT * FROM orders" + where + " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+    params = list(params) + [limit, offset]
+    with _DB_LOCK:
+        rows = _db_connect().execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["metadata"] = _from_json(d.pop("metadata_json", None))
+            d["order_info"] = _from_json(d.pop("order_json", None))
+            d["result"] = _from_json(d.pop("result_json", None))
+            out.append(d)
+        return out
+
+
+def _db_count_orders(status: Optional[str] = None) -> int:
+    if not _DB_INITIALIZED:
+        _db_init()
+    where, params = _orders_filter_sql(status)
+    with _DB_LOCK:
+        row = _db_connect().execute("SELECT COUNT(*) FROM orders" + where, params).fetchone()
+        return row[0] if row else 0
+
+
+def _db_purge_foreign_orders(keep_days: float = _FOREIGN_KEEP_DAYS) -> int:
+    """
+    Удаляет старые заказы непривязанных лотов.
+
+    Они нужны лишь для разбора «почему не выдалось» в первые дни; дальше это
+    просто мусор от торговли другими товарами, растящий БД.
+    keep_days=0 — удалить все (кнопка «Очистить список»).
+    """
+    if not _DB_INITIALIZED:
+        _db_init()
+    cutoff = time.time() - max(0.0, float(keep_days)) * 86400
+    marks = ",".join("?" * len(_FOREIGN_STATUSES))
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            cur = conn.execute(
+                f"DELETE FROM orders WHERE status IN ({marks}) AND COALESCE(updated_at, 0) <= ?",
+                list(_FOREIGN_STATUSES) + [cutoff])
+            removed = cur.rowcount or 0
+            conn.commit()
+        if removed:
+            logger.info("foreign orders purged", extra={"count": removed, "keep_days": keep_days})
+        return removed
+    except Exception as e:
+        logger.warning("purge foreign orders failed", extra={"error": repr(e)})
+        return 0
+
+
+def _short_sku(sku: Optional[str]) -> str:
+    """SKU для списка: 'topups:mobile_legends:ml-100' -> 'mobile_legends / ml-100'."""
+    parts = str(sku or "").split(":")
+    if len(parts) >= 3:
+        return f"{parts[1]} / {parts[2]}"
+    return str(sku or "—")
+
+
+def _ago(ts: Optional[float]) -> str:
+    """Человеческое «сколько прошло» — в списке важнее точной даты."""
+    if not ts:
+        return "—"
+    delta = max(0, int(time.time() - float(ts)))
+    if delta < 60:
+        return f"{delta} с назад"
+    if delta < 3600:
+        return f"{delta // 60} мин назад"
+    if delta < 86400:
+        return f"{delta // 3600} ч назад"
+    if delta < 7 * 86400:
+        return f"{delta // 86400} дн назад"
+    return time.strftime("%d.%m.%Y", time.localtime(float(ts)))
+
+
+def _duration(seconds: Optional[float]) -> str:
+    """Длительность без «назад»: «1 ч 5 мин». Для фраз вида «ждал X»."""
+    if not seconds or seconds < 0:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} с"
+    minutes, _ = divmod(seconds, 60)
+    return _fmt_minutes(minutes)
+
+
+def _show_orders(c: "Cardinal", call: Any, filter_status: str = "all", page: int = 0) -> None:
+    per_page = _ORDERS_PER_PAGE
+    total = _db_count_orders(filter_status)
+    max_page = max(0, (total - 1) // per_page)
+    page = max(0, min(page, max_page))
+    orders = _db_get_orders(filter_status, per_page, page * per_page)
+
+    label = _ORDER_STATUS_LABEL.get(filter_status, filter_status)
+    header = (f"📋 <b>Заказы</b> · {_esc(label)}\n"
+              f"<i>всего {total}" + (f", стр. {page + 1}/{max_page + 1}" if total else "") + "</i>")
+    lines = [header]
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    if not orders:
+        if filter_status == "foreign":
+            lines.append("<blockquote><i>Заказов по чужим лотам нет.</i></blockquote>")
+        else:
+            lines.append("<blockquote><i>Заказов с таким статусом нет.</i></blockquote>")
+    else:
+        rows: List[Any] = []
+        for idx, o in enumerate(orders, start=page * per_page + 1):
+            status_text = _order_status_text(o.get("status"))
+            order_id = _esc(o["funpay_order_id"])
+            buyer = _esc(o.get("buyer_username") or "—")
+            qty = o.get("quantity")
+            qty_text = f" ×{_esc(int(qty))}" if qty and float(qty) != 1 else ""
+            err = o.get("error")
+            err_line = f"\n<i>⚠️ {_esc(str(err)[:80])}</i>" if err else ""
+            lines.append(
+                f"<blockquote><b>{idx}.</b> {status_text}  <code>{order_id}</code>{qty_text}\n"
+                f"🛒 {_esc(_short_sku(o.get('sku_id')))}\n"
+                f"👤 {buyer} · 🕐 {_esc(_ago(o.get('updated_at')))}{err_line}</blockquote>"
+            )
+            # одна кнопка на заказ: действия — внутри карточки, иначе клавиатура нечитаема
+            rows.append(_inline_button(f"{idx}. {status_text} {o['funpay_order_id']}",
+                                       callback_data=f"{CB_PREFIX}:order_view:{o['funpay_order_id']}"))
+        for i in range(0, len(rows), 2):
+            kb.add(*rows[i:i + 2])
+
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=f"{CB_PREFIX}:orders:{filter_status}:{page - 1}"))
+    if (page + 1) * per_page < total:
+        nav.append(_inline_button("➡️", callback_data=f"{CB_PREFIX}:orders:{filter_status}:{page + 1}"))
+    if nav:
+        kb.add(*nav)
+
+    # фильтры со счётчиками — сразу видно, где есть работа
+    counts = _db_status_counts()
+    foreign = sum(counts.get(k, 0) for k in _FOREIGN_STATUSES)
+    # «Все» = только наши заказы; чужие лоты живут в отдельном фильтре
+    total_all = sum(v for k, v in counts.items() if k not in _FOREIGN_STATUSES)
+    active = sum(counts.get(k, 0) for k in _ACTIVE_STATUSES)
+    problems = sum(counts.get(k, 0) for k in _PROBLEM_STATUSES)
+    filters = [
+        ("all", "Все", total_all),
+        ("active", "⏳ В работе", active),
+        ("problems", "⚠️ Проблемные", problems),
+        ("completed", "✅ Выданы", counts.get("completed", 0)),
+        ("awaiting_metadata", "💬 Ждут данных", counts.get("awaiting_metadata", 0)),
+        ("foreign", "🚫 Чужие лоты", foreign),
+    ]
+    fbuttons = [
+        _inline_button(f"{'• ' if code == filter_status else ''}{text} {cnt}",
+                       callback_data=f"{CB_PREFIX}:orders_filter:{code}:0")
+        for code, text, cnt in filters if cnt or code in ("all", filter_status)
+    ]
+    for i in range(0, len(fbuttons), 2):
+        kb.add(*fbuttons[i:i + 2])
+
+    if filter_status == "foreign":
+        lines.insert(1, "<i>Лоты без привязки к FazerCards — плагин их не обслуживает. "
+                        f"Чистятся автоматически через {_FOREIGN_KEEP_DAYS} дн.</i>")
+        if orders:
+            kb.add(_inline_button("🧹 Очистить список",
+                                  callback_data=f"{CB_PREFIX}:orders_purge_foreign",
+                                  style="danger"))
+
+    kb.add(_inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:orders:{filter_status}:{page}"),
+           _inline_button("🔙 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n\n".join(lines), kb=kb)
+
+
+def _orders_purge_foreign(c: "Cardinal", call: Any) -> None:
+    """Убрать из базы все заказы чужих лотов (кнопка в фильтре «Чужие лоты»)."""
+    removed = _db_purge_foreign_orders(keep_days=0)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("📋 Заказы", callback_data=f"{CB_PREFIX}:orders:all:0"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(
+        c, call,
+        f"🧹 <b>Удалено записей: {removed}</b>\n\n"
+        "<i>Это были заказы лотов, не привязанных к FazerCards. На сами заказы "
+        "FunPay удаление никак не влияет — плагин просто перестаёт их помнить.</i>",
+        kb=kb)
+
+
+def _show_order_details(c: "Cardinal", call: Any, order_id: str) -> None:
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    metadata = order.get("metadata") or {}
+    metadata_text = "\n".join(f"• {_esc(k)}: <code>{_esc(v)}</code>" for k, v in metadata.items()) or "<i>нет</i>"
+    events = _db_get_events(order_id, limit=10)
+    events_text = "\n".join(
+        f"<i>{time.strftime('%H:%M:%S %d.%m', time.localtime(e.get('created_at') or 0))}</i> — {_esc(_EVENT_LABELS.get(e.get('event_type'), e.get('event_type')))}"
+        for e in events
+    ) or "<i>нет событий</i>"
+
+    # batch: заказ FunPay на N штук = несколько заказов FazerCards
+    batch = _from_json(order.get("batch_json")) if order.get("batch_json") else None
+    batch_line = ""
+    if isinstance(batch, dict) and (batch.get("ids") or []):
+        ids = [str(i) for i in batch["ids"]]
+        batch_line = (f"🧾 Заказов FazerCards: <b>{len(ids)}</b>\n"
+                      f"<code>{_esc(', '.join(ids[:8]))}{'…' if len(ids) > 8 else ''}</code>\n")
+
+    mapping = _get_mapping_by_id(order.get("mapping_id"))
+    lot_line = ""
+    if mapping:
+        upi = _units_per_item(mapping)
+        lot_line = f"🔗 Лот: <b>{_esc(mapping.get('funpay_lot_id') or '—')}</b>"
+        if upi != 1:
+            lot_line += f" · номинал <b>×{upi}</b>"
+        lot_line += "\n"
+
+    qty = order.get("quantity")
+    qty_text = _esc(int(qty)) if qty and float(qty) == int(float(qty)) else _esc(qty)
+    err = order.get("error")
+
+    # заказ ждёт пополнения баланса — показываем сумму и сколько уже ждёт
+    funds = order.get("funds") or {}
+    funds_block = ""
+    if order.get("status") == OrderStatus.AWAITING_FUNDS.value:
+        needed = funds.get("needed_usd")
+        bal = funds.get("balance_usd")
+        deadline = _funds_refund_deadline(load_config(), order)
+        refund_line = ""
+        if deadline is not None:
+            left = int((deadline - time.time()) / 60)
+            refund_line = (f"\n↩️ Автовозврат через: <b>{_fmt_minutes(max(0, left))}</b>"
+                           if left > 0 else "\n↩️ <b>Возврат будет оформлен на следующей проверке</b>")
+        funds_block = (
+            f"\n<blockquote><b>💸 Ждёт пополнения баланса</b>\n"
+            f"Нужно: <b>{_esc(f'{float(needed):.2f}' if needed else '—')} USD</b>"
+            + (f" · было на балансе: {float(bal):.2f} USD" if bal is not None else "")
+            + f"\nЖдёт: <b>{_esc(_duration(time.time() - float(funds.get('since') or order.get('created_at') or time.time())))}</b>"
+            f" · попыток: <b>{int(funds.get('attempts') or 0)}</b>"
+            f"{refund_line}\n"
+            f"<i>Данные покупателя сохранены — при повторе он ничего не вводит "
+            f"заново.</i></blockquote>\n")
+    elif order.get("status") == OrderStatus.REFUNDED.value and funds.get("refunded_at"):
+        funds_block = (
+            f"\n<blockquote><b>↩️ Возврат оформлен</b>\n"
+            f"Когда: <b>{_esc(_ago(funds['refunded_at']))}</b>\n"
+            f"Причина: {'автоматически (истекло время ожидания)' if funds.get('refund_reason') == 'timeout' else 'вручную'}\n"
+            f"<i>Деньги возвращены покупателю, заказ закрыт.</i></blockquote>\n")
+
+    text = (
+        f"📄 <b>Заказ</b> <code>{_esc(order_id)}</code>\n"
+        f"{_order_status_text(order.get('status'))} · обновлён {_esc(_ago(order.get('updated_at')))}\n\n"
+        f"<blockquote>"
+        f"🛒 {_esc(_short_sku(order.get('sku_id')))}\n"
+        f"👤 Покупатель: <b>{_esc(order.get('buyer_username') or '—')}</b>\n"
+        f"🔢 Количество: <b>{qty_text}</b>\n"
+        f"{lot_line}"
+        f"🆔 FZR: <code>{_esc(order.get('fzr_order_id') or '—')}</code>\n"
+        f"{batch_line}"
+        f"</blockquote>\n"
+        f"{funds_block}"
+    )
+    if err and order.get("status") != OrderStatus.AWAITING_FUNDS.value:
+        # у awaiting_funds причина уже расписана в блоке выше — дубль «Ошибка»
+        # только пугает: заказ не сломан, ему просто нужен баланс
+        text += f"\n⚠️ <b>Ошибка:</b>\n<blockquote>{_esc(str(err)[:500])}</blockquote>\n"
+    # v3.18: экономика заказа — та же, что уходила в отчёт при создании
+    profit_block = _order_profit_block(order)
+    if profit_block:
+        text += profit_block
+    text += (f"\n<blockquote><b>🧩 Данные покупателя:</b>\n{metadata_text}</blockquote>\n"
+             f"\n<blockquote expandable><b>📜 События:</b>\n{events_text}</blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    status = order.get("status")
+    delivered = order.get("completed_notification_sent") == 2 or status == OrderStatus.COMPLETED.value
+    if status == OrderStatus.AWAITING_FUNDS.value:
+        # главная кнопка для этого статуса — повторить закупку
+        kb.add(_inline_button("🔄 Повторить (нужен баланс)",
+                              callback_data=f"{CB_PREFIX}:funds_retry:{order_id}"))
+        kb.add(_inline_button("↩️ Вернуть деньги",
+                              callback_data=f"{CB_PREFIX}:funds_refund:{order_id}", style="danger"),
+               _inline_button("💸 Все ждущие", callback_data=f"{CB_PREFIX}:funds_list"))
+    elif not delivered:
+        kb.add(
+            _inline_button("🔄 Повторить", callback_data=f"{CB_PREFIX}:order_retry:{order_id}"),
+            _inline_button("❌ Отменить", callback_data=f"{CB_PREFIX}:order_cancel:{order_id}", style="danger"),
+        )
+    kb.add(_inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+    # у ручных услуг есть чат с исполнителем — вход прямо из карточки заказа
+    if str(order.get("sku_id") or "").startswith("manual-services:") and order.get("fzr_order_id"):
+        chat_cnt = _db_manual_chat_count(order_id)
+        label = "💬 Чат с исполнителем" + (f" ({chat_cnt})" if chat_cnt else "")
+        kb.add(_inline_button(label, callback_data=f"{CB_PREFIX}:mchat:{order_id}"))
+    back_filter = "problems" if status in _PROBLEM_STATUSES else "all"
+    kb.add(_inline_button("🔙 К списку", callback_data=f"{CB_PREFIX}:orders:{back_filter}:0"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, text, kb=kb)
+
+
+def _retry_order(c: "Cardinal", call: Any, order_id: str) -> None:
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    # заказ ждёт баланса — у него свой путь повтора (с проверкой денег и отчётом)
+    if order.get("status") == OrderStatus.AWAITING_FUNDS.value:
+        _funds_retry_button(c, call, order_id)
+        return
+    if order.get("status") == OrderStatus.COMPLETED.value or order.get("completed_notification_sent") == 2:
+        _send_or_edit(c, call, "⚠️ <b>Заказ уже выдан и не может быть повторён.</b>")
+        return
+    if order.get("status") == OrderStatus.AWAITING_METADATA.value:
+        _send_or_edit(c, call, "💬 <b>Заказ ожидает данных от покупателя. Повторите попытку позже.</b>")
+        return
+    if order.get("fzr_order_id"):
+        _db_force_update_order(order_id, status=OrderStatus.PENDING.value, error="")
+        _db_log_event(order_id, "admin_retry", {"previous_status": order.get("status"), "mode": "poll"})
+        _schedule_poll(c, order_id, order["fzr_order_id"], delay=2.0, attempt=1)
+        _send_or_edit(c, call, f"🔄 <b>Опрос заказа <code>{_esc(order_id)}</code> возобновлён.</b>")
+        return
+    mapping = _get_mapping_by_id(order.get("mapping_id")) or _db_get_mapping_by_sku_id(order.get("sku_id"))
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Не найдена привязка для повторной обработки. Создайте привязку.</b>")
+        return
+    order_info = order.get("order_info") or {}
+    if not order_info:
+        _send_or_edit(c, call, "❌ <b>Не удалось восстановить данные заказа.</b>")
+        return
+    metadata = order.get("metadata") or {}
+    _db_force_update_order(order_id, status=OrderStatus.PROCESSING.value, error="")
+    _db_log_event(order_id, "admin_retry", {"previous_status": order.get("status"), "mode": "create"})
+    _submit_task(_process_order_creation, c, order_info, mapping, metadata)
+    _send_or_edit(c, call, f"🔄 <b>Повторная обработка заказа <code>{_esc(order_id)}</code> запущена.</b>")
+
+
+# --- v3.6: кнопки для заказов, ждущих баланса ---
+
+def _funds_retry_button(c: "Cardinal", call: Any, order_id: str) -> None:
+    """
+    Кнопка «Повторить сейчас».
+
+    Перед повтором смотрим баланс: если денег всё ещё не хватает, честно
+    говорим сколько нужно — иначе продавец нажимал бы кнопку по кругу и
+    получал один и тот же алерт.
+    """
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    funds = order.get("funds") or {}
+    needed = funds.get("needed_usd")
+    cfg = load_config()
+    balance: Optional[float] = None
+    if cfg.get("api_key"):
+        try:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            balance = float(api.get_balance().get("balance") or 0)
+        except Exception as ex:
+            logger.warning("funds retry: balance check failed",
+                           extra={"error": _redact_sensitive(str(ex))})
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    if (needed is not None and balance is not None
+            and balance < float(needed)
+            and order.get("status") == OrderStatus.AWAITING_FUNDS.value):
+        # денег всё ещё нет — не тратим попытку и не трогаем заказ
+        kb.add(_inline_button("🔄 Проверить снова",
+                              callback_data=f"{CB_PREFIX}:funds_retry:{order_id}"))
+        kb.add(_inline_button("👤 Аккаунт", callback_data=f"{CB_PREFIX}:account"),
+               _inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+        _send_or_edit(
+            c, call,
+            "💸 <b>Баланса всё ещё не хватает</b>\n"
+            f"Заказ <code>{_esc(order_id)}</code>\n\n"
+            f"<blockquote>нужно <b>{float(needed):.2f} USD</b>\n"
+            f"на балансе <b>{balance:.2f} USD</b>\n"
+            f"не хватает <b>{float(needed) - balance:.2f} USD</b></blockquote>\n"
+            "Пополните баланс FazerCards и нажмите «Проверить снова».\n"
+            "<i>Заказ покупателя в это время не потерян и ждёт.</i>", kb=kb)
+        return
+
+    ok, msg = _retry_awaiting_funds_order(c, order_id, manual=True)
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"))
+    if not ok:
+        kb.add(_inline_button("💸 Ждут баланса", callback_data=f"{CB_PREFIX}:funds_list"))
+        _send_or_edit(c, call, f"⚠️ <b>{_esc(msg)}</b>", kb=kb)
+        return
+    kb.add(_inline_button("💸 Ждут баланса", callback_data=f"{CB_PREFIX}:funds_list"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    bal_line = f"\n<i>Баланс: {balance:.2f} USD</i>" if balance is not None else ""
+    _send_or_edit(
+        c, call,
+        f"🔄 <b>{_esc(msg)}</b>\n"
+        f"Заказ <code>{_esc(order_id)}</code> создаётся заново с сохранёнными "
+        f"данными покупателя — заново он ничего не вводит.{bal_line}\n\n"
+        "<i>Результат придёт обычным уведомлением о выдаче.</i>", kb=kb)
+
+
+def _funds_refund_button(c: "Cardinal", call: Any, order_id: str) -> None:
+    """Ручной возврат по заказу, ждущему баланса (кнопка в карточке/списке)."""
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"),
+           _inline_button("💸 Ждут баланса", callback_data=f"{CB_PREFIX}:funds_list"))
+    if order.get("status") != OrderStatus.AWAITING_FUNDS.value:
+        _send_or_edit(c, call, f"⚠️ <b>Заказ не в ожидании баланса</b> "
+                               f"(статус: {_ORDER_STATUS_LABEL.get(order.get('status'), '?')}).\n\n"
+                               f"<i>Возврат из этого статуса делайте на FunPay вручную.</i>", kb=kb)
+        return
+    if _refund_awaiting_funds_order(c, order, reason="manual"):
+        _send_or_edit(c, call,
+                      f"↩️ <b>Возврат оформлен</b>\n"
+                      f"Заказ <code>{_esc(order_id)}</code> закрыт, деньги вернулись "
+                      f"покупателю.\n\n<i>Покупателю отправлено сообщение с извинением.</i>", kb=kb)
+    else:
+        _send_or_edit(c, call,
+                      f"❌ <b>Не удалось оформить возврат</b>\n\n"
+                      f"<i>Проверьте заказ на FunPay: возможно, он уже закрыт или "
+                      f"возврат недоступен. Подробности — в карточке заказа.</i>", kb=kb)
+
+
+def _show_funds_orders(c: "Cardinal", call: Any) -> None:
+    """Список заказов, ждущих пополнения баланса."""
+    orders = _funds_orders()
+    cfg = load_config()
+    balance: Optional[float] = None
+    if cfg.get("api_key"):
+        try:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            balance = float(api.get_balance().get("balance") or 0)
+        except Exception:
+            balance = None
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    if not orders:
+        kb.add(_inline_button("📦 Заказы", callback_data=f"{CB_PREFIX}:orders:all:0"),
+               _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+        _send_or_edit(c, call,
+                      "💸 <b>Заказы, ждущие баланса</b>\n\n"
+                      "<blockquote>Таких заказов нет — всё закуплено.</blockquote>", kb=kb)
+        return
+
+    total = 0.0
+    blocks = []
+    cfg_now = load_config()
+    for o in orders[:15]:
+        funds = o.get("funds") or {}
+        needed = funds.get("needed_usd")
+        if needed:
+            total += float(needed)
+        since_ts = funds.get("since") or o.get("created_at")
+        waited = _duration(time.time() - float(since_ts)) if since_ts else "—"
+        mark = "🟢" if (balance is not None and needed is not None
+                       and balance >= float(needed)) else "🔴"
+        # сколько осталось до автовозврата — самое важное для очереди
+        deadline = _funds_refund_deadline(cfg_now, o)
+        refund_line = ""
+        if deadline is not None:
+            left = int((deadline - time.time()) / 60)
+            refund_line = (f"\n↩️ возврат через <b>{_fmt_minutes(max(0, left))}</b>"
+                           if left > 0 else "\n↩️ <b>возврат на следующей проверке</b>")
+        blocks.append(
+            f"<blockquote>{mark} <code>{_esc(o['funpay_order_id'])}</code> · "
+            f"{_esc(_short_sku(o.get('sku_id')))}\n"
+            f"👤 {_esc(o.get('buyer_username') or '—')} · ждёт {_esc(waited)}\n"
+            f"💵 нужно <b>{_esc(f'{float(needed):.2f}' if needed else '—')} USD</b>"
+            f" · попыток: {int(funds.get('attempts') or 0)}{refund_line}</blockquote>")
+    header = ("💸 <b>Заказы, ждущие баланса</b>\n"
+              f"<i>всего: {len(orders)}, суммарно нужно "
+              f"{total:.2f} USD</i>\n"
+              + (f"<i>на балансе: {balance:.2f} USD</i>\n" if balance is not None else "")
+              + (f"<i>автовозврат: через {_fmt_minutes(cfg_now['settings'].get('funds_refund_after'))} "
+                 f"ожидания</i>\n" if cfg_now["settings"].get("funds_auto_refund")
+                 else "<i>автовозврат выключен</i>\n")
+              + "\n🟢 хватает баланса · 🔴 не хватает\n")
+    text = _fit_blocks(header, blocks)
+    if len(orders) > 15:
+        text += f"\n<i>…и ещё {len(orders) - 15}</i>"
+
+    ready = [o for o in orders
+             if balance is not None and (o.get("funds") or {}).get("needed_usd")
+             and balance >= float((o.get("funds") or {})["needed_usd"])]
+    if ready:
+        kb.add(_inline_button(f"🔄 Повторить готовые ({len(ready)})",
+                              callback_data=f"{CB_PREFIX}:funds_retry_all"))
+    for o in orders[:5]:
+        kb.add(_inline_button(f"🔄 {o['funpay_order_id']}",
+                              callback_data=f"{CB_PREFIX}:funds_retry:{o['funpay_order_id']}"))
+    if len(orders) == 1:
+        # для одиночного заказа сразу даём возврат: чаще всего решение бинарное
+        kb.add(_inline_button("↩️ Вернуть деньги покупателю",
+                              callback_data=f"{CB_PREFIX}:funds_refund:{orders[0]['funpay_order_id']}",
+                              style="danger"))
+    kb.add(_inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:funds_list"),
+           _inline_button("👤 Аккаунт", callback_data=f"{CB_PREFIX}:account"))
+    kb.add(_inline_button("⚙️ Настройки возврата", callback_data=f"{CB_PREFIX}:settings_sec:checks"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, text, kb=kb)
+
+
+def _funds_retry_all(c: "Cardinal", call: Any) -> None:
+    """Повторить все заказы, на которые баланса уже хватает."""
+    cfg = load_config()
+    report = _funds_watcher_tick(c, cfg)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("💸 Список", callback_data=f"{CB_PREFIX}:funds_list"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    if report.get("checked") == 0:
+        _send_or_edit(c, call, "✅ <b>Заказов, ждущих баланса, нет.</b>", kb=kb)
+        return
+    bal = report.get("balance")
+    refunded_line = ""
+    if report.get("refunded"):
+        refunded_line = f"↩️ возвращено покупателям: <b>{report['refunded']}</b>\n"
+    _send_or_edit(
+        c, call,
+        "🔄 <b>Повтор заказов</b>\n\n"
+        f"<blockquote>ждали баланса: <b>{report['checked']}</b>\n"
+        f"запущено повторно: <b>{report['retried']}</b>\n"
+        f"{refunded_line}"
+        f"всё ещё не хватает денег: <b>{report['skipped']}</b>\n"
+        f"баланс: <b>{f'{bal:.2f} USD' if bal is not None else '—'}</b></blockquote>\n"
+        "<i>Покупатели ничего не вводят повторно — данные взяты из заказа.</i>", kb=kb)
+
+
+def _cancel_order(c: "Cardinal", call: Any, order_id: str) -> None:
+    """
+    Отмена заказа продавцом из панели (v3.22: с возвратом денег).
+
+    Раньше кнопка только помечала заказ как failed и писала покупателю
+    «ошибка» — деньги на FunPay оставались у продавца, и покупатель шёл
+    в спор. Теперь отмена — это полноценный возврат:
+
+      1. отменяем закупку у поставщика (если она была и это включено);
+      2. возвращаем деньги покупателю на FunPay — при включённом
+         автовозврате (`funds_auto_refund`), т.к. это необратимо;
+      3. статус `refunded`, покупателю уходит текст про отмену
+         (свой на товар, `refund_template`), а не «ошибка выдачи»;
+      4. списание возвращается в книгу локального баланса.
+
+    Если автовозврат выключен или FunPay отказал — заказ уходит в failed
+    (или needs_review) и продавцу прямо пишется, что вернуть деньги надо
+    руками. Молча «отменить, не вернув» нельзя.
+    """
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    if order.get("completed_notification_sent") == 2 or order.get("status") == OrderStatus.COMPLETED.value:
+        _send_or_edit(c, call, "⚠️ <b>Заказ уже выдан и не может быть отменён.</b>")
+        return
+
+    cfg = load_config()
+    fzr_order_id = str(order.get("fzr_order_id") or "")
+    mapping = (_get_mapping_by_id(order.get("mapping_id"))
+               or _db_get_mapping_by_sku_id(order.get("sku_id")))
+    name = _mapping_display_name(mapping) if mapping else _short_sku(order.get("sku_id"))
+    buyer = order.get("buyer_username") or ""
+    steps: List[str] = []
+
+    # 1) закупку у поставщика отменяем сразу: держать её при отмене заказа
+    #    бессмысленно, деньги должны вернуться и там
+    if fzr_order_id:
+        cancelled = False
+        try:
+            if cfg["api_key"]:
+                api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+                api.cancel_order(fzr_order_id)
+                cancelled = True
+        except Exception as ex:
+            err = _redact_sensitive(str(ex))
+            logger.warning("cancel: fzr order cancel failed",
+                           extra={"funpay_order_id": order_id, "error": err})
+            steps.append(f"⚠️ Закупку <code>{_esc(fzr_order_id)}</code> отменить не "
+                         f"удалось — проверьте её у поставщика")
+        if cancelled:
+            _db_log_event(order_id, "fzr_order_cancelled",
+                          {"fzr_order_id": fzr_order_id, "reason": "admin_cancel"})
+            steps.append(f"✅ Закупка <code>{_esc(fzr_order_id)}</code> отменена")
+
+    # 2) возврат денег покупателю — только при включённом автовозврате
+    auto_refund = bool(cfg["settings"].get("funds_auto_refund"))
+    refunded = False
+    refund_error = ""
+    if auto_refund:
+        try:
+            c.account.refund(order_id)
+            refunded = True
+        except Exception as ex:
+            refund_error = _redact_sensitive(str(ex))
+            logger.error("cancel: funpay refund failed",
+                         extra={"funpay_order_id": order_id, "error": refund_error})
+
+    if refunded:
+        funds = order.get("funds") or {}
+        funds["refunded_at"] = time.time()
+        funds["refund_reason"] = "admin_cancel"
+        _db_force_update_order(order_id, _event="order_cancelled_refunded",
+                               status=OrderStatus.REFUNDED.value,
+                               error="Отменено продавцом, деньги возвращены",
+                               funds_json=_to_json(funds))
+        _inc_metric("orders_refunded")
+        steps.append("✅ Деньги возвращены покупателю на FunPay")
+    else:
+        new_status = (OrderStatus.NEEDS_REVIEW.value if refund_error
+                      else OrderStatus.FAILED.value)
+        reason = ("Отменено продавцом; возврат на FunPay не прошёл: " + refund_error
+                  if refund_error else "Отменено продавцом (без возврата)")
+        if not _db_force_update_order(order_id, _event="order_cancelled",
+                                      status=new_status, error=reason[:500]):
+            _send_or_edit(c, call, "⚠️ <b>Не удалось обновить статус заказа.</b>")
+            return
+        if refund_error:
+            steps.append(f"❌ Возврат на FunPay не прошёл: {_esc(refund_error[:150])}")
+        else:
+            steps.append("⚠️ Деньги <b>не</b> возвращены: автовозврат выключен")
+
+    _db_log_event(order_id, "order_cancelled",
+                  {"reason": "admin", "fzr_order_id": fzr_order_id,
+                   "refunded": refunded})
+
+    # 3) списание возвращаем в книгу локального баланса
+    try:
+        if _balance_refund_order(c, order_id, comment="возврат: заказ отменён продавцом"):
+            steps.append("✅ Закупка возвращена в локальный баланс")
+    except Exception as e:
+        logger.warning("cancel: local balance refund failed",
+                       extra={"funpay_order_id": order_id, "error": repr(e)})
+
+    # 4) сообщение покупателю: про отмену и возврат, а не «ошибка выдачи»
+    order_proxy = _order_proxy(order)
+    chat_id = getattr(order_proxy, "chat_id", None)
+    if refunded:
+        text = _fzr_refund_text(cfg, mapping, order_id=order_id,
+                                fzr_order_id=fzr_order_id, buyer=buyer,
+                                reason="отменено продавцом")
+    else:
+        text = render_template(
+            cfg["templates"]["error"],
+            default=DEFAULT_CONFIG["templates"]["error"],
+            error="Заказ отменён продавцом.",
+            fzr_order_id=fzr_order_id, funpay_order_id=order_id, buyer=buyer)
+    if text:
+        _send_buyer(c, chat_id, text, buyer)
+        steps.append("✉️ Покупателю отправлено сообщение")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    if not refunded:
+        if not auto_refund:
+            kb.add(_inline_button("↩️ Включить автовозврат и повторить",
+                                  callback_data=f"{CB_PREFIX}:cancel_refund:{order_id}"))
+        else:
+            kb.add(_inline_button("🔄 Повторить возврат",
+                                  callback_data=f"{CB_PREFIX}:cancel_refund:{order_id}"))
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+
+    head = ("↩️ <b>Заказ отменён, деньги возвращены</b>" if refunded
+            else "❌ <b>Заказ отменён</b>")
+    tail = ""
+    if not refunded:
+        tail = ("\n\n<i>Верните оплату покупателю вручную на FunPay — "
+                "иначе он откроет спор.</i>"
+                if not auto_refund else
+                "\n\n<i>Возврат не прошёл: верните оплату вручную на FunPay.</i>")
+        if not auto_refund:
+            tail += ("\n<i>Включить автовозврат: Настройки → Проверки → "
+                     "«Автовозврат».</i>")
+    _send_or_edit(c, call,
+                  f"{head}\nЗаказ <code>{_esc(order_id)}</code> · {_esc(name)}\n\n"
+                  f"<blockquote>" + "\n".join(steps) + "</blockquote>" + tail, kb=kb)
+
+
+def _cancel_refund_retry(c: "Cardinal", call: Any, order_id: str) -> None:
+    """
+    Повторить возврат по уже отменённому заказу (v3.22).
+
+    Нужна, когда продавец нажал «Отменить» с выключенным автовозвратом:
+    заказ закрыт, а деньги у него. Кнопка включает автовозврат (если он
+    выключен) и возвращает деньги.
+    """
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    if order.get("status") == OrderStatus.REFUNDED.value:
+        _send_or_edit(c, call, "✅ <b>По этому заказу возврат уже оформлен.</b>", kb=kb)
+        return
+    if order.get("completed_notification_sent") == 2:
+        _send_or_edit(c, call, "⚠️ <b>Заказ выдан — возврат делать нельзя.</b>", kb=kb)
+        return
+
+    cfg = load_config()
+    turned_on = False
+    if not cfg["settings"].get("funds_auto_refund"):
+        cfg["settings"]["funds_auto_refund"] = True
+        save_config(cfg)
+        turned_on = True
+        logger.info("funds_auto_refund enabled from cancel screen")
+
+    try:
+        c.account.refund(order_id)
+    except Exception as ex:
+        err = _redact_sensitive(str(ex))
+        _db_log_event(order_id, "refund_retry_failed", {"error": err[:300]})
+        _send_or_edit(c, call,
+                      f"❌ <b>Возврат не прошёл</b>\n\n"
+                      f"<blockquote>{_esc(err[:300])}</blockquote>\n"
+                      f"<i>Верните оплату вручную на FunPay.</i>", kb=kb)
+        return
+
+    funds = order.get("funds") or {}
+    funds["refunded_at"] = time.time()
+    funds["refund_reason"] = "admin_cancel_retry"
+    _db_force_update_order(order_id, _event="order_cancelled_refunded",
+                           status=OrderStatus.REFUNDED.value,
+                           error="Отменено продавцом, деньги возвращены",
+                           funds_json=_to_json(funds))
+    _inc_metric("orders_refunded")
+    mapping = (_get_mapping_by_id(order.get("mapping_id"))
+               or _db_get_mapping_by_sku_id(order.get("sku_id")))
+    text = _fzr_refund_text(cfg, mapping, order_id=order_id,
+                            fzr_order_id=str(order.get("fzr_order_id") or ""),
+                            buyer=order.get("buyer_username") or "",
+                            reason="отменено продавцом")
+    if text:
+        _send_buyer(c, order.get("chat_id"), text, order.get("buyer_username"))
+    try:
+        _balance_refund_order(c, order_id, comment="возврат: заказ отменён продавцом")
+    except Exception as e:
+        logger.warning("retry refund: local balance failed",
+                       extra={"funpay_order_id": order_id, "error": repr(e)})
+    _send_or_edit(c, call,
+                  f"↩️ <b>Деньги возвращены покупателю</b>\n"
+                  f"Заказ <code>{_esc(order_id)}</code>\n\n"
+                  + ("<blockquote>🔔 Автовозврат включён — теперь плагин будет "
+                     "возвращать деньги сам при отмене и при возврате от "
+                     "поставщика.</blockquote>" if turned_on else "")
+                  + "<i>Покупателю отправлено сообщение об отмене.</i>", kb=kb)
+
+
+def _split_telegram_text(text: str, max_len: int = 4096) -> List[str]:
+    if len(text) <= max_len:
+        return [text]
+    # split by block separators to avoid cutting HTML tags inside lines
+    parts = re.split(r"(\n\s*\n|\n)", text)
+    chunks: List[str] = []
+    current = ""
+    for part in parts:
+        if not part:
+            continue
+        if len(current) + len(part) > max_len and current:
+            chunks.append(current)
+            current = part.lstrip("\n")
+        else:
+            if current and part.startswith("\n"):
+                current += part
+            else:
+                current += part
+        if len(current) > max_len:
+            # single part too long: split by lines
+            lines = current.split("\n")
+            sub = ""
+            for line in lines:
+                if len(sub) + len(line) + 1 > max_len and sub:
+                    chunks.append(sub)
+                    sub = line
+                else:
+                    sub = line if not sub else sub + "\n" + line
+                if len(sub) > max_len:
+                    # very long line: split by words
+                    words = re.split(r"( +)", sub)
+                    sub2 = ""
+                    for w in words:
+                        if len(sub2) + len(w) > max_len and sub2:
+                            chunks.append(sub2)
+                            sub2 = w
+                        else:
+                            sub2 += w
+                    sub = sub2
+            if sub:
+                current = sub
+            else:
+                current = ""
+    if current:
+        chunks.append(current)
+    # merge tiny last chunk
+    if len(chunks) >= 2 and len(chunks[-1]) < 50 and len(chunks[-2]) + len(chunks[-1]) <= max_len:
+        chunks[-2] += chunks[-1]
+        chunks.pop()
+    return chunks if chunks else [text[:max_len]]
+
+
+def _send_telegram_message(c: "Cardinal", chat_id: Any, text: str, reply_to: Optional[Any] = None, kb: Optional[InlineKeyboardMarkup] = None) -> Optional[Any]:
+    """Отправка в Telegram. Возвращает последнее отправленное сообщение (или None)."""
+    if not c.telegram:
+        return None
+    if kb is None:
+        kb = _cancel_kb()
+    chunks = _split_telegram_text(text)
+    reply_id = None
+    if reply_to is not None:
+        reply_id = getattr(reply_to, "message_id", None)
+    sent = None
+    for i, chunk in enumerate(chunks):
+        kwargs: Dict[str, Any] = {"parse_mode": "HTML", "disable_web_page_preview": True}
+        if i == len(chunks) - 1:
+            kwargs["reply_markup"] = kb
+        if i == 0 and reply_id:
+            kwargs["reply_to_message_id"] = reply_id
+        try:
+            sent = c.telegram.bot.send_message(chat_id, chunk, **kwargs)
+        except Exception as e:
+            logger.warning("send_telegram_message failed", extra={"error": repr(e)})
+            break
+    return sent
+
+def _send_or_edit(c: "Cardinal", call: Any, text: str, kb: Optional[InlineKeyboardMarkup] = None, reply_to: Optional[Any] = None) -> None:
+    if not getattr(c, "telegram", None):
+        return
+    bot = c.telegram.bot
+    if kb is None:
+        kb = _cancel_kb()
+    reply_id: Optional[int] = None
+    if reply_to is not None:
+        reply_id = getattr(reply_to, "message_id", None)
+    display_text = text
+    if len(display_text) > 4096:
+        display_text = display_text[:4090] + "\n<i>(…)</i>"
+
+    msg = getattr(call, "message", None) if call else None
+    chat_id: Optional[int] = None
+    message_id: Optional[int] = None
+    if msg and getattr(msg, "chat", None) and getattr(msg, "message_id", None):
+        chat_id = msg.chat.id
+        message_id = msg.message_id
+    elif call and getattr(call, "chat", None) and getattr(call, "message_id", None):
+        chat_id = call.chat.id
+        message_id = call.message_id
+    elif call and getattr(getattr(call, "message", None), "chat", None):
+        chat_id = call.message.chat.id
+    if not chat_id:
+        chat_id = getattr(getattr(call, "from_user", None), "id", None)
+    if not chat_id:
+        logger.warning("send_or_edit: cannot determine chat_id", extra={"call_type": type(call).__name__})
+        return
+
+    try:
+        if message_id:
+            bot.edit_message_text(
+                display_text,
+                chat_id,
+                message_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            kwargs: Dict[str, Any] = {"reply_markup": kb, "parse_mode": "HTML", "disable_web_page_preview": True}
+            if reply_id:
+                kwargs["reply_to_message_id"] = reply_id
+            bot.send_message(chat_id, display_text, **kwargs)
+    except Exception as e:
+        descr = str(getattr(e, "description", ""))
+        if "message is not modified" in descr or "message is not modified" in str(e):
+            return
+        logger.warning("send_or_edit error", extra={"error": repr(e)})
+        try:
+            kwargs = {"reply_markup": kb, "parse_mode": "HTML", "disable_web_page_preview": True}
+            if reply_id:
+                kwargs["reply_to_message_id"] = reply_id
+            bot.send_message(chat_id, display_text, **kwargs)
+        except Exception:
+            pass
+
+def cmd_fzr(c: "Cardinal", message: Any) -> None:
+    if not _is_admin(c, message):
+        return
+    clear_state(getattr(getattr(message, "from_user", None), "id", None))
+    c.telegram.bot.send_message(
+        message.chat.id,
+        _main_menu_text(),
+        reply_markup=_main_keyboard(),
+        parse_mode="HTML",
+    )
+_STATE_TTL = 1800.0          # 30 минут на шаг диалога в ПУ
+
+
+def set_state(user_id: int, state: str, data: Optional[Dict[str, Any]] = None) -> None:
+    with _STATES_LOCK:
+        _USER_STATES[user_id] = {"state": state, "data": data or {},
+                                 "expires_at": time.time() + _STATE_TTL}
+def clear_state(user_id: Optional[int]) -> None:
+    if user_id is None:
+        return
+    with _STATES_LOCK:
+        _USER_STATES.pop(user_id, None)
+def get_state(user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Текущее состояние диалога в ПУ.
+
+    TTL скользящий: каждое обращение продлевает срок. Мастер создания лота
+    состоит из 6+ шагов (доп. поля, названия, описания, цена, выбор SKU в
+    каталоге) — с фиксированными 30 минутами от начала пользователь ловил
+    «Сессия истекла» на последнем шаге.
+    """
+    with _STATES_LOCK:
+        s = _USER_STATES.get(user_id)
+        if s is None:
+            return None
+        if time.time() > s.get("expires_at", 0.0):
+            _USER_STATES.pop(user_id, None)
+            return None
+        s["expires_at"] = time.time() + _STATE_TTL
+        return s
+def _state_waiting(message: Any) -> bool:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if user_id is None:
+        return False
+    return get_state(user_id) is not None
+def cbq_dispatcher(c: "Cardinal", call: Any) -> None:
+    if not _is_admin(c, call):
+        try:
+            c.telegram.bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        return
+    try:
+        c.telegram.bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+
+    raw_data = _unpack_callback_data(call.data)
+    if raw_data is None:
+        _send_or_edit(c, call, "⏳ <b>Данные устарели.</b>\n\nПопробуйте снова.")
+        return
+    parts = raw_data.split(":", 2)
+    if len(parts) < 2 or parts[0] != CB_PREFIX:
+        return
+    action = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+
+    if action not in _STATE_PRESERVING_ACTIONS:
+        clear_state(user_id)
+
+    bot = c.telegram.bot
+    try:
+        if action == "menu":
+            _send_or_edit(c, call, _main_menu_text(), kb=_main_keyboard())
+        elif action == "close":
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                _send_or_edit(c, call, "👋", kb=None)
+        elif action == "apikey":
+            set_state(call.from_user.id, "apikey")
+            text = (
+                "🔑 <b>API-ключ FazerCards</b>\n\n"
+                "Введите ключ (обычно начинается с <code>live_</code> или <code>test_</code>):"
+            )
+            _send_or_edit(c, call, text)
+        elif action == "catalog":
+            _show_catalog(c, call, arg)
+        elif action == "mappings":
+            _show_mappings(c, call)
+        elif action == "mappings_page":
+            try:
+                page = int(arg)
+            except ValueError:
+                page = 0
+            _show_mappings(c, call, page)
+        elif action == "mapping_add":
+            set_state(call.from_user.id, "mapping_sku")
+            _send_or_edit(
+                c, call,
+                "➕ <b>Новая привязка</b>\n\n"
+                "Введите <b>SKU FazerCards</b> в формате <code>kind:category_id:offer_id</code>\n"
+                "(например <code>giftcards:123:456</code>):",
+            )
+        elif action == "mapping_open":
+            _mapping_open(c, call, arg)
+        elif action == "mapping_del":
+            _delete_mapping(c, call, arg)
+        elif action == "mapping_del_yes":
+            mapping = _get_mapping_by_id(arg)
+            if mapping:
+                _db_delete_mapping(arg)
+                _send_or_edit(c, call, f"✅ <b>Привязка <code>{_esc(mapping.get('fzr_sku_id'))}</code> удалена.</b>", kb=_main_keyboard())
+            else:
+                _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        elif action == "relink":
+            _show_relink(c, call, arg)
+        elif action == "relink_all":
+            _relink_all(c, call)
+        elif action == "mappings_enable_all":
+            _mappings_enable_all(c, call)
+        elif action == "mappings_enable_undo":
+            _mappings_enable_undo(c, call)
+        elif action == "relink_apply":
+            _relink_apply(c, call, enable=(arg == "1"))
+        elif action == "mapping_toggle":
+            _toggle_mapping(c, call, arg)
+        elif action == "mapping_markup":
+            _mapping_markup_prompt(c, call, arg)
+        elif action == "mapping_markup_reset":
+            _mapping_markup_set(c, call, arg, None, None,
+                                "<b>Наценка сброшена</b> — привязка снова берёт общую "
+                                "из «Настройки → Цены».")
+        elif action == "mapping_markup_zero":
+            _mapping_markup_set(c, call, arg, 0.0, 0.0,
+                                "<b>Наценка ровно 0%</b> — этот лот продаётся по цене "
+                                "закупки, общая наценка на него больше не влияет.")
+        elif action == "mapping_units":
+            _mapping_units_prompt(c, call, arg)
+        elif action == "mapping_refresh":
+            _mapping_refresh_fields(c, call, arg)
+        elif action == "mapping_vid":
+            _mapping_toggle_validate_id(c, call, arg)
+        elif action == "mchat":
+            _show_manual_chat(c, call, arg)
+        elif action == "mchat_reply":
+            _manual_chat_reply_prompt(c, call, arg)
+        elif action == "mchat_relay":
+            _manual_chat_relay_now(c, call, arg)
+        elif action == "mchat_list":
+            _show_manual_chat_list(c, call)
+        elif action == "balance":
+            _show_balance(c, call)
+        elif action == "bal_history":
+            _show_balance_history(c, call, arg)
+        elif action == "bal_topup":
+            _balance_topup_prompt(c, call)
+        elif action == "bal_correct":
+            _balance_correct_prompt(c, call)
+        elif action == "account":
+            _show_account(c, call)
+        elif action == "funds_retry":
+            _funds_retry_button(c, call, arg)
+        elif action == "funds_list":
+            _show_funds_orders(c, call)
+        elif action == "funds_retry_all":
+            _funds_retry_all(c, call)
+        elif action == "price_sync_now":
+            _price_sync_now(c, call)
+        elif action == "rate_now":
+            _rate_update_now(c, call)
+        elif action == "funds_refund":
+            _funds_refund_button(c, call, arg)
+        elif action == "mapping_psync":
+            _mapping_toggle_price_sync(c, call, arg)
+        elif action == "mapping_psync_now":
+            _mapping_price_sync_now(c, call, arg)
+        elif action == "mapping_greet":
+            _mapping_greeting_prompt(c, call, arg)
+        elif action == "mapping_ask":
+            _mapping_ask_prompt(c, call, arg)
+        elif action == "mapping_review":
+            _mapping_review_prompt(c, call, arg)
+        elif action == "mapping_refund":
+            _mapping_refund_prompt(c, call, arg)
+        elif action == "tpl_edit":
+            _tpl_edit_prompt(c, call, arg)
+        elif action == "mapping_texts":
+            _mapping_preview_texts(c, call, arg)
+        elif action == "settings":
+            _show_settings(c, call)
+        elif action == "settings_sec":
+            _show_settings(c, call, arg)
+        elif action == "settings_edit":
+            _start_settings_edit(c, call, arg)
+        elif action == "settings_toggle":
+            _toggle_setting(c, call, arg)
+        elif action == "webhook":
+            _show_webhook(c, call)
+        elif action == "webhook_set":
+            set_state(call.from_user.id, "webhook_url")
+            _send_or_edit(
+                c, call,
+                "🔔 <b>Webhook</b>\n\n"
+                "Отправьте <b>HTTPS URL</b>, на который FazerCards будет присылать события "
+                "(например <code>https://example.com/fzr-hook</code>).\n\n"
+                "<i>Нужен свой публично доступный эндпоинт. Плагин сам его не поднимает — "
+                "опрос статуса (polling) продолжит работать как есть.</i>",
+            )
+        elif action == "webhook_del":
+            _webhook_delete(c, call)
+        elif action == "webhook_test":
+            _webhook_test(c, call)
+        elif action == "webhook_secret":
+            _webhook_regenerate_secret(c, call)
+        elif action == "webhook_log":
+            _webhook_deliveries(c, call)
+        elif action == "catalog_select":
+            _catalog_select(c, call, arg)
+        elif action == "create_lot":
+            _fzr_start_create_lot(c, call)
+        elif action == "lotcat":
+            try:
+                cat_id, page = arg.split(":", 1)
+                _fzr_open_category(c, call, int(cat_id), int(page))
+            except Exception as e:
+                logger.warning("lotcat parse error", extra={"error": _redact_sensitive(str(e))})
+                _send_or_edit(c, call, "❌ Неверные данные категории.")
+        elif action == "lotcat_page":
+            try:
+                page = int(arg)
+            except ValueError:
+                page = 0
+            _send_or_edit(c, call, "🆕 <b>Создание лота</b>\n\n<i>Выберите игру (категорию):</i>", kb=_fzr_categories_kb(c, page))
+        elif action == "lotsub":
+            try:
+                subcat_id, page = arg.split(":", 1)
+                _fzr_select_subcategory(c, call, int(subcat_id))
+            except Exception as e:
+                logger.warning("lotsub parse error", extra={"error": _redact_sensitive(str(e))})
+                _send_or_edit(c, call, "❌ Неверные данные подкатегории.")
+        elif action == "lotsub_page":
+            try:
+                cat_id, page = arg.split(":", 1)
+                _fzr_open_category(c, call, int(cat_id), int(page))
+            except Exception as e:
+                logger.warning("lotsub_page parse error", extra={"error": _redact_sensitive(str(e))})
+                _send_or_edit(c, call, "❌ Неверные данные пагинации.")
+        elif action == "lotcustom":
+            _fzr_handle_custom_select(c, call, arg)
+        elif action == "lotcustom_page":
+            _fzr_handle_custom_page(c, call, arg)
+        elif action == "lotcustom_back":
+            _fzr_handle_custom_back(c, call, arg)
+        elif action == "lotcustom_goto":
+            _fzr_goto_custom_field(c, call, arg)
+        elif action == "create_lot_sku_catalog":
+            _fzr_open_sku_catalog_for_create_lot(c, call)
+        elif action == "create_lot_skip_sku":
+            _fzr_skip_sku_step(c, call)
+        elif action == "create_lot_skip_title":
+            _fzr_skip_title(c, call)
+        elif action == "create_lot_psync":
+            _fzr_toggle_create_psync(c, call)
+        elif action == "create_lot_amount":
+            _fzr_set_amount(c, call, arg)
+        elif action == "create_lot_amount_edit":
+            _fzr_edit_amount(c, call)
+        elif action == "create_lot_useprice":
+            _fzr_use_calc_price(c, call)
+        elif action == "create_lot_go":
+            _fzr_confirm_create_lot(c, call)
+        elif action == "create_lot_back":
+            _fzr_wizard_back(c, call)
+        elif action == "create_lot_back_to_wizard":
+            _fzr_wizard_resume(c, call)
+        elif action == "create_lot_fix":
+            _fzr_fix_failed_lot(c, call)
+        elif action == "orders":
+            try:
+                filter_status, page = arg.split(":", 1)
+                page = int(page)
+            except Exception:
+                filter_status = "all"
+                page = 0
+            _show_orders(c, call, filter_status, page)
+        elif action == "orders_filter":
+            try:
+                filter_status, page = arg.split(":", 1)
+                page = int(page)
+            except Exception:
+                filter_status = "all"
+                page = 0
+            _show_orders(c, call, filter_status, page)
+        elif action == "orders_purge_foreign":
+            _orders_purge_foreign(c, call)
+        elif action == "order_view":
+            _show_order_details(c, call, arg)
+        elif action == "order_retry":
+            _retry_order(c, call, arg)
+        elif action == "cancel_refund":
+            _cancel_refund_retry(c, call, arg)
+        elif action == "order_cancel":
+            _cancel_order(c, call, arg)
+        elif action == "search":
+            try:
+                mode, payload = arg.split(":", 1)
+                ctx = json.loads(payload)
+                _fzr_search_prompt(c, call, mode, ctx)
+            except Exception as e:
+                logger.warning("search callback parse error", extra={"error": _redact_sensitive(str(e))})
+                _send_or_edit(c, call, "❌ Ошибка параметров поиска.")
+        elif action == "search_page":
+            try:
+                delta = int(arg)
+            except ValueError:
+                delta = 0
+            state = get_state(user_id)
+            if state and state.get("state") == "search":
+                new_page = max(0, state["data"].get("page", 0) + delta)
+                state["data"]["page"] = new_page
+                _fzr_show_search_results(c, call, state)
+        elif action == "metrics":
+            _show_metrics(c, call)
+        elif action == "metrics_reset":
+            _reset_metrics()
+            _show_metrics(c, call)
+        elif action == "backup":
+            _show_backup_menu(c, call)
+        elif action == "readiness":
+            _show_readiness(c, call)
+        elif action == "export":
+            _do_export(c, call, arg)
+        elif action == "exp_sel":
+            _show_export_pick(c, call, arg)
+        elif action in ("exp_pick", "exp_all", "exp_none", "exp_on", "exp_off", "exp_mode"):
+            _export_pick_action(c, call, action, arg)
+        elif action == "exp_go":
+            _export_selected(c, call, arg)
+        elif action == "mappings_wipe":
+            _mappings_delete_all_prompt(c, call)
+        elif action == "export_secret":
+            _do_export(c, call, _EXPORT_KIND_FULL, with_secrets=True)
+        elif action == "import":
+            _import_prompt(c, call)
+        elif action == "import_apply":
+            _import_apply(c, call)
+        elif action == "import_lots":
+            _import_replan(c, call, keep_lots=(arg == "1"))
+        elif action == "import_key":
+            _import_replan(c, call, toggle_key=True)
+        elif action == "import_backups":
+            _import_backups_list(c, call)
+        elif action == "import_undo":
+            _import_undo(c, call, arg)
+        elif action == "noop":
+            pass
+        else:
+            _send_or_edit(c, call, "❓ <b>Неизвестная команда.</b>")
+    except Exception as e:
+        logger.exception("cbq_dispatcher failed", extra={"error": repr(e)})
+        try:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка: {_esc(e)}")
+        except Exception:
+            pass
+
+def _handle_step(c: "Cardinal", message: Any, state: Optional[Dict[str, Any]]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    raw_text = (message.text or "").strip()
+    logger.info("handle_step called", extra={"user_id": user_id, "chat_id": chat_id, "state": state.get("state") if state else None, "text": raw_text[:200]})
+    if not state:
+        clear_state(user_id)
+        return
+    text = raw_text.lower()
+    if text == "/cancel":
+        clear_state(user_id)
+        _send_telegram_message(c, message.chat.id, "🚫 Операция отменена.", kb=_main_keyboard())
+        return
+    handlers = {
+        "apikey": _step_apikey,
+        "settings_edit": _step_settings_edit,
+        "webhook_url": _step_webhook_url,
+        "mapping_sku": _step_mapping_sku,
+        "mapping_lot": _step_mapping_lot,
+        "mapping_markup": _step_mapping_markup,
+        "mapping_markup_edit": _step_mapping_markup_edit,
+        "mapping_units_edit": _step_mapping_units_edit,
+        "manual_chat_reply": _step_manual_chat_reply,
+        "mapping_greeting_edit": _step_mapping_greeting_edit,
+        "mapping_ask_edit": _step_mapping_ask_edit,
+        "mapping_review_edit": _step_mapping_review_edit,
+        "mapping_refund_edit": _step_mapping_refund_edit,
+        "tpl_edit": _step_tpl_edit,
+        "bal_topup": _step_balance_topup,
+        "bal_correct": _step_balance_correct,
+        "mapping_meta": _step_mapping_meta,
+        "mapping_meta_prompt": _step_mapping_meta_prompt,
+        "mapping_delivery": _step_mapping_delivery,
+        "mapping_confirm_del": _step_mapping_confirm_del,
+        "mappings_wipe": _step_mappings_wipe,
+        "create_lot_custom": _step_create_lot_custom,
+        "create_lot_title_ru": _step_create_lot_title_ru,
+        "create_lot_title_en": _step_create_lot_title_en,
+        "create_lot_desc_ru": _step_create_lot_desc_ru,
+        "create_lot_desc_en": _step_create_lot_desc_en,
+        "create_lot_price": _step_create_lot_price,
+        "create_lot_amount": _step_create_lot_amount,
+        "create_lot_sku": _step_create_lot_sku,
+        "create_lot_confirm": _step_create_lot_confirm,
+        "import_wait_file": _step_import_wait_file,
+        "search": _step_search,
+    }
+    handler = handlers.get(state["state"])
+    if handler:
+        logger.info("handle_step dispatch", extra={"user_id": user_id, "state": state["state"], "handler": handler.__name__})
+        handler(c, message, state)
+    else:
+        logger.warning("handle_step unknown state", extra={"user_id": user_id, "state": state.get("state")})
+        clear_state(user_id)
+
+
+def _step_import_wait_file(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    """
+    Пользователь ждёт-ждёт и присылает текст вместо файла.
+
+    Частый случай: вставили содержимое JSON в чат. Разбираем и это — лишь бы
+    не заставлять человека угадывать, почему «ничего не происходит».
+    """
+    if getattr(message, "document", None) is not None:
+        _import_handle_document(c, message)
+        return
+    text = (message.text or "").strip()
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            _send_telegram_message(c, message.chat.id,
+                                   f"❌ Текст не читается как JSON:\n"
+                                   f"<blockquote>{_esc(e)}</blockquote>\n"
+                                   f"<i>Лучше пришлите файлом — так надёжнее.</i>",
+                                   reply_to=message, kb=kb)
+            return
+        kind = _detect_export_kind(data) if isinstance(data, dict) else None
+        if kind is None:
+            _send_telegram_message(c, message.chat.id,
+                                   "❌ В присланном JSON нет ни настроек, ни привязок.",
+                                   reply_to=message, kb=kb)
+            return
+        payload = _normalize_import_payload(data, kind)
+        plan = _plan_import(payload, kind, keep_lots=False, c=c)
+        user_id = message.from_user.id
+        clear_state(user_id)
+        _staging_put(user_id, {"payload": payload, "kind": kind,
+                               "file_name": "вставленный текст", "plan": plan})
+        _send_telegram_message(c, message.chat.id,
+                               _import_plan_text(plan, "вставленный текст"),
+                               kb=_import_plan_kb(plan))
+        return
+    _send_telegram_message(
+        c, message.chat.id,
+        "📥 Жду <b>файл .json</b> (прикрепите его как документ).\n\n"
+        "<i>Можно и вставить содержимое JSON текстом — тоже разберу.</i>",
+        reply_to=message, kb=kb)
+
+
+def _step_search(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    query = (message.text or "").strip()
+    if not query:
+        _send_telegram_message(c, message.chat.id, "❌ Введите непустой поисковый запрос.", reply_to=message)
+        return
+    # v3.15: сообщение с запросом убираем — экран поиска редактируется на месте
+    _fzr_delete_message(c, message)
+    state["data"]["query"] = query
+    state["data"]["page"] = 0
+    _fzr_show_search_results(c, message, state)
+
+
+def _step_apikey(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    key = (message.text or "").strip()
+    if len(key) < 8:
+        _send_telegram_message(c, message.chat.id, "❌ API-ключ слишком короткий.", reply_to=message)
+        return
+    cfg = load_config()
+    cfg["api_key"] = key
+    save_config(cfg)
+    clear_state(message.from_user.id)
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        me = api.get_balance()
+        balance = me.get("balance", me.get("balance_usd", "?"))
+        text = f"✅ <b>API-ключ сохранён.</b>\n\n💰 Баланс: <b>{_esc(balance)} USD</b>"
+    except Exception as e:
+        text = f"⚠️ <b>Ключ сохранён, но проверка баланса не удалась:</b>\n\n<blockquote>{_esc(e)}</blockquote>"
+    _send_telegram_message(c, message.chat.id, text, reply_to=message, kb=_main_keyboard())
+
+_VALID_SKU_KINDS = {m.value for m in MappingKind}
+
+
+def _parse_sku(sku: str) -> Tuple[str, str, str]:
+    s = (sku or "").strip()
+    if not s:
+        raise ValueError("SKU не может быть пустым.")
+    parts = s.split(":", 2)
+    if len(parts) < 3:
+        raise ValueError("SKU должен быть в формате kind:category_id:offer_id.")
+    kind, category_id, offer_id = parts
+    if kind not in _VALID_SKU_KINDS:
+        raise ValueError(f"Неизвестный kind: {kind}. Допустимые: {', '.join(sorted(_VALID_SKU_KINDS))}.")
+    if not category_id or not offer_id:
+        raise ValueError("category_id и offer_id не могут быть пустыми.")
+    return kind, category_id, offer_id
+
+
+def _resolve_manual_sku(
+    c: "Cardinal",
+    api_key: str,
+    base_url: str,
+    kind: str,
+    category_id: str,
+    offer_id: str,
+    data: Dict[str, Any],
+) -> None:
+    if kind not in _VALID_SKU_KINDS:
+        return
+    try:
+        api = get_fzr_client(api_key, base_url)
+        page = api.get_offers(kind, category_id, include_ui=True)
+        norm = _normalize_catalog_page(kind, page, False)
+        for it in norm.get("items", []):
+            if str(it.get("id")) == offer_id:
+                data["offer_name"] = str(it.get("name", ""))
+                data["price_usd"] = str(it.get("price_usd") or "")
+                data["fields"] = it.get("fields") or []
+                for k in ("stock", "min_quantity", "max_quantity"):
+                    if k in it:
+                        data[k] = it[k]
+                return
+    except Exception as e:
+        logger.warning("resolve_manual_sku failed", extra={"kind": kind, "category_id": category_id, "offer_id": offer_id, "error": _redact_sensitive(str(e))})
+
+
+def _step_mapping_sku(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    logger.info("step_mapping_sku start", extra={"user_id": user_id, "state": state.get("state"), "text": (message.text or "")[:200]})
+    try:
+        kind, category_id, offer_id = _parse_sku(message.text)
+    except ValueError as e:
+        _send_telegram_message(
+            c,
+            message.chat.id,
+            f"❌ {_esc(e)}\n\n"
+            "Формат: <code>kind:category_id:offer_id</code>\n"
+            "Для Steam Gifts: <code>steam-gifts:appid:sub_id:region</code>\n"
+            "Пример: <code>giftcards:123:456</code>",
+            reply_to=message,
+        )
+        return
+    data = state["data"]
+    data["sku"] = f"{kind}:{category_id}:{offer_id}"
+    data["category_kind"] = kind
+    data["category_id"] = category_id
+    data["offer_id"] = offer_id
+    cfg = load_config()
+    if cfg.get("api_key"):
+        _resolve_manual_sku(c, cfg["api_key"], cfg["base_url"], kind, category_id, offer_id, data)
+    state["state"] = "mapping_lot"
+    _send_telegram_message(
+        c,
+        message.chat.id,
+        f"✅ SKU: <code>{_esc(kind)}:{_esc(category_id)}:{_esc(offer_id)}</code>\n\n"
+        "Введите <b>ID лота FunPay</b>, к которому привязать этот товар:",
+        reply_to=message,
+    )
+
+def _step_mapping_lot(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    raw_lot = (message.text or "").strip()
+    logger.info("step_mapping_lot start", extra={"user_id": user_id, "state": state.get("state"), "text": raw_lot[:200]})
+    lot_raw = raw_lot
+    lot_id: Optional[int] = None
+    lot_title = ""
+    subcategory_id: Optional[int] = None
+
+    m = re.search(r"[?&]id=(\d+)", lot_raw)
+    if m:
+        lot_id = int(m.group(1))
+    elif lot_raw.isdigit():
+        lot_id = int(lot_raw)
+    else:
+        # Если пользователь ввёл SKU вместо ID лота — подскажем правильный flow
+        if raw_lot and ":" in raw_lot and _parse_sku is not None:
+            try:
+                _parse_sku(raw_lot)
+                _send_telegram_message(
+                    c,
+                    message.chat.id,
+                    "❌ Сейчас нужен <b>ID лота FunPay</b> или ссылка, а не SKU.\n\n"
+                    "Если вы хотите <b>создать новый лот</b> с этим SKU: /cancel → 🆕 <b>Создать лот</b>.\n"
+                    "Если вы хотите <b>привязать к существующему лоту</b> — введите его ID.",
+                    reply_to=message,
+                )
+                return
+            except Exception:
+                pass
+        _send_telegram_message(
+            c,
+            message.chat.id,
+            "❌ Введите числовой <b>ID лота</b> или ссылку вида <code>https://funpay.com/lots/offer?id=123</code>.",
+            reply_to=message,
+        )
+        return
+
+    try:
+        lot_fields = c.account.get_lot_fields(lot_id)
+        lot_title = lot_fields.title_ru or lot_fields.title_en or f"Лот {lot_id}"
+        subcategory_id = lot_fields.subcategory.id if lot_fields.subcategory else None
+    except Exception as e:
+        _send_telegram_message(c, message.chat.id, f"❌ Не удалось получить лот <b>{_esc(lot_id)}</b>:\n\n<blockquote>{_esc(e)}</blockquote>", reply_to=message)
+        return
+
+    state["data"]["lot_id"] = lot_id
+    state["data"]["lot_title"] = lot_title
+    state["data"]["subcategory_id"] = subcategory_id
+    # наценка привязки: 0 = наследуется из глобальных настроек (см. _apply_markup)
+    state["data"].setdefault("markup_percent", None)
+    state["data"].setdefault("markup_fixed", None)
+    _fzr_ask_mapping_meta_or_delivery(c, message, state)
+
+def _fzr_ask_mapping_meta_or_delivery(c: "Cardinal", target: Any, state: Dict[str, Any]) -> None:
+    data = state["data"]
+    fields = data.get("fields") or []
+    if fields and isinstance(fields, list) and len(fields) > 0:
+        meta_fields: List[Dict[str, Any]] = []
+        for f in fields:
+            key = f.get("code") or f.get("key") or ""
+            label = f.get("name") or f.get("label") or key
+            if not key:
+                continue
+            meta_fields.append(_make_metadata_field(key, label, f))
+        if meta_fields:
+            data["metadata_fields"] = meta_fields
+            data["metadata_key"] = meta_fields[0]["key"]
+            data["metadata_prompt"] = meta_fields[0]["label"]
+            state["state"] = "mapping_delivery"
+            lines = []
+            for f in meta_fields:
+                if _is_select_field(f):
+                    opts = _field_options(f)
+                    lines.append(f"<code>{_esc(f['key'])}</code> — {_esc(f['label'])} "
+                                 f"🔽 выбор из {len(opts)}: {_format_select_options_html(f, 5)}")
+                else:
+                    lines.append(f"<code>{_esc(f['key'])}</code> — {_esc(f['label'])}")
+            fields_text = "\n".join(lines)
+            _send_telegram_message(
+                c,
+                target.chat.id,
+                f"✅ Лот найден: <b>{_esc(data.get('lot_title', ''))}</b>\n\n"
+                "<b>Метаданные для заказа настроены.</b>\n\n"
+                f"{fields_text}\n\n"
+                "Введите <b>шаблон выдачи</b> или отправьте <b>-</b> для использования стандартного.\n\n"
+                "Доступные переменные: <code>{code}</code>, <code>{codes}</code>, "
+                "<code>{order_number}</code>, <code>{funpay_order_id}</code>, <code>{buyer}</code>.",
+                reply_to=target,
+            )
+            return
+    state["state"] = "mapping_meta"
+    _send_telegram_message(
+        c,
+        target.chat.id,
+        f"✅ Лот найден: <b>{_esc(data.get('lot_title', ''))}</b>\n\n"
+        "Введите <b>ключ метаданных</b> для FazerCards API, если требуется "
+        "(например <code>player_id</code> для PUBG UC, <code>steam_id</code> для Steam-wallet).\n\n"
+        "Если метаданные не нужны — отправьте <b>-</b>.",
+        reply_to=target,
+    )
+
+def _step_mapping_markup(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    state["data"]["markup_percent"] = None
+    state["data"]["markup_fixed"] = None
+    _fzr_ask_mapping_meta_or_delivery(c, message, state)
+
+
+
+
+def _step_mapping_meta(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    key = message.text.strip()
+    if key in ("-", ""):
+        state["data"]["metadata_key"] = ""
+        state["data"]["metadata_prompt"] = ""
+        state["data"]["metadata_fields"] = []
+        state["state"] = "mapping_delivery"
+        _send_telegram_message(
+            c,
+            message.chat.id,
+            "✅ <b>Метаданные не требуются.</b>\n\n"
+            "Введите <b>шаблон выдачи</b> или отправьте <b>-</b> для использования стандартного.",
+            reply_to=message,
+        )
+        return
+    error = _validate_non_empty(key, "Ключ метаданных", max_len=100)
+    if error:
+        _send_telegram_message(c, message.chat.id, f"❌ {error}", reply_to=message)
+        return
+    state["data"]["metadata_key"] = key
+    state["data"]["metadata_validation"] = _infer_validation(key)
+    state["state"] = "mapping_meta_prompt"
+    _send_telegram_message(
+        c,
+        message.chat.id,
+        f"🔑 Ключ метаданных: <code>{_esc(key)}</code>\n\n"
+        "Введите <b>текст запроса</b>, который бот отправит покупателю для получения значения:",
+        reply_to=message,
+    )
+
+
+
+def _step_mapping_meta_prompt(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    prompt = message.text.strip()
+    error = _validate_non_empty(prompt, "Текст запроса", max_len=500)
+    if error:
+        _send_telegram_message(c, message.chat.id, f"❌ {error}", reply_to=message)
+        return
+    data = state["data"]
+    data["metadata_prompt"] = prompt
+    key = data.get("metadata_key", "")
+    if key:
+        # если это поле из API помечено как select — сохраняем варианты
+        raw = next((f for f in (data.get("fields") or [])
+                    if str(f.get("code") or f.get("key") or "") == key), None)
+        if raw is not None and _is_select_field(raw):
+            data["metadata_fields"] = [_make_metadata_field(key, prompt or key, raw)]
+        else:
+            data["metadata_fields"] = [{"key": key, "label": prompt or key,
+                                        "validation": data.get("metadata_validation") or _infer_validation(key, prompt)}]
+    else:
+        data["metadata_fields"] = []
+    state["state"] = "mapping_delivery"
+    _send_telegram_message(
+        c,
+        message.chat.id,
+        "✅ <b>Запрос метаданных сохранён.</b>\n\n"
+        "Введите <b>шаблон выдачи</b> или отправьте <b>-</b> для использования стандартного.\n\n"
+        "Доступные переменные: <code>{code}</code>, <code>{codes}</code>, "
+        "<code>{order_number}</code>, <code>{funpay_order_id}</code>, <code>{buyer}</code>.",
+        reply_to=message,
+    )
+
+
+
+def _step_mapping_delivery(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    tpl = message.text.strip()
+    if tpl in ("-", ""):
+        tpl = ""
+    else:
+        try:
+            _validate_template(tpl)
+            render_template(
+                tpl,
+                default=DEFAULT_CONFIG["templates"]["delivery"],
+                code="TEST",
+                codes="TEST1\nTEST2",
+                fzr_order_id="fzr-123",
+                order_number="ord-123",
+                funpay_order_id="fp-123",
+                buyer="buyer",
+                sku="sku",
+            )
+        except Exception as e:
+            _send_telegram_message(
+                c,
+                message.chat.id,
+                f"❌ <b>Шаблон некорректный:</b>\n\n<blockquote>{_esc(e)}</blockquote>\n\n"
+                "Отправьте <b>-</b> для использования стандартного шаблона.",
+                reply_to=message,
+            )
+            return
+
+    cfg = load_config()
+    data = state["data"]
+    mapping = {
+        "id": str(uuid.uuid4()),
+        "fzr_sku_id": data.get("sku", ""),
+        "category_kind": data.get("category_kind", "giftcards"),
+        "category_id": data.get("category_id", ""),
+        "offer_id": data.get("offer_id", ""),
+        "offer_name": data.get("offer_name", ""),
+        "price_usd": data.get("price_usd", ""),
+        "stock": data.get("stock"),
+        "min_quantity": data.get("min_quantity"),
+        "max_quantity": data.get("max_quantity"),
+        "fields": data.get("fields", []),
+        "funpay_lot_id": data["lot_id"],
+        "funpay_subcategory_id": data.get("subcategory_id"),
+        "funpay_title": data.get("lot_title", ""),
+        # None = наследовать глобальную наценку (0 означал бы «ровно 0%»)
+        "markup_percent": None,
+        "markup_fixed": None,
+        "metadata_key": data.get("metadata_key", ""),
+        "metadata_prompt": data.get("metadata_prompt", ""),
+        "metadata_validation": data.get("metadata_validation", ""),
+        "metadata_fields": data.get("metadata_fields", []),
+        "delivery_template": tpl,
+        "enabled": True,
+        "price_sync": 1,
+    }
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    display = _esc(mapping.get("offer_name") or mapping["fzr_sku_id"])
+    _send_telegram_message(
+        c,
+        message.chat.id,
+        f"✅ <b>Привязка создана:</b>\n\n"
+        f"<blockquote><code>{display}</code> ➜ FunPay лот <b>{_esc(mapping['funpay_lot_id'])}</b>\n"
+        f"📌 {_esc(mapping['funpay_title'])}</blockquote>",
+        reply_to=message,
+        kb=_main_keyboard(),
+    )
+
+
+def _step_mapping_confirm_del(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    data = state.get("data", {})
+    mapping_id = data.get("mapping_id")
+    if not mapping_id:
+        clear_state(user_id)
+        return
+    text = (message.text or "").strip().lower()
+    if text == "да":
+        mapping = _db_get_mapping_by_id(mapping_id)
+        if mapping:
+            _db_delete_mapping(mapping_id)
+            _send_telegram_message(c, message.chat.id, f"✅ <b>Привязка <code>{_esc(mapping.get('fzr_sku_id'))}</code> удалена.</b>", reply_to=message, kb=_main_keyboard())
+        else:
+            _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", reply_to=message, kb=_main_keyboard())
+    else:
+        _send_telegram_message(c, message.chat.id, "❌ <b>Удаление отменено.</b>", reply_to=message, kb=_main_keyboard())
+    clear_state(user_id)
+
+
+
+
+def _show_balance(c: "Cardinal", call: Any) -> None:
+    """
+    Раздел «Локальный баланс» (v3.19).
+
+    Показываем свой учёт и, если получится, общий баланс ключа — чтобы было
+    видно расхождение: общий делят несколько человек, свой считает только этот
+    плагин.
+    """
+    cfg = load_config()
+    if not cfg["settings"].get("local_balance", True):
+        # локальный учёт выключен — показываем прежний экран аккаунта FazerCards
+        _show_account(c, call)
+        return
+    balance = _db_local_balance()
+    totals = _db_ledger_totals()
+    try:
+        low = float(cfg["settings"].get("local_balance_low", 0) or 0)
+    except (TypeError, ValueError):
+        low = 0.0
+
+    if balance < 0:
+        head = f"🔴 <b>Локальный баланс: {_fmt_usd(balance)}</b>"
+        note = (f"\n<b>Нужно внести {_fmt_usd(abs(balance))}</b>, чтобы выйти в ноль.")
+    elif low > 0 and balance < low:
+        head = f"🟡 <b>Локальный баланс: {_fmt_usd(balance)}</b>"
+        note = f"\n<i>Ниже порога {_fmt_usd(low)} — скоро уйдёт в минус.</i>"
+    else:
+        head = f"🟢 <b>Локальный баланс: {_fmt_usd(balance)}</b>"
+        note = ""
+
+    lines = [head, note.strip(), ""] if note else [head, ""]
+    lines.append(
+        "<blockquote>"
+        f"➕ Внесено: <b>{_fmt_usd(totals.get('topup', 0))}</b>"
+        + (f" <i>({int(totals.get('topup_count', 0))} шт.)</i>"
+           if totals.get("topup_count") else "") + "\n"
+        f"➖ Закупки: <b>{_fmt_usd(totals.get('order', 0))}</b>"
+        + (f" <i>({int(totals.get('order_count', 0))} шт.)</i>"
+           if totals.get("order_count") else "") + "\n"
+        + (f"↩️ Возвраты: <b>{_fmt_usd(totals.get('refund', 0), sign=True)}</b>\n"
+           if totals.get("refund") else "")
+        + (f"✏️ Корректировки: <b>{_fmt_usd(totals.get('correction', 0), sign=True)}</b>\n"
+           if totals.get("correction") else "")
+        + (f"🔔 Порог предупреждения: {_fmt_usd(low)}" if low > 0
+           else "🔔 Предупреждать только при минусе")
+        + "</blockquote>")
+
+    # общий баланс ключа — для сверки. Ошибку не раздуваем: раздел про свой учёт
+    if cfg["api_key"]:
+        try:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            bal = api.get_balance()
+            shared = float(bal.get("balance_usd", bal.get("balance", 0)) or 0)
+            diff = round(shared - balance, 2)
+            lines.append(
+                f"<blockquote>🌐 Общий баланс ключа: <b>{_fmt_usd(shared)}</b>\n"
+                f"<i>Разница с вашим: {_fmt_usd(diff, sign=True)} — это деньги "
+                f"других участников ключа.</i></blockquote>")
+        except Exception as e:
+            lines.append(f"<blockquote>🌐 Общий баланс ключа: <i>не ответил</i>\n"
+                         f"<i>{_esc(str(e)[:120])}</i></blockquote>")
+
+    last = _db_ledger_list(limit=5)
+    if last:
+        rows = []
+        for op in last:
+            rows.append(f"{_ledger_icon(op)} {_fmt_usd(op['amount_usd'], sign=True)} · "
+                        f"{_esc(_ledger_title(op))} · {_esc(_ago(op.get('created_at')))}")
+        lines.append("<blockquote><b>Последние операции</b>\n" + "\n".join(rows)
+                     + "</blockquote>")
+    else:
+        lines.append("<i>Операций пока нет. Нажмите «Пополнить» и внесите сумму, "
+                     "которую вы закинули на общий ключ.</i>")
+
+    lines.append("<i>Этот баланс ничего не блокирует: заказы создаются и "
+                 "выдаются даже в минусе — покупатель уже заплатил. Минус — "
+                 "сигнал вам, что пора пополнить общий ключ.</i>")
+    _send_or_edit(c, call, "\n".join(l for l in lines if l), kb=_balance_kb())
+
+
+def _ledger_icon(op: Dict[str, Any]) -> str:
+    kind = str(op.get("kind") or "")
+    if kind == "topup":
+        return "➕"
+    if kind == "order":
+        return "🛒"
+    if kind == "refund":
+        return "↩️"
+    if kind == "init":
+        return "🎬"
+    return "✏️"
+
+
+def _ledger_title(op: Dict[str, Any]) -> str:
+    base = _LEDGER_KINDS.get(str(op.get("kind")), str(op.get("kind") or "операция"))
+    order_id = op.get("funpay_order_id")
+    if order_id:
+        return f"{base} · заказ {order_id}"
+    comment = str(op.get("comment") or "").strip()
+    return f"{base}: {comment[:60]}" if comment else base
+
+
+def _show_balance_history(c: "Cardinal", call: Any, arg: str = "0") -> None:
+    """История операций с пагинацией — чтобы любую цифру можно было объяснить."""
+    try:
+        page = max(0, int(arg or 0))
+    except (TypeError, ValueError):
+        page = 0
+    per_page = 10
+    total = _db_ledger_count()
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages - 1)
+    ops = _db_ledger_list(limit=per_page, offset=page * per_page)
+
+    lines = [f"📜 <b>История баланса</b> <i>(стр. {page + 1}/{pages}, всего {total})</i>", ""]
+    if not ops:
+        lines.append("<i>Операций пока нет.</i>")
+    for op in ops:
+        parts = [f"{_ledger_icon(op)} <b>{_fmt_usd(op['amount_usd'], sign=True)}</b>",
+                 f"→ остаток {_fmt_usd(op.get('balance_after'))}"]
+        lines.append(" ".join(parts))
+        detail = [_esc(_ledger_title(op)), _esc(_ago(op.get("created_at")))]
+        if op.get("fzr_order_id"):
+            detail.append(f"FZR {_esc(op['fzr_order_id'])}")
+        lines.append(f"<i>{' · '.join(detail)}</i>")
+    kb = InlineKeyboardMarkup(row_width=2)
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=f"{CB_PREFIX}:bal_history:{page - 1}"))
+    if page < pages - 1:
+        nav.append(_inline_button("➡️", callback_data=f"{CB_PREFIX}:bal_history:{page + 1}"))
+    if nav:
+        kb.add(*nav)
+    kb.add(_inline_button("💼 Баланс", callback_data=f"{CB_PREFIX}:balance"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _balance_topup_prompt(c: "Cardinal", call: Any) -> None:
+    balance = _db_local_balance()
+    set_state(getattr(getattr(call, "from_user", None), "id", None), "bal_topup", {})
+    hint = ""
+    if balance < 0:
+        hint = (f"\n<i>Чтобы выйти в ноль, внесите {_fmt_usd(abs(balance))} "
+                f"или больше.</i>")
+    _send_or_edit(
+        c, call,
+        "➕ <b>Пополнение локального баланса</b>\n\n"
+        f"<blockquote>Сейчас: <b>{_fmt_usd(balance)}</b></blockquote>\n"
+        f"Отправьте сумму в USD, которую вы закинули на общий ключ "
+        f"(например <code>50</code> или <code>25.5</code>).{hint}\n\n"
+        "<i>Можно добавить комментарий через пробел: <code>50 перевод с карты</code>.\n"
+        "Это только ваш учёт — на сам FazerCards деньги так не попадут.</i>",
+        kb=_cancel_kb())
+
+
+def _balance_correct_prompt(c: "Cardinal", call: Any) -> None:
+    balance = _db_local_balance()
+    set_state(getattr(getattr(call, "from_user", None), "id", None), "bal_correct", {})
+    _send_or_edit(
+        c, call,
+        "✏️ <b>Корректировка баланса</b>\n\n"
+        f"<blockquote>Сейчас: <b>{_fmt_usd(balance)}</b></blockquote>\n"
+        "Отправьте, на сколько изменить: <code>-12.5</code> (списать) или "
+        "<code>+30</code> (добавить).\n"
+        "Чтобы задать баланс ровно: <code>=100</code>.\n\n"
+        "<i>Нужно, если закупку сделали вручную мимо плагина или в учёте "
+        "накопилась ошибка. Каждая корректировка остаётся в истории.</i>",
+        kb=_cancel_kb())
+
+
+def _parse_balance_amount(raw: str) -> Tuple[Optional[float], str, str]:
+    """
+    Разбирает «50», «-12.5», «=100», «50 комментарий».
+
+    Возвращает (сумма, режим, комментарий), режим — `delta` или `set`.
+    Запятая как разделитель дробной части: продавцы пишут «25,5».
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, "", ""
+    mode = "delta"
+    if text.startswith("="):
+        mode = "set"
+        text = text[1:].strip()
+    parts = text.split(None, 1)
+    number = parts[0].replace(",", ".").replace("−", "-").replace("$", "")
+    comment = parts[1].strip() if len(parts) > 1 else ""
+    try:
+        value = float(number)
+    except ValueError:
+        return None, mode, comment
+    if not math.isfinite(value):
+        return None, mode, comment
+    return value, mode, comment
+
+
+def _step_balance_topup(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    amount, _mode, comment = _parse_balance_amount(message.text or "")
+    if amount is None:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Введите сумму в USD, например <code>50</code> "
+                               "или <code>25.5</code>.", reply_to=message)
+        return
+    if amount <= 0:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Сумма пополнения должна быть больше нуля.\n"
+                               "<i>Чтобы списать, используйте «Корректировка».</i>",
+                               reply_to=message)
+        return
+    if amount > 1_000_000:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Слишком большая сумма — проверьте, нет ли опечатки.",
+                               reply_to=message)
+        return
+    before = _db_local_balance()
+    after = _db_ledger_add("topup", amount, comment=comment or "пополнение вручную")
+    clear_state(message.from_user.id)
+    covered = ""
+    if before < 0 <= (after or 0):
+        covered = "\n✅ <i>Долг закрыт — баланс снова в плюсе.</i>"
+    elif before < 0 and (after or 0) < 0:
+        covered = (f"\n🔴 <i>Всё ещё минус: не хватает "
+                   f"{_fmt_usd(abs(after or 0))}.</i>")
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ <b>Баланс пополнен на {_fmt_usd(amount)}</b>\n\n"
+        f"<blockquote>{_fmt_usd(before)} → <b>{_fmt_usd(after)}</b></blockquote>"
+        + (f"<i>{_esc(comment)}</i>\n" if comment else "") + covered,
+        kb=_balance_kb())
+    # пополнение могло вывести из минуса — состояние алертов надо обновить
+    _balance_check_and_alert(c, after)
+
+
+def _step_balance_correct(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    amount, mode, comment = _parse_balance_amount(message.text or "")
+    if amount is None:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Введите <code>-12.5</code>, <code>+30</code> "
+                               "или <code>=100</code>.", reply_to=message)
+        return
+    before = _db_local_balance()
+    if mode == "set":
+        delta = round(amount - before, 6)
+        if abs(delta) < 1e-9:
+            clear_state(message.from_user.id)
+            _send_telegram_message(c, message.chat.id,
+                                   f"ℹ️ Баланс уже равен {_fmt_usd(amount)} — "
+                                   f"ничего не менял.", kb=_balance_kb())
+            return
+        note = comment or f"выставлен вручную: {amount:.2f} $"
+    else:
+        delta = amount
+        note = comment or "корректировка вручную"
+    if abs(delta) > 1_000_000:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Слишком большое изменение — проверьте опечатку.",
+                               reply_to=message)
+        return
+    after = _db_ledger_add("correction", delta, comment=note)
+    clear_state(message.from_user.id)
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ <b>Корректировка {_fmt_usd(delta, sign=True)}</b>\n\n"
+        f"<blockquote>{_fmt_usd(before)} → <b>{_fmt_usd(after)}</b></blockquote>"
+        + (f"<i>{_esc(note)}</i>" if note else ""),
+        kb=_balance_kb())
+    _balance_check_and_alert(c, after)
+
+
+def _show_account(c: "Cardinal", call: Any) -> None:
+    """
+    Состояние аккаунта FazerCards: баланс, план, срок подписки.
+
+    Держим вместе, потому что продажи останавливают ровно две вещи —
+    кончились деньги или кончилась подписка.
+    """
+    cfg = load_config()
+    if not cfg["api_key"]:
+        _send_or_edit(c, call, "❌ <b>Сначала установите API-ключ.</b>", kb=_main_keyboard())
+        return
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+
+    lines = ["👤 <b>Аккаунт FazerCards</b>", ""]
+    balance: Optional[float] = None
+    try:
+        bal = api.get_balance()
+        raw = bal.get("balance_usd", bal.get("balance", "?"))
+        try:
+            balance = float(raw)
+        except (TypeError, ValueError):
+            balance = None
+        lines.append(f"<blockquote>💰 Баланс: <b>{_esc(raw)} USD</b>")
+        try:
+            threshold = float(cfg["settings"].get("low_balance_threshold", 0) or 0)
+        except (TypeError, ValueError):
+            threshold = 0.0
+        if threshold > 0:
+            state = "🟢 выше порога" if (balance or 0) >= threshold else "🔴 ниже порога"
+            lines.append(f"🔔 Порог алерта: {threshold:.2f} USD — {state}")
+        else:
+            lines.append("🔔 Алерт о низком балансе: <i>выключен</i>")
+        lines.append("</blockquote>")
+    except Exception as e:
+        lines.append(f"<blockquote>💰 Баланс: <i>ошибка</i>\n{_esc(str(e)[:200])}</blockquote>")
+
+    try:
+        me = api.get_me()
+        sub = api.get_subscription()
+        left = _days_left(sub.get("planExpiresAt"))
+        active = bool(sub.get("subscriptionActive"))
+        if not active or (left is not None and left <= 0):
+            mark = "🔴 неактивна"
+        elif left is not None and left <= float(cfg["settings"].get("sub_alert_days", 5) or 5):
+            mark = f"🟡 истекает через {left:.1f} дн."
+        else:
+            mark = f"🟢 активна ещё {left:.0f} дн." if left is not None else "🟢 активна"
+        lines.append(
+            f"<blockquote>🎫 Подписка: {mark}\n"
+            f"План: <b>{_esc(sub.get('plan') or '—')}</b>\n"
+            f"До: <b>{_esc(_fmt_date(sub.get('planExpiresAt')))}</b>\n"
+            f"Автопродление: {'🟢 вкл' if sub.get('planAutoRenew') else '🔴 выкл'}</blockquote>")
+        summary = me.get("summary") or {}
+        lines.append(
+            f"<blockquote>🧾 Логин: <b>{_esc(me.get('login') or '—')}</b>\n"
+            f"Заказов всего: <b>{_esc(summary.get('totalOrders', 0))}</b>\n"
+            f"Потрачено: <b>{_esc(summary.get('totalSpent', '0'))} USD</b></blockquote>")
+        if not sub.get("planAutoRenew"):
+            lines.append("<i>Автопродление выключено — продлевать нужно вручную, "
+                         "иначе автовыдача остановится.</i>")
+    except Exception as e:
+        lines.append(f"<blockquote>🎫 Подписка: <i>ошибка</i>\n{_esc(str(e)[:200])}</blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:account"),
+           _inline_button("🛡 Проверки", callback_data=f"{CB_PREFIX}:settings_sec:checks"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _show_catalog(c: "Cardinal", call: Any, arg: str = "") -> None:
+    cfg = load_config()
+    if not cfg["api_key"]:
+        _send_or_edit(c, call, "❌ <b>Сначала установите API-ключ.</b>")
+        return
+
+    data = _catalog_parse(arg)
+    kind = data.get("kind")
+    category_id = data.get("category_id")
+    cursor = data.get("cursor") or None
+    history = data.get("history") or []
+    category_name = data.get("category_name", "Каталог")
+
+    if not kind:
+        kb = InlineKeyboardMarkup(row_width=2)
+        kinds = [
+            ("gamekeys", "🎮 Game Keys"),
+            ("steam-gifts", "🎁 Steam Gifts"),
+            ("steam-topup", "💳 Пополнить Steam"),
+            ("giftcards", "🎁 Gift Cards"),
+            ("topups", "💎 Top-ups"),
+            ("manual-services", "🛠 Manual Services"),
+            ("telegram-stars", "⭐ Telegram Stars"),
+            ("telegram-premium", "👑 Telegram Premium"),
+        ]
+        for k, label in kinds:
+            cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=k)}")
+            kb.add(_inline_button(label, callback_data=cb))
+        kb.add(_search_button("catalog_global", {}, label="🔍 Поиск по каталогам"))
+        # Баг v3.13: «Назад» на корне каталога вела на сам корень каталога
+        # (`catalog:`) — экран не менялся, кнопка выглядела нерабочей.
+        # Если сюда пришли из мастера создания лота — возвращаем в мастер.
+        wiz = _wizard_state(getattr(getattr(call, "from_user", None), "id", None))
+        if wiz is not None:
+            kb.add(_inline_button("🔙 К созданию лота",
+                                  callback_data=f"{CB_PREFIX}:create_lot_back_to_wizard"))
+        else:
+            kb.add(_inline_button("🔙 Меню", callback_data=f"{CB_PREFIX}:menu"))
+        _send_or_edit(c, call, "📦 <b>Каталог FazerCards</b>\n\n<i>Выберите категорию товаров:</i>", kb=kb)
+        return
+
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        if not category_id:
+            page = _get_catalog_page(api, kind, None, cursor)
+            items = page["items"]
+            kb = InlineKeyboardMarkup(row_width=1)
+            for it in items:
+                name = _esc(it["name"])
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=it['id'], category_name=it['name'])}")
+                kb.add(_inline_button(f"📂 {name}", callback_data=cb))
+            nav = []
+            if history:
+                prev_cursor = history[-1]
+                back_hist = history[:-1]
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, cursor=prev_cursor, history=back_hist)}")
+                nav.append(_inline_button("⬅️ Назад", callback_data=cb))
+            if page.get("next_cursor"):
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, cursor=page['next_cursor'], history=history + [cursor])}")
+                nav.append(_inline_button("➡️ Далее", callback_data=cb))
+            if nav:
+                kb.add(*nav)
+            kb.add(_search_button("catalog_categories", {"kind": kind}))
+            # v3.15: из мастера возвращаемся в мастер, а не в главное меню —
+            # иначе выход из каталога незаметно бросал создание лота
+            if _wizard_state(getattr(getattr(call, "from_user", None), "id", None)) is not None:
+                kb.add(_inline_button("🔙 К созданию лота",
+                                      callback_data=f"{CB_PREFIX}:create_lot_back_to_wizard"))
+            else:
+                kb.add(_inline_button("🔙 Назад", callback_data=_pack_callback_data(f"{CB_PREFIX}:catalog:")))
+            text = f"📦 <b>{_esc(_catalog_kind_label(kind))}</b>\n\n<i>Выберите подкатегорию:</i>" if items else "Каталог пуст."
+            _send_or_edit(c, call, text, kb=kb)
+        else:
+            edition_id = data.get("edition_id")
+            edition_name = data.get("edition_name", "")
+            page = _get_catalog_page(api, kind, category_id, cursor, edition_id=edition_id)
+            items = page["items"]
+            kb = InlineKeyboardMarkup(row_width=1)
+            for it in items:
+                name = _esc(it["name"])
+                price = _esc(str(it.get("price_usd") or "—"))
+                suffix = ""
+                if it.get("stock") is not None:
+                    suffix = f" | stock {it['stock']}"
+                fields = it.get("fields") or []
+                if kind == "steam-gifts" and it.get("type") == "edition":
+                    cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=category_id, category_name=category_name, edition_id=it['id'], edition_name=it['name'])}")
+                    kb.add(_inline_button(f"📦 {name}", callback_data=cb))
+                else:
+                    select_data = {
+                        "kind": kind,
+                        "category_id": category_id,
+                        "category_name": category_name,
+                        "offer_id": it['id'],
+                        "offer_name": it['name'],
+                        "price_usd": str(it.get('price_usd') or ''),
+                        "fields": fields,
+                        "stock": it.get('stock'),
+                        "min_quantity": it.get('min_quantity'),
+                        "max_quantity": it.get('max_quantity'),
+                    }
+                    if kind == "steam-gifts" and edition_id:
+                        select_data["edition_id"] = edition_id
+                        select_data["edition_name"] = edition_name
+                    cb = _pack_callback_data(f"{CB_PREFIX}:catalog_select:{_catalog_arg(**select_data)}")
+                    # цена в рублях с наценкой полезнее, чем сырые USD
+                    _rub = _apply_markup(it.get("price_usd"), {}, load_config())
+                    _price_label = f"{price} USD" if _rub is None else f"{_rub}₽"
+                    _fields_mark = f" · 🧩{len(fields)}" if fields else ""
+                    kb.add(_inline_button(f"🛒 {name} — 💵 {_price_label}{suffix}{_fields_mark}",
+                                          callback_data=cb))
+            nav = []
+            if history:
+                prev_cursor = history[-1]
+                back_hist = history[:-1]
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=category_id, category_name=category_name, edition_id=edition_id, edition_name=edition_name, cursor=prev_cursor, history=back_hist)}")
+                nav.append(_inline_button("⬅️ Назад", callback_data=cb))
+            if page.get("next_cursor"):
+                cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{_catalog_arg(kind=kind, category_id=category_id, category_name=category_name, edition_id=edition_id, edition_name=edition_name, cursor=page['next_cursor'], history=history + [cursor])}")
+                nav.append(_inline_button("➡️ Далее", callback_data=cb))
+            if nav:
+                kb.add(*nav)
+            if kind == "steam-gifts" and edition_id:
+                back_arg = _catalog_arg(kind=kind, category_id=category_id, category_name=category_name)
+            elif category_id:
+                back_arg = _catalog_arg(kind=kind)
+            else:
+                back_arg = ""
+            back = _pack_callback_data(f"{CB_PREFIX}:catalog:{back_arg}")
+            if kind == "steam-gifts" and edition_id is None:
+                kb.add(_search_button("catalog_offers", {"kind": kind, "category_id": category_id, "category_name": category_name}))
+            kb.add(_inline_button("🔙 Назад", callback_data=back))
+            if kind == "steam-gifts" and edition_id is None:
+                text = f"📦 <b>{_esc(category_name)}</b>\n\n<i>Выберите издание:</i>" if items else "Издания отсутствуют."
+            else:
+                text = f"📦 <b>{_esc(category_name)}{(' — ' + _esc(edition_name)) if edition_name else ''}</b>\n\n<i>Выберите товар для привязки:</i>" if items else "Товары отсутствуют."
+            _send_or_edit(c, call, text, kb=kb)
+    except Exception as e:
+        text = f"❌ <b>Ошибка загрузки каталога</b>\n\n<blockquote>{_esc(e)}</blockquote>"
+        _send_or_edit(c, call, text, kb=_main_keyboard())
+
+
+def _catalog_select(c: "Cardinal", call: Any, arg: str) -> None:
+    user_id = call.from_user.id
+    logger.info("catalog_select start", extra={"user_id": user_id})
+    data = _catalog_parse(arg)
+    kind = data.get("kind")
+    category_id = data.get("category_id")
+    offer_id = data.get("offer_id")
+    offer_name = data.get("offer_name", "")
+    price_usd = data.get("price_usd", "")
+    fields = data.get("fields") or []
+    category_name = data.get("category_name", "")
+    edition_id = data.get("edition_id")
+    edition_name = data.get("edition_name", "")
+    if not kind or not category_id or not offer_id:
+        _send_or_edit(c, call, "❌ <b>Ошибка: не выбран товар.</b>")
+        return
+    sku = f"{kind}:{category_id}:{offer_id}"
+    # Если пользователь выбирает SKU в процессе создания лота — подставляем его
+    # и ведём на экран подтверждения (там же тумблер синхронизации цены).
+    # Раньше лот создавался сразу, без возможности что-то проверить.
+    # Флаг selecting_sku не требуем: в состоянии мастера любой выбор товара
+    # из каталога — это выбор SKU для создаваемого лота.
+    #
+    # v3.15: мастер может быть спрятан в состоянии поиска (см. _fzr_search_prompt).
+    # Раньше здесь читался только get_state(), поэтому «нашёл товар поиском» =
+    # «мастер потерян» и плагин спрашивал ID лота FunPay.
+    create_state = get_state(user_id)
+    if create_state and create_state.get("state") == "search":
+        saved = (create_state.get("data") or {}).get("wizard")
+        if isinstance(saved, dict) and saved.get("state") in _WIZARD_STATES:
+            set_state(user_id, saved["state"], saved.get("data") or {})
+            create_state = get_state(user_id)
+    if create_state and create_state.get("state") in _WIZARD_STATES:
+        c_data = create_state["data"]
+        c_data["sku"] = sku
+        c_data["category_kind"] = kind
+        c_data["category_id"] = category_id
+        c_data["offer_id"] = offer_id
+        c_data["offer_name"] = offer_name
+        c_data["price_usd"] = price_usd
+        c_data["fields"] = fields
+        c_data["stock"] = data.get("stock")
+        c_data["min_quantity"] = data.get("min_quantity")
+        c_data["max_quantity"] = data.get("max_quantity")
+        c_data.setdefault("price_sync", True)
+        c_data["selecting_sku"] = False
+        create_state["state"] = "create_lot_confirm"
+        _fzr_show_create_confirm(c, call, create_state)
+        return
+    set_state(call.from_user.id, "mapping_lot", {
+        "category_kind": kind,
+        "category_id": category_id,
+        "offer_id": offer_id,
+        "offer_name": offer_name,
+        "price_usd": price_usd,
+        "sku": sku,
+        "fields": fields,
+        "stock": data.get("stock"),
+        "min_quantity": data.get("min_quantity"),
+        "max_quantity": data.get("max_quantity"),
+    })
+    kb = InlineKeyboardMarkup(row_width=1)
+    if kind == "steam-gifts" and edition_id:
+        back_arg = _catalog_arg(kind=kind, category_id=category_id, category_name=category_name, edition_id=edition_id, edition_name=edition_name)
+    else:
+        back_arg = _catalog_arg(kind=kind, category_id=category_id, category_name=category_name)
+    back_cb = _pack_callback_data(f"{CB_PREFIX}:catalog:{back_arg}")
+    kb.add(_inline_button("🔙 Назад", callback_data=back_cb))
+    kb.add(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(
+        c,
+        call,
+        f"✅ Выбран товар: <b>{_esc(offer_name)}</b>\n"
+        f"<b>SKU:</b> <code>{_esc(sku)}</code>\n"
+        f"<b>Цена:</b> {_esc(price_usd)} USD\n\n"
+        f"Введите <b>ID лота FunPay</b>:",
+        kb=kb,
+    )
+
+
+def _show_mappings(c: "Cardinal", call: Any, page: int = 0) -> None:
+    mappings = get_mappings()
+    if not mappings:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(_inline_button("📦 Выбрать из каталога", callback_data=f"{CB_PREFIX}:catalog:"))
+        kb.add(_inline_button("➕ Добавить по SKU", callback_data=f"{CB_PREFIX}:mapping_add"))
+        kb.add(_inline_button("📥 Импорт привязок", callback_data=f"{CB_PREFIX}:import"))
+        kb.add(_inline_button("🔙 Меню", callback_data=f"{CB_PREFIX}:menu"))
+        _send_or_edit(
+            c, call,
+            "🔗 <b>Привязки</b>\n\n"
+            "<blockquote>Пока ни одного лота не привязано.\n\n"
+            "Привязка связывает лот FunPay с товаром FazerCards — после этого "
+            "заказы по лоту выдаются автоматически.</blockquote>\n\n"
+            "<i>Проще всего начать с каталога: там сразу подставятся цена и нужные поля.</i>",
+            kb=kb)
+        return
+
+    total = len(mappings)
+    per_page = _MAPPINGS_PER_PAGE
+    max_page = max(0, (total - 1) // per_page)
+    page = max(0, min(page, max_page))
+    start = page * per_page
+    end = min(start + per_page, total)
+    page_mappings = mappings[start:end]
+
+    cfg = load_config()
+    enabled_total = sum(1 for m in mappings if m.get("enabled", True))
+    lines = [f"🔗 <b>Привязки</b> · вкл. <b>{enabled_total}</b> из <b>{total}</b>"
+             + (f"\n<i>стр. {page + 1}/{max_page + 1}</i>" if max_page else "")]
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for m in page_mappings:
+        enabled = m.get("enabled", True)
+        name = _esc(m.get("offer_name") or m["fzr_sku_id"])
+        kind = _esc(m.get("category_kind", "giftcards"))
+        lot = _esc(m["funpay_lot_id"])
+        price = _apply_markup(m.get("price_usd"), m, cfg)
+        bits = [f"{kind}"]
+        if price is not None:
+            bits.append(f"{price}₽")
+        elif m.get("price_usd"):
+            bits.append(f"{m['price_usd']}$")
+        upi = _units_per_item(m)
+        if upi != 1:
+            bits.append(f"×{upi}")
+        meta_count = len(_build_metadata_fields(m))
+        if meta_count:
+            bits.append(f"{meta_count} 🧩")
+        lines.append(f"<blockquote>{'🟢' if enabled else '🔴'} <b>{name}</b>\n"
+                     f"лот <code>{lot}</code> · {' · '.join(bits)}</blockquote>")
+        kb.add(_inline_button(
+            f"{'🟢' if enabled else '🔴'} {m.get('offer_name') or m['fzr_sku_id']} ➜ {m['funpay_lot_id']}",
+            callback_data=f"{CB_PREFIX}:mapping_open:{m['id']}",
+        ))
+
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=f"{CB_PREFIX}:mappings_page:{page - 1}"))
+    if end < total:
+        nav.append(_inline_button("➡️", callback_data=f"{CB_PREFIX}:mappings_page:{page + 1}"))
+    if nav:
+        kb.add(*nav)
+    kb.add(_inline_button("📦 Каталог", callback_data=f"{CB_PREFIX}:catalog:"),
+           _inline_button("➕ По SKU", callback_data=f"{CB_PREFIX}:mapping_add"))
+
+    # v3.21: массовые кнопки показываем ТОЛЬКО когда есть что делать — иначе
+    # они путают («нажал, ничего не произошло»).
+    missing = _mappings_missing_lot(c)
+    if missing:
+        kb.add(_inline_button(f"🔗 Привязать ID лотов FunPay ({len(missing)})",
+                              callback_data=f"{CB_PREFIX}:relink_all"))
+    off_total = total - enabled_total
+    if off_total:
+        kb.add(_inline_button(f"🟢 Включить все привязки ({off_total})",
+                              callback_data=f"{CB_PREFIX}:mappings_enable_all"))
+    # подробный разбор нужен, когда автопривязка не всё смогла
+    kb.add(_inline_button("🔎 Определить ID лотов (подробно)",
+                          callback_data=f"{CB_PREFIX}:relink"))
+    # v3.22: удаление всех привязок доступно и отсюда, а не только из
+    # «Экспорт/импорт» — искать его там неочевидно
+    kb.add(_inline_button("🗑 Удалить все привязки",
+                          callback_data=f"{CB_PREFIX}:mappings_wipe", style="danger"))
+    kb.add(_inline_button("🔙 Меню", callback_data=f"{CB_PREFIX}:menu"))
+
+    if missing:
+        lines.append(f"⚠️ <b>Без рабочего лота FunPay: {len(missing)}</b> — "
+                     f"заказы по ним не опознаются.\n"
+                     f"<i>Нажмите «Привязать ID лотов FunPay»: найду лоты "
+                     f"по названию и впишу ID сам.</i>")
+    if off_total:
+        lines.append(f"🔴 <b>Выключено привязок: {off_total}</b> — "
+                     f"<i>по ним выдачи не будет.</i>")
+    _send_or_edit(c, call, "\n\n".join(lines), kb=kb)
+
+# =============================================================================
+# определение ID лотов FunPay по названию (v3.21)
+#
+# Зачем: после переноса привязок на другой аккаунт (или после того, как лот
+# пересоздали) в привязке лежит чужой/пустой funpay_lot_id. Заказ ищется по
+# ID лота и по описанию, поэтому такая привязка просто не участвует в выдаче.
+# Кнопка «Определить ID лотов FunPay» ищет лоты по названию и прописывает
+# живые ID, названия и подкатегории.
+#
+# Работаем в два шага (план → подтверждение): переписывать разом все привязки
+# без показа, что именно изменится, слишком опасно.
+# =============================================================================
+
+# v3.22: порог нечёткого сравнения названий лотов. 0.86 подобран так, чтобы
+# «АВТОВЫДАЧА 24/7» ↔ «АВТО 24/7» находилось, а разные номиналы — нет
+# (числа названия при этом всё равно обязаны совпадать).
+_LOT_FUZZY_MIN_RATIO = 0.86
+
+_RELINK_PLANS: Dict[int, Dict[str, Any]] = {}
+_RELINK_LOCK = threading.RLock()
+_RELINK_TTL = 900.0
+
+
+def _relink_plan_put(user_id: Optional[int], plan: Dict[str, Any]) -> None:
+    if user_id is None:
+        return
+    with _RELINK_LOCK:
+        now = time.time()
+        for uid in [u for u, v in _RELINK_PLANS.items()
+                    if now - v.get("at", 0) > _RELINK_TTL]:
+            _RELINK_PLANS.pop(uid, None)
+        plan["at"] = now
+        _RELINK_PLANS[user_id] = plan
+
+
+def _relink_plan_get(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if user_id is None:
+        return None
+    with _RELINK_LOCK:
+        plan = _RELINK_PLANS.get(user_id)
+        if plan and time.time() - plan.get("at", 0) > _RELINK_TTL:
+            _RELINK_PLANS.pop(user_id, None)
+            return None
+        return plan
+
+
+def _mapping_search_titles(mapping: Dict[str, Any]) -> List[str]:
+    """
+    По каким названиям искать лот для этой привязки.
+
+    Порядок = приоритет: сначала то, что записано как название лота (его
+    продавец и правит в файле при переносе), потом название товара
+    поставщика — оно часто совпадает с названием лота.
+    """
+    out: List[str] = []
+    for key in ("funpay_title", "offer_name"):
+        value = str(mapping.get(key) or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _find_lot_by_title(lots: Dict[str, Any], title: str,
+                       subcategory_id: Any = None) -> Tuple[List[str], str]:
+    """
+    Ищет лоты аккаунта по названию: точно → «по буквам» → нечётко (v3.22).
+
+    Проходы, от надёжного к приблизительному:
+      1. точное название (регистр и лишние пробелы не важны);
+      2. только буквы и цифры (эмодзи, дефисы, «!!!» игнорируются);
+      3. одна строка — начало другой: FunPay обрезает длинные названия
+         в списке лотов, поэтому в привязке лежит усечённый вариант;
+      4. похожесть ≥ 0.86 по SequenceMatcher — на случай «АВТОВЫДАЧА 24/7»
+         против «АВТО 24/7» и прочих правок руками.
+
+    На проходах 3–4 ОБЯЗАТЕЛЬНО совпадение всех чисел названия: «5 АЛМАЗОВ»
+    и «95 АЛМАЗОВ» по буквам почти одинаковы, а это разные номиналы.
+
+    Подкатегория, если известна, используется как фильтр при нескольких
+    кандидатах. Возвращает (список id, как нашли).
+    """
+    by_id = lots.get("by_id") or {}
+    if not title or not by_id:
+        return [], ""
+
+    def _filter(ids: List[str]) -> List[str]:
+        uniq: List[str] = []
+        for i in ids:
+            if str(i) not in uniq:
+                uniq.append(str(i))
+        if subcategory_id is None or len(uniq) < 2:
+            return uniq
+        same = [i for i in uniq
+                if str((by_id.get(str(i)) or {}).get("subcategory_id")) == str(subcategory_id)]
+        return same or uniq
+
+    exact = (lots.get("by_title") or {}).get(_normalize_title(title)) or []
+    if exact:
+        return _filter([str(i) for i in exact]), "точное название"
+    loose_key = _title_loose_key(title)
+    if not loose_key:
+        return [], ""
+    loose = (lots.get("by_title_loose") or {}).get(loose_key) or []
+    if loose:
+        return _filter([str(i) for i in loose]), "название без регистра и знаков"
+
+    # --- v3.22: нечёткие проходы ---
+    want_digits = _digits_key(title)
+    rows = _lots_search_rows(lots)
+
+    # 3) одно название — начало другого (FunPay обрезает длинные названия)
+    prefix: List[str] = []
+    for row in rows:
+        if row["digits"] != want_digits:
+            continue
+        a, b = loose_key, row["loose"]
+        if len(a) < 6 or len(b) < 6:
+            continue
+        if a.startswith(b) or b.startswith(a):
+            prefix.append(row["id"])
+    if prefix:
+        return _filter(prefix), "название обрезано (совпало начало)"
+
+    # 4) похожие названия — только при совпадении чисел
+    best_ratio = 0.0
+    best: List[str] = []
+    for row in rows:
+        if row["digits"] != want_digits:
+            continue
+        ratio = difflib.SequenceMatcher(None, loose_key, row["loose"]).ratio()
+        if ratio < _LOT_FUZZY_MIN_RATIO:
+            continue
+        if ratio > best_ratio + 0.01:
+            best_ratio, best = ratio, [row["id"]]
+        elif abs(ratio - best_ratio) <= 0.01 and row["id"] not in best:
+            best.append(row["id"])
+    if best:
+        return _filter(best), f"похожее название ({int(best_ratio * 100)}%)"
+    return [], ""
+
+
+def _relink_build_plan(c: Optional["Cardinal"],
+                       only_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """
+    Что нужно сделать, чтобы привязки снова знали свои лоты.
+
+    Категории результата:
+      linked     — ID нашли, будем прописывать;
+      ok         — ID уже верный, лот на аккаунте есть;
+      ambiguous  — по названию несколько лотов, выбрать нельзя;
+      not_found  — лота с таким названием нет;
+      no_title   — искать нечем (нет ни названия лота, ни названия товара);
+      taken      — найденный лот уже занят другой привязкой.
+    """
+    lots = _lots_index(c, force=True)
+    by_id = lots.get("by_id") or {}
+    plan: Dict[str, Any] = {"linked": [], "ok": [], "ambiguous": [], "not_found": [],
+                            "no_title": [], "taken": [], "lots_known": bool(by_id),
+                            "lots_total": len(by_id),
+                            # v3.22: образцы живых лотов — чтобы в отчёте было
+                            # видно, что плагин реально получил с аккаунта
+                            "lots_sample": [
+                                (lid, (info.get("title")
+                                       or info.get("server")
+                                       or info.get("side") or "(без названия)"))
+                                for lid, info in list(by_id.items())[:5]]}
+    if not by_id:
+        return plan
+
+    mappings = _db_get_mappings()
+    if only_ids is not None:
+        mappings = [m for m in mappings if str(m.get("id")) in only_ids]
+    # какие лоты уже заняты живыми привязками — на них не претендуем
+    used: Dict[str, str] = {}
+    for m in _db_get_mappings():
+        lot = str(m.get("funpay_lot_id") or "")
+        if lot and lot in by_id:
+            used.setdefault(lot, str(m.get("id")))
+
+    for m in mappings:
+        name = _mapping_display_name(m)
+        lot_id = str(m.get("funpay_lot_id") or "")
+        if lot_id and lot_id in by_id:
+            plan["ok"].append((m, lot_id, by_id[lot_id].get("title") or ""))
+            continue
+        titles = _mapping_search_titles(m)
+        if not titles:
+            plan["no_title"].append((m, name))
+            continue
+        found: List[str] = []
+        how = ""
+        used_title = ""
+        for title in titles:
+            found, how = _find_lot_by_title(lots, title, m.get("funpay_subcategory_id"))
+            if found:
+                used_title = title
+                break
+        if not found:
+            plan["not_found"].append((m, titles[0]))
+            continue
+        # лот, уже привязанный к другой привязке, не отбираем
+        free = [i for i in found if used.get(i, str(m.get("id"))) == str(m.get("id"))]
+        if not free:
+            other = used.get(found[0])
+            other_m = _db_get_mapping_by_id(other) if other else None
+            plan["taken"].append((m, found[0],
+                                  _mapping_display_name(other_m) if other_m else "другая привязка"))
+            continue
+        if len(free) > 1:
+            plan["ambiguous"].append((m, used_title, free))
+            continue
+        new_lot = free[0]
+        live = by_id.get(new_lot) or {}
+        plan["linked"].append({
+            "mapping": m,
+            "lot_id": new_lot,
+            "old_lot_id": lot_id,
+            "title": live.get("title") or "",
+            "subcategory_id": live.get("subcategory_id"),
+            "subcategory_name": live.get("subcategory_name") or "",
+            "how": how,
+            "matched_title": used_title,
+            "was_enabled": bool(m.get("enabled", True)),
+        })
+        used[new_lot] = str(m.get("id"))
+    return plan
+
+
+def _relink_text(plan: Dict[str, Any]) -> str:
+    """Отчёт по плану — понятный без чтения кода."""
+    linked = plan["linked"]
+    lines = ["🔎 <b>Определение ID лотов FunPay</b>"]
+    if not plan["lots_known"]:
+        lines.append("\n⚠️ <b>Список лотов аккаунта недоступен.</b>\n"
+                     "<i>FunPay не отдал профиль — попробуйте позже. "
+                     "Без списка лотов сопоставлять не с чем.</i>")
+        return "\n".join(lines)
+    lines.append(f"<i>Сверяю названия привязок с {plan['lots_total']} лотами аккаунта. "
+                 f"Регистр, лишние пробелы, эмодзи и знаки не важны.</i>\n")
+    lines.append(f"<blockquote>🔗 Привяжу: <b>{len(linked)}</b>"
+                 + (f"\n✅ Уже привязаны: {len(plan['ok'])}" if plan["ok"] else "")
+                 + (f"\n⚠️ Несколько совпадений: {len(plan['ambiguous'])}"
+                    if plan["ambiguous"] else "")
+                 + (f"\n🚫 Лот не найден: {len(plan['not_found'])}"
+                    if plan["not_found"] else "")
+                 + (f"\n🛡 Лот занят другой привязкой: {len(plan['taken'])}"
+                    if plan["taken"] else "")
+                 + (f"\n❔ Нечем искать: {len(plan['no_title'])}"
+                    if plan["no_title"] else "")
+                 + "</blockquote>")
+
+    if linked:
+        block = []
+        for item in linked[:10]:
+            was = item["old_lot_id"] or "—"
+            block.append(f"🔗 <b>{_esc(_mapping_display_name(item['mapping'])[:34])}</b>\n"
+                         f"   лот <code>{_esc(was)}</code> → <code>{_esc(item['lot_id'])}</code>"
+                         f" · {_esc((item['title'] or '(без названия)')[:34])}\n"
+                         f"   <i>{_esc(item['how'])}</i>"
+                         + ("" if item["was_enabled"] else "\n   <i>привязка выключена</i>"))
+        lines.append("\n<b>Что изменится</b>\n<blockquote>" + "\n".join(block) + "</blockquote>")
+        if len(linked) > 10:
+            lines.append(f"<i>…и ещё {len(linked) - 10}</i>")
+        off = sum(1 for i in linked if not i["was_enabled"])
+        if off:
+            lines.append(f"ℹ️ <b>Выключенных среди них: {off}</b> — их можно включить "
+                         f"сразу же второй кнопкой.")
+
+    problems = []
+    for m, title, ids in plan["ambiguous"][:5]:
+        problems.append(f"⚠️ {_esc(_mapping_display_name(m)[:30])}\n"
+                        f"   <i>«{_esc(str(title)[:30])}» — подходит {len(ids)} лотов, "
+                        f"впишите ID вручную</i>")
+    for m, title in plan["not_found"][:5]:
+        problems.append(f"🚫 {_esc(_mapping_display_name(m)[:30])}\n"
+                        f"   <i>лота «{_esc(str(title)[:30])}» на аккаунте нет</i>")
+    for m, lot, other in plan["taken"][:5]:
+        problems.append(f"🛡 {_esc(_mapping_display_name(m)[:30])}\n"
+                        f"   <i>лот {_esc(lot)} уже у «{_esc(str(other)[:24])}»</i>")
+    for m, name in plan["no_title"][:3]:
+        problems.append(f"❔ {_esc(str(name)[:30])}\n"
+                        f"   <i>нет названия лота — впишите его в привязке</i>")
+    if problems:
+        lines.append("\n<b>Требуют вас</b>\n<blockquote>" + "\n".join(problems) + "</blockquote>")
+
+    if not linked:
+        if plan["ok"] and not problems:
+            lines.append("\n<i>Все привязки уже знают свои лоты — делать нечего.</i>")
+        else:
+            lines.append("\n<i>Автоматически сопоставить не удалось. Впишите ID лота "
+                         "в привязке вручную (можно вставить ссылку на лот) "
+                         "или поправьте название.</i>")
+        # v3.22: если не нашли НИЧЕГО — показываем, что плагин видит на
+        # аккаунте. Иначе непонятно, в чём расхождение: раньше в такой
+        # ситуации отчёт просто врал «лота нет», хотя лот был.
+        sample = plan.get("lots_sample") or []
+        if sample and not plan["ok"]:
+            lines.append("\n<b>Как плагин видит лоты аккаунта</b>")
+            lines.append("<blockquote>"
+                         + "\n".join(f"<code>{_esc(str(i))}</code> · {_esc(str(t)[:44])}"
+                                     for i, t in sample[:5])
+                         + "</blockquote>")
+            lines.append("<i>Сравните с названиями привязок выше. Если названия "
+                         "совсем другие — проще вписать ID лота руками "
+                         "в карточке привязки.</i>")
+    else:
+        lines.append("\n<i>Ничего не меняю, пока не нажмёте кнопку. "
+                     "Названия лотов в привязках тоже обновлю на живые — "
+                     "по ним опознаётся заказ.</i>")
+    return "\n".join(lines)
+
+
+def _relink_kb(plan: Dict[str, Any]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    linked = plan["linked"]
+    if linked:
+        kb.add(_inline_button(f"✅ Привязать {len(linked)} лотов",
+                              callback_data=f"{CB_PREFIX}:relink_apply:0"))
+        if any(not i["was_enabled"] for i in linked):
+            kb.add(_inline_button("🟢 Привязать и включить",
+                                  callback_data=f"{CB_PREFIX}:relink_apply:1"))
+    kb.add(_inline_button("🔄 Проверить снова", callback_data=f"{CB_PREFIX}:relink"))
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _relink_all_hint_kb() -> InlineKeyboardMarkup:
+    """Клавиатура-подсказка после массовых операций."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _show_relink(c: "Cardinal", call: Any, arg: str = "") -> None:
+    """Кнопка «Определить ID лотов FunPay» (v3.21)."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    only = {arg} if arg else None
+    if not _db_get_mappings():
+        _send_or_edit(c, call, "🔗 <b>Привязок нет</b> — определять нечего.",
+                      kb=_main_keyboard())
+        return
+    plan = _relink_build_plan(c, only_ids=only)
+    plan["only_ids"] = list(only) if only else None
+    _relink_plan_put(user_id, plan)
+    _send_or_edit(c, call, _relink_text(plan), kb=_relink_kb(plan))
+
+
+def _relink_apply(c: "Cardinal", call: Any, enable: bool = False) -> None:
+    """Прописывает найденные ID лотов в привязки."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    plan = _relink_plan_get(user_id)
+    if not plan or not plan.get("linked"):
+        _send_or_edit(c, call,
+                      "⏳ <b>Данные устарели.</b>\n\n"
+                      "<i>Нажмите «Определить ID лотов» заново — за это время "
+                      "лоты на аккаунте могли измениться.</i>",
+                      kb=_main_keyboard())
+        return
+
+    done = 0
+    enabled_count = 0
+    failed: List[str] = []
+    for item in plan["linked"]:
+        mapping = _get_mapping_by_id(str(item["mapping"].get("id")))
+        if not mapping:
+            failed.append(_mapping_display_name(item["mapping"]))
+            continue
+        mapping["funpay_lot_id"] = item["lot_id"]
+        # живое название и подкатегория обязательны: заказ матчится по ним,
+        # а не по ID (FunPay не присылает ID лота в событии)
+        if item["title"]:
+            mapping["funpay_title"] = item["title"]
+        if item["subcategory_id"] is not None:
+            mapping["funpay_subcategory_id"] = item["subcategory_id"]
+        if enable and not mapping.get("enabled", True):
+            mapping["enabled"] = True
+            enabled_count += 1
+        try:
+            _db_save_mapping(mapping)
+            done += 1
+        except Exception as e:
+            logger.error("relink save failed", extra={"mapping": mapping.get("id"),
+                                                      "error": repr(e)})
+            failed.append(_mapping_display_name(mapping))
+
+    _LOTS_INDEX_CACHE["ts"] = 0.0          # индекс устарел, пересоберём при нужде
+    logger.info("lots relinked", extra={"linked": done, "enabled": enabled_count})
+
+    # сразу проверяем, что заказы теперь найдут свои привязки
+    rep = _delivery_readiness(c)
+    lines = [f"✅ <b>Привязано лотов: {done}</b>"]
+    if enabled_count:
+        lines.append(f"🟢 Включено привязок: <b>{enabled_count}</b>")
+    if failed:
+        lines.append(f"⚠️ Не удалось: {len(failed)} ({_esc(', '.join(failed[:3]))})")
+    lines.append("")
+    lines.append(f"<blockquote>🧪 <b>Проверка выдачи</b>\n"
+                 f"✅ Готовы: <b>{len(rep['ok'])}</b>"
+                 + (f"\n❌ С проблемами: <b>{len(rep['problems'])}</b>"
+                    if rep["problems"] else "")
+                 + "</blockquote>")
+    if rep["problems"]:
+        block = [f"❌ {_esc(str(n)[:32])} — <i>{_esc(str(note)[:44])}</i>"
+                 for n, _code, note in rep["problems"][:6]]
+        lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+        lines.append("<i>Эти лоты пока не выдадутся — откройте привязку и "
+                     "впишите ID лота вручную.</i>")
+    else:
+        lines.append("<i>Заказ по любому включённому лоту найдёт свою привязку.</i>")
+    if not enable and any(not i["was_enabled"] for i in plan["linked"]):
+        lines.append("\nℹ️ <i>Некоторые привязки остались выключенными — "
+                     "включите их в списке привязок, иначе выдачи не будет.</i>")
+
+    with _RELINK_LOCK:
+        _RELINK_PLANS.pop(user_id, None)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🧪 Проверить выдачу", callback_data=f"{CB_PREFIX}:readiness"))
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _mappings_missing_lot(c: Optional["Cardinal"] = None,
+                          lots: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    ID привязок, у которых нет рабочего лота FunPay (v3.21).
+
+    Считаем «без лота» два случая:
+      * поле пустое — лот вообще не привязан;
+      * лот указан, но его нет среди лотов аккаунта (типичный след переноса).
+
+    Список лотов недоступен → судим только по пустому полю, иначе после
+    единственного сбоя FunPay кнопка предложила бы «перепривязать всё».
+    """
+    index = lots if lots is not None else _lots_index(c)
+    by_id = index.get("by_id") or {}
+    out: List[str] = []
+    for m in _db_get_mappings():
+        lot = str(m.get("funpay_lot_id") or "").strip()
+        if not lot:
+            out.append(str(m.get("id")))
+        elif by_id and lot not in by_id:
+            out.append(str(m.get("id")))
+    return out
+
+
+_ENABLE_UNDO: Dict[int, Dict[str, Any]] = {}
+_ENABLE_UNDO_LOCK = threading.RLock()
+_ENABLE_UNDO_TTL = 900.0
+
+
+def _enable_undo_put(user_id: Optional[int], ids: List[str]) -> None:
+    if user_id is None or not ids:
+        return
+    with _ENABLE_UNDO_LOCK:
+        now = time.time()
+        for uid in [u for u, v in _ENABLE_UNDO.items()
+                    if now - v.get("at", 0) > _ENABLE_UNDO_TTL]:
+            _ENABLE_UNDO.pop(uid, None)
+        _ENABLE_UNDO[user_id] = {"ids": list(ids), "at": now}
+
+
+def _enable_undo_take(user_id: Optional[int]) -> List[str]:
+    if user_id is None:
+        return []
+    with _ENABLE_UNDO_LOCK:
+        entry = _ENABLE_UNDO.pop(user_id, None)
+    if not entry or time.time() - entry.get("at", 0) > _ENABLE_UNDO_TTL:
+        return []
+    return list(entry.get("ids") or [])
+
+
+def _mappings_enable_all(c: "Cardinal", call: Any) -> None:
+    """
+    Включить все привязки одной кнопкой (v3.21).
+
+    Действие обратимое, поэтому без диалога подтверждения — но с кнопкой
+    «вернуть как было»: возвращаем ровно те привязки, которые включили сами,
+    а не «выключить все» (это разные вещи).
+    """
+    mappings = _db_get_mappings()
+    off = [m for m in mappings if not m.get("enabled", True)]
+    if not off:
+        # кнопка и так скрыта в этом случае — значит экран открыли по старому
+        # сообщению; просто показываем актуальный список
+        _show_mappings(c, call)
+        return
+
+    turned: List[str] = []
+    failed: List[str] = []
+    for m in off:
+        fresh = _get_mapping_by_id(str(m.get("id")))
+        if not fresh:
+            continue
+        fresh["enabled"] = True
+        try:
+            _db_save_mapping(fresh)
+            turned.append(str(fresh.get("id")))
+        except Exception as e:
+            logger.error("enable all failed", extra={"mapping": fresh.get("id"),
+                                                     "error": repr(e)})
+            failed.append(_mapping_display_name(fresh))
+
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    _enable_undo_put(user_id, turned)
+    logger.info("mappings enabled in bulk", extra={"count": len(turned)})
+
+    rep = _delivery_readiness(c)
+    lines = [f"🟢 <b>Включено привязок: {len(turned)}</b>"]
+    if failed:
+        lines.append(f"⚠️ Не удалось: {len(failed)} ({_esc(', '.join(failed[:3]))})")
+    lines.append("")
+    lines.append(f"<blockquote>🧪 <b>Проверка выдачи</b>\n"
+                 f"✅ Готовы: <b>{len(rep['ok'])}</b>"
+                 + (f"\n❌ С проблемами: <b>{len(rep['problems'])}</b>"
+                    if rep["problems"] else "")
+                 + "</blockquote>")
+    kb = InlineKeyboardMarkup(row_width=1)
+    if rep["problems"]:
+        block = [f"❌ {_esc(str(n)[:32])} — <i>{_esc(str(note)[:42])}</i>"
+                 for n, _code, note in rep["problems"][:6]]
+        lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+        lines.append("<i>Эти лоты включены, но заказ по ним не опознается — "
+                     "нажмите «Привязать ID лотов».</i>")
+        kb.add(_inline_button("🔗 Привязать ID лотов",
+                              callback_data=f"{CB_PREFIX}:relink_all"))
+    else:
+        lines.append("<i>Все включённые привязки готовы выдавать заказы.</i>")
+    if turned:
+        kb.add(_inline_button(f"↩️ Вернуть как было ({len(turned)})",
+                              callback_data=f"{CB_PREFIX}:mappings_enable_undo",
+                              style="danger"))
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _mappings_enable_undo(c: "Cardinal", call: Any) -> None:
+    """Выключает обратно ровно те привязки, которые включила кнопка «включить все»."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    ids = _enable_undo_take(user_id)
+    if not ids:
+        _send_or_edit(c, call,
+                      "⏳ <b>Отменять уже нечего.</b>\n\n"
+                      "<i>Отмена живёт 15 минут после нажатия. "
+                      "Выключить привязку можно в её карточке.</i>",
+                      kb=_relink_all_hint_kb())
+        return
+    back = 0
+    for mid in ids:
+        mapping = _get_mapping_by_id(mid)
+        if not mapping:
+            continue
+        mapping["enabled"] = False
+        try:
+            _db_save_mapping(mapping)
+            back += 1
+        except Exception as e:
+            logger.error("enable undo failed", extra={"mapping": mid, "error": repr(e)})
+    logger.info("bulk enable reverted", extra={"count": back})
+    _send_or_edit(c, call,
+                  f"↩️ <b>Выключено обратно: {back}</b>\n\n"
+                  f"<i>Остальные привязки не тронуты.</i>",
+                  kb=_relink_all_hint_kb())
+
+
+def _relink_all(c: "Cardinal", call: Any) -> None:
+    """
+    Одна кнопка: привязать ID лотов всем привязкам, где лота нет (v3.21).
+
+    Отличие от «Определить ID лотов» — без экрана подтверждения: операция
+    касается только привязок БЕЗ рабочего лота, ничего рабочего не ломает
+    (занятые лоты не отбираются, валидные ID не перезаписываются).
+    """
+    index = _lots_index(c, force=True)
+    if not (index.get("by_id") or {}):
+        _send_or_edit(c, call,
+                      "⚠️ <b>Список лотов FunPay недоступен.</b>\n\n"
+                      "<i>FunPay не отдал профиль — попробуйте позже. "
+                      "Ничего не изменено.</i>",
+                      kb=_relink_all_hint_kb())
+        return
+    missing = _mappings_missing_lot(c, lots=index)
+    if not missing:
+        _send_or_edit(c, call,
+                      "✅ <b>У всех привязок есть рабочий лот FunPay.</b>\n\n"
+                      "<i>Привязывать нечего.</i>",
+                      kb=_relink_all_hint_kb())
+        return
+
+    plan = _relink_build_plan(c, only_ids=set(missing))
+    done = 0
+    failed: List[str] = []
+    for item in plan["linked"]:
+        mapping = _get_mapping_by_id(str(item["mapping"].get("id")))
+        if not mapping:
+            failed.append(_mapping_display_name(item["mapping"]))
+            continue
+        mapping["funpay_lot_id"] = item["lot_id"]
+        if item["title"]:
+            mapping["funpay_title"] = item["title"]
+        if item["subcategory_id"] is not None:
+            mapping["funpay_subcategory_id"] = item["subcategory_id"]
+        try:
+            _db_save_mapping(mapping)
+            done += 1
+        except Exception as e:
+            logger.error("relink_all save failed",
+                         extra={"mapping": mapping.get("id"), "error": repr(e)})
+            failed.append(_mapping_display_name(mapping))
+    _LOTS_INDEX_CACHE["ts"] = 0.0
+    logger.info("relink all", extra={"checked": len(missing), "linked": done})
+
+    left = (len(plan["not_found"]) + len(plan["ambiguous"])
+            + len(plan["taken"]) + len(plan["no_title"]))
+    rep = _delivery_readiness(c)
+    lines = [f"🔗 <b>Привязано лотов: {done}</b> из {len(missing)} без лота"]
+    if failed:
+        lines.append(f"⚠️ Не удалось сохранить: {len(failed)}")
+    if done:
+        block = []
+        for item in plan["linked"][:8]:
+            block.append(f"🔗 {_esc(_mapping_display_name(item['mapping'])[:30])} → "
+                         f"<code>{_esc(item['lot_id'])}</code> "
+                         f"{_esc((item['title'] or '')[:26])}")
+        lines.append("<blockquote>" + "\n".join(block)
+                     + (f"\n<i>…и ещё {done - 8}</i>" if done > 8 else "")
+                     + "</blockquote>")
+    lines.append(f"<blockquote>🧪 <b>Проверка выдачи</b>\n"
+                 f"✅ Готовы: <b>{len(rep['ok'])}</b>"
+                 + (f"\n❌ С проблемами: <b>{len(rep['problems'])}</b>"
+                    if rep["problems"] else "")
+                 + "</blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    if left:
+        lines.append(f"⚠️ <b>Осталось без лота: {left}</b> — там нужно ваше решение "
+                     f"(нет такого лота, несколько похожих или лот занят).")
+        kb.add(_inline_button("🔎 Показать подробно", callback_data=f"{CB_PREFIX}:relink"))
+    elif not rep["problems"]:
+        lines.append("<i>Все привязки знают свои лоты — заказы будут опознаваться.</i>")
+    off = sum(1 for m in _db_get_mappings() if not m.get("enabled", True))
+    if off:
+        lines.append(f"\nℹ️ <b>Выключенных привязок: {off}</b> — пока они выключены, "
+                     f"выдачи по ним не будет.")
+        kb.add(_inline_button(f"🟢 Включить все привязки ({off})",
+                              callback_data=f"{CB_PREFIX}:mappings_enable_all"))
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _toggle_mapping(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ Привязка не найдена.")
+        return
+    mapping["enabled"] = not mapping.get("enabled", True)
+    _db_save_mapping(mapping)
+    _mapping_open(c, call, mapping_id)
+
+
+def _delete_mapping(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("✅ Да, удалить", callback_data=f"{CB_PREFIX}:mapping_del_yes:{mapping_id}"))
+    kb.add(_inline_button("❌ Отмена", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_or_edit(
+        c,
+        call,
+        f"🗑 <b>Удаление привязки</b>\n\n"
+        f"<blockquote><code>{_esc(mapping.get('offer_name') or mapping.get('fzr_sku_id'))}</code> ({_esc(mapping.get('category_kind','giftcards'))}) ➜ лот <b>{_esc(mapping.get('funpay_lot_id'))}</b></blockquote>\n\n"
+        f"Подтвердите удаление:",
+        kb=kb,
+    )
+
+
+def _mapping_open(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    enabled = mapping.get("enabled", True)
+    kind = str(mapping.get("category_kind", "giftcards"))
+    lot = _esc(mapping.get("funpay_lot_id"))
+    cfg = load_config()
+
+    # поля, которые спросят у покупателя
+    meta_fields = _build_metadata_fields(mapping)
+    if meta_fields:
+        meta_lines = []
+        for f in meta_fields:
+            if _is_select_field(f):
+                opts = _field_options(f)
+                hint = ("подставится автоматически" if len(opts) == 1
+                        else f"выбор из {len(opts)}")
+                meta_lines.append(f"• {_esc(f.get('label') or f['key'])} — <i>{hint}</i>")
+            else:
+                line = f"• {_esc(f.get('label') or f['key'])}"
+                # первая строка подсказки — продавцу видно, что получит покупатель
+                own_hint = _field_hint(f)
+                if own_hint and cfg["settings"].get("show_field_hints", True):
+                    line += f"\n  <i>{_esc(own_hint.splitlines()[0])}</i>"
+                meta_lines.append(line)
+        meta_block = "\n".join(meta_lines)
+    else:
+        meta_block = "<i>не требуются — выдача сразу после оплаты</i>"
+
+    bd = _markup_breakdown(mapping.get("price_usd"), mapping, cfg)
+    if bd["price_rub"] is not None:
+        price_line = (f"🏷 Цена лота: <b>{_esc(bd['price_rub'])}₽</b>\n"
+                      f"<i>{_esc(bd['price_usd'])}$ × {_esc(bd['rate'])} "
+                      f"+{_esc(bd['markup_percent'])}% +{_esc(bd['markup_fixed'])}₽ "
+                      f"({_markup_source_text(bd)})</i>")
+    else:
+        price_line = ("🏷 Цена лота: <i>не рассчитана — "
+                      "укажите курс RUB/USD в настройках</i>")
+
+    upi = _units_per_item(mapping)
+    unit_line = ""
+    if kind == "steam-topup":
+        if upi == 1:
+            unit_line = ("\n📐 Номинал: <b>1 шт = 1 единица валюты</b>\n"
+                         "<i>Лот должен продаваться «за 1 ₽»: покупатель ставит "
+                         "количество = сумма пополнения.</i>")
+        else:
+            unit_line = (f"\n📐 Номинал: <b>1 шт = {upi}</b>\n"
+                         f"<i>Покупка 1 шт пополнит на {upi}, 2 шт — на {upi * 2}.</i>")
+
+    checks = []
+    vid_on = mapping.get("validate_id") not in (0, "0", False)
+    if kind == "topups":
+        checks.append(f"{'✅' if vid_on else '🛑'} проверка Player ID")
+    if kind == "steam-topup":
+        checks.append(f"{'✅' if vid_on else '🛑'} проверка логина Steam")
+    checks_line = ("\n🛡 " + " · ".join(checks)) if checks else ""
+
+    # синхронизация цены: что уже поставили и когда
+    psync_on = bool(mapping.get("price_sync"))
+    if psync_on:
+        last_lot = mapping.get("last_lot_price")
+        synced = mapping.get("price_synced_at")
+        sync_line = f"\n🔄 Синхронизация цены: <b>включена</b>"
+        if last_lot:
+            sync_line += f"\n<i>последняя цена {_esc(last_lot)}₽, {_esc(_ago(synced))}</i>"
+        else:
+            sync_line += "\n<i>ещё не выполнялась</i>"
+    else:
+        sync_line = "\n🔄 Синхронизация цены: <i>выключена</i>"
+
+    profile = _kind_profile(kind)
+    texts = []
+    if mapping.get("greeting_template"):
+        texts.append("своё приветствие")
+    if mapping.get("ask_template"):
+        texts.append("свой запрос данных")
+    if mapping.get("delivery_template"):
+        texts.append("свой шаблон выдачи")
+    texts_line = ("\n💬 Тексты: " + ", ".join(texts)) if texts else \
+                 f"\n💬 Тексты: <i>по профилю «{_esc(profile['name'])}»</i>"
+
+    text = (
+        f"🔗 <b>{_esc(mapping.get('offer_name') or mapping.get('fzr_sku_id'))}</b>\n"
+        f"{'🟢 Включена' if enabled else '🔴 Отключена'} · <code>{_esc(kind)}</code>\n\n"
+        f"<blockquote>"
+        f"📌 Лот <b>{lot}</b>: {_esc(mapping.get('funpay_title') or '—')}\n"
+        f"🆔 SKU: <code>{_esc(mapping.get('fzr_sku_id'))}</code>\n"
+        f"💵 Закупка: <b>{_esc(mapping.get('price_usd') or '—')} USD</b>\n"
+        f"{price_line}"
+        f"{sync_line}"
+        f"{unit_line}"
+        f"{checks_line}"
+        f"{texts_line}"
+        f"</blockquote>\n\n"
+        f"<blockquote><b>🧩 Спросим у покупателя:</b>\n{meta_block}</blockquote>"
+    )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button(
+        f"{'🔴 Отключить' if enabled else '🟢 Включить'}",
+        callback_data=f"{CB_PREFIX}:mapping_toggle:{mapping_id}",
+    ), _inline_button("💰 Наценка", callback_data=f"{CB_PREFIX}:mapping_markup:{mapping_id}"))
+    kb.add(_inline_button(f"{'🛑 Выкл.' if psync_on else '🔄 Вкл.'} синхронизацию цены",
+                          callback_data=f"{CB_PREFIX}:mapping_psync:{mapping_id}"))
+    if psync_on:
+        kb.add(_inline_button("💱 Пересчитать цену сейчас",
+                              callback_data=f"{CB_PREFIX}:mapping_psync_now:{mapping_id}"))
+    if kind == "steam-topup":
+        kb.add(_inline_button(f"📐 Номинал (сейчас ×{upi})",
+                              callback_data=f"{CB_PREFIX}:mapping_units:{mapping_id}"))
+    if kind in ("topups", "steam-topup"):
+        label = "проверку Player ID" if kind == "topups" else "проверку логина"
+        kb.add(_inline_button(f"{'🛑 Выкл.' if vid_on else '✅ Вкл.'} {label}",
+                              callback_data=f"{CB_PREFIX}:mapping_vid:{mapping_id}"))
+    kb.add(_inline_button("👋 Приветствие", callback_data=f"{CB_PREFIX}:mapping_greet:{mapping_id}"),
+           _inline_button("❓ Запрос данных", callback_data=f"{CB_PREFIX}:mapping_ask:{mapping_id}"))
+    kb.add(_inline_button("👁 Как видит покупатель",
+                          callback_data=f"{CB_PREFIX}:mapping_texts:{mapping_id}"))
+    kb.add(_inline_button("🔄 Обновить поля из API",
+                          callback_data=f"{CB_PREFIX}:mapping_refresh:{mapping_id}"))
+    # v3.21: ID лота этой привязки — определить по названию
+    kb.add(_inline_button("🔎 Определить ID лота",
+                          callback_data=f"{CB_PREFIX}:relink:{mapping_id}"))
+    kb.add(_inline_button("🗑 Удалить", callback_data=f"{CB_PREFIX}:mapping_del:{mapping_id}", style="danger"))
+    kb.add(_inline_button("🔙 К списку", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, text, kb=kb)
+
+
+# --- v3.5: синхронизация цены и тексты у привязки ---
+
+def _mapping_toggle_price_sync(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    mapping["price_sync"] = 0 if mapping.get("price_sync") else 1
+    _db_save_mapping(mapping)
+    logger.info("mapping price_sync toggled", extra={
+        "mapping_id": mapping_id, "value": mapping["price_sync"]})
+    _mapping_open(c, call, mapping_id)
+
+
+def _mapping_price_sync_now(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    """Пересчитать цену одной привязки прямо сейчас."""
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    report = _sync_lot_prices(c, cfg, force=True, only_mapping_id=mapping_id)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_or_edit(c, call, _price_sync_report_html(report), kb=kb)
+
+
+def _price_sync_report_html(report: Dict[str, Any]) -> str:
+    """Подробный отчёт синхронизации для ПУ."""
+    if report.get("error"):
+        return f"❌ <b>{_esc(report['error'])}</b>"
+    lines = [f"💱 <b>Синхронизация цен</b>",
+             f"<i>проверено привязок: {report.get('checked', 0)}</i>"]
+    if report.get("dry_run"):
+        lines.append("🧪 <i>режим проверки: лоты не менялись</i>")
+    lines.append("")
+    for item in report.get("changed", [])[:10]:
+        old = item.get("old")
+        delta = item.get("delta_pct")
+        head = f"<b>{_esc(item['name'])}</b>"
+        if old is None:
+            body = f"→ <b>{_esc(item['new'])}₽</b> (первая синхронизация)"
+        else:
+            arrow = "↑" if (delta or 0) > 0 else "↓"
+            body = f"{_esc(old)}₽ → <b>{_esc(item['new'])}₽</b> ({arrow}{abs(delta or 0):.1f}%)"
+        reasons = ", ".join(item.get("reasons") or [])
+        block = f"<blockquote>✅ {head}\n{body}"
+        if reasons:
+            block += f"\n<i>{_esc(reasons)}</i>"
+        lines.append(block + "</blockquote>")
+    for item in report.get("review", [])[:5]:
+        lines.append(f"<blockquote>⚠️ <b>{_esc(item['name'])}</b>\n"
+                     f"{_esc(item.get('old'))}₽ → {_esc(item.get('new'))}₽\n"
+                     f"<i>{_esc(item.get('reason'))}</i></blockquote>")
+    for item in report.get("failed", [])[:5]:
+        lines.append(f"<blockquote>❌ <b>{_esc(item['name'])}</b>\n"
+                     f"<i>{_esc(str(item.get('error'))[:200])}</i></blockquote>")
+    skipped = report.get("skipped") or []
+    if skipped:
+        lines.append(f"<blockquote expandable><b>Без изменений: {len(skipped)}</b>\n" +
+                     "\n".join(f"• {_esc(s['name'])} — {_esc(s.get('reason'))}"
+                               for s in skipped[:15]) + "</blockquote>")
+    if not report.get("changed") and not report.get("failed") and not report.get("review"):
+        lines.append("<i>Менять нечего: все цены в пределах порога.</i>")
+    return "\n".join(lines)
+
+
+def _price_sync_now(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Проверить цены сейчас» из настроек."""
+    cfg = load_config()
+    candidates = _price_sync_candidates()
+    if not candidates:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(_inline_button("🔗 К привязкам", callback_data=f"{CB_PREFIX}:mappings"))
+        kb.add(_inline_button("🔙 Настройки", callback_data=f"{CB_PREFIX}:settings_sec:price"))
+        _send_or_edit(c, call,
+                      "💱 <b>Синхронизация цен</b>\n\n"
+                      "<blockquote>Ни у одной привязки не включена синхронизация.\n\n"
+                      "Откройте привязку → «🔄 Вкл. синхронизацию цены».</blockquote>", kb=kb)
+        return
+    report = _sync_lot_prices(c, cfg, force=True)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔄 Ещё раз", callback_data=f"{CB_PREFIX}:price_sync_now"))
+    kb.add(_inline_button("🔙 Настройки", callback_data=f"{CB_PREFIX}:settings_sec:price"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, _price_sync_report_html(report), kb=kb)
+
+
+def _mapping_greeting_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    current = mapping.get("greeting_template") or ""
+    preview = _greeting_text(cfg, mapping, quantity=1, will_ask=bool(_build_metadata_fields(mapping)))
+    set_state(call.from_user.id, "mapping_greeting_edit", {"mapping_id": mapping_id})
+    _send_or_edit(
+        c, call,
+        "👋 <b>Приветствие покупателю</b>\n"
+        f"Привязка: <b>{_esc(_mapping_display_name(mapping))}</b>\n\n"
+        f"<blockquote><b>Сейчас покупатель получает:</b>\n{_esc(preview)}</blockquote>\n"
+        + (f"<blockquote><b>Свой шаблон:</b>\n{_esc(current)}</blockquote>\n" if current else "")
+        + "\nОтправьте новый текст, <b>-</b> чтобы вернуть стандартный.\n\n"
+          "<i>Переменные: {sku_name}, {kind_name}, {eta}, {quantity}</i>",
+        kb=_cancel_kb())
+
+
+def _step_mapping_greeting_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    raw = (message.text or "").strip()
+    mapping["greeting_template"] = "" if raw == "-" else raw
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    preview = _greeting_text(load_config(), mapping, quantity=1)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_telegram_message(
+        c, message.chat.id,
+        ("✅ Приветствие сброшено на стандартное." if raw == "-" else "✅ Приветствие сохранено.")
+        + f"\n\n<blockquote>{_esc(preview)}</blockquote>", kb=kb)
+
+
+def _tpl_edit_prompt(c: "Cardinal", call: Any, key: str) -> None:
+    """
+    Правка общего шаблона сообщения покупателю (v3.17).
+
+    Раньше общие шаблоны правились только в файле конфига — для просьбы об
+    отзыве это неудобно: её текст продавец захочет подогнать под себя сразу.
+    """
+    meta = _TPL_EDITABLE.get(key)
+    if not meta:
+        _send_or_edit(c, call, "❌ <b>Неизвестный шаблон.</b>", kb=_main_keyboard())
+        return
+    label, hint = meta
+    cfg = load_config()
+    current = str(cfg["templates"].get(key) or "")
+    default = str(DEFAULT_CONFIG["templates"].get(key) or "")
+    set_state(getattr(getattr(call, "from_user", None), "id", None),
+              "tpl_edit", {"key": key})
+    _send_or_edit(
+        c, call,
+        f"📝 <b>{_esc(label)}</b>\n\n"
+        f"<blockquote><b>Сейчас:</b>\n{_esc(current or '(пусто — сообщение не отправляется)')}</blockquote>\n"
+        + (f"<blockquote><b>Стандартный текст:</b>\n{_esc(default)}</blockquote>\n"
+           if current.strip() != default.strip() else "")
+        + "\nОтправьте новый текст.\n"
+          "<b>-</b> вернуть стандартный, <b>0</b> — не отправлять это сообщение.\n\n"
+          f"<i>{hint}</i>",
+        kb=_cancel_kb())
+
+
+def _step_tpl_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    key = state["data"].get("key")
+    meta = _TPL_EDITABLE.get(key)
+    if not meta:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Ошибка состояния.", kb=_main_keyboard())
+        return
+    label, _hint = meta
+    raw = (message.text or "").strip()
+    cfg = load_config()
+    if raw == "-":
+        cfg["templates"][key] = DEFAULT_CONFIG["templates"].get(key, "")
+        note = "✅ Вернул стандартный текст."
+    elif raw == "0":
+        cfg["templates"][key] = ""
+        note = "✅ Сообщение отключено — покупателю оно не уйдёт."
+    else:
+        err = _validate_non_empty(raw, label, max_len=1500, allow_html=True)
+        if err:
+            _send_telegram_message(c, message.chat.id, f"❌ {_esc(err)}", reply_to=message)
+            return
+        cfg["templates"][key] = raw[:1500]
+        note = "✅ Текст сохранён."
+    save_config(cfg)
+    clear_state(message.from_user.id)
+    logger.info("template changed", extra={"key": key, "empty": not cfg["templates"][key]})
+    preview = ""
+    if key == "review_request":
+        # показываем ровно то, что увидит покупатель (со ссылкой на заказ)
+        preview = _review_request_text(cfg, None, funpay_order_id="123456789")
+        preview = _scrub_buyer_text(preview)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("📝 Сообщения покупателю",
+                          callback_data=f"{CB_PREFIX}:settings_sec:tpl"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_telegram_message(
+        c, message.chat.id,
+        f"{note}"
+        + (f"\n\n<blockquote><b>Покупатель увидит:</b>\n{_esc(preview)}</blockquote>"
+           if preview else ""), kb=kb)
+
+
+# общие шаблоны, которые можно править из панели
+_TPL_EDITABLE = {
+    "review_request": (
+        "Просьба подтвердить заказ и оставить отзыв",
+        "Переменные: {order_link} — ссылка на заказ FunPay, {sku_name}, {buyer}, "
+        "{order_number}. Уходит отдельным сообщением сразу после выдачи. "
+        "Ссылка добавляется автоматически, даже если убрать {order_link}.",
+    ),
+}
+
+
+def _mapping_refund_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    """Свой текст покупателю при возврате товара (v3.20)."""
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    current = mapping.get("refund_template") or ""
+    preview = _scrub_buyer_text(
+        _fzr_refund_text(cfg, mapping, order_id="123456789", fzr_order_id="ord-123"))
+    set_state(call.from_user.id, "mapping_refund_edit", {"mapping_id": mapping_id})
+    _send_or_edit(
+        c, call,
+        "↩️ <b>Текст при возврате</b>\n"
+        f"Привязка: <b>{_esc(_mapping_display_name(mapping))}</b>\n\n"
+        f"<blockquote><b>Сейчас покупатель получит:</b>\n"
+        f"{_esc(preview or '(сообщение отключено)')}</blockquote>\n"
+        + (f"<blockquote><b>Свой шаблон:</b>\n{_esc(current)}</blockquote>\n" if current else "")
+        + "\nОтправьте новый текст, <b>-</b> чтобы вернуть общий.\n\n"
+          "<i>Уходит, когда поставщик вернул деньги за закупку: товара не будет, "
+          "покупателю оформляется возврат на FunPay.\n"
+          "Переменные: {sku_name}, {buyer}, {order_link}, {funpay_order_id}.\n"
+          "🔒 Причину отказа поставщика покупатель не увидит — только ваш текст.</i>",
+        kb=_cancel_kb())
+
+
+def _step_mapping_refund_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    raw = (message.text or "").strip()
+    mapping["refund_template"] = "" if raw == "-" else raw[:1500]
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    preview = _scrub_buyer_text(
+        _fzr_refund_text(load_config(), mapping, order_id="123456789"))
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_telegram_message(
+        c, message.chat.id,
+        ("✅ Вернул общий текст." if raw == "-" else "✅ Текст сохранён.")
+        + f"\n\n<blockquote>{_esc(preview)}</blockquote>", kb=kb)
+
+
+def _mapping_review_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    """Своя просьба об отзыве для конкретного товара (v3.17)."""
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    current = mapping.get("review_template") or ""
+    preview = _scrub_buyer_text(
+        _review_request_text(cfg, mapping, funpay_order_id="123456789"))
+    set_state(call.from_user.id, "mapping_review_edit", {"mapping_id": mapping_id})
+    _send_or_edit(
+        c, call,
+        "⭐ <b>Просьба подтвердить заказ и отзыв</b>\n"
+        f"Привязка: <b>{_esc(_mapping_display_name(mapping))}</b>\n\n"
+        f"<blockquote><b>Сейчас покупатель получает:</b>\n"
+        f"{_esc(preview or '(сообщение отключено)')}</blockquote>\n"
+        + (f"<blockquote><b>Свой шаблон:</b>\n{_esc(current)}</blockquote>\n" if current else "")
+        + "\nОтправьте новый текст, <b>-</b> чтобы вернуть общий.\n\n"
+          "<i>Переменные: {order_link}, {sku_name}, {buyer}, {order_number}</i>",
+        kb=_cancel_kb())
+
+
+def _step_mapping_review_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    raw = (message.text or "").strip()
+    mapping["review_template"] = "" if raw == "-" else raw[:1500]
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    preview = _scrub_buyer_text(
+        _review_request_text(load_config(), mapping, funpay_order_id="123456789"))
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_telegram_message(
+        c, message.chat.id,
+        ("✅ Вернул общий текст." if raw == "-" else "✅ Текст сохранён.")
+        + f"\n\n<blockquote>{_esc(preview)}</blockquote>", kb=kb)
+
+
+def _mapping_ask_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    fields = _build_metadata_fields(mapping)
+    if not fields:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+        _send_or_edit(c, call,
+                      "ℹ️ У этого товара нет полей для покупателя — "
+                      "запрос данных не отправляется.", kb=kb)
+        return
+    current = mapping.get("ask_template") or ""
+    preview = _format_metadata_prompt(cfg, fields[0], mapping, index=0, total=len(fields))
+    set_state(call.from_user.id, "mapping_ask_edit", {"mapping_id": mapping_id})
+    _send_or_edit(
+        c, call,
+        "❓ <b>Запрос данных у покупателя</b>\n"
+        f"Привязка: <b>{_esc(_mapping_display_name(mapping))}</b>\n\n"
+        f"<blockquote><b>Сейчас первый вопрос выглядит так:</b>\n{_esc(preview)}</blockquote>\n"
+        + (f"<blockquote><b>Свой шаблон:</b>\n{_esc(current)}</blockquote>\n" if current else "")
+        + "\nОтправьте новый текст, <b>-</b> чтобы вернуть стандартный.\n\n"
+          "<i>Обязательно оставьте {prompt} — вместо него подставится название поля.\n"
+          "Ещё доступно: {sku_name}, {kind_name}</i>",
+        kb=_cancel_kb())
+
+
+def _step_mapping_ask_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    raw = (message.text or "").strip()
+    if raw != "-" and "{prompt}" not in raw:
+        # без {prompt} покупатель не узнает, что именно от него хотят
+        _send_telegram_message(
+            c, message.chat.id,
+            "❌ В шаблоне нет <code>{prompt}</code> — покупатель не поймёт, "
+            "какие данные нужны. Добавьте его и отправьте снова.", reply_to=message)
+        return
+    mapping["ask_template"] = "" if raw == "-" else raw
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    fields = _build_metadata_fields(mapping)
+    preview = (_format_metadata_prompt(load_config(), fields[0], mapping, index=0,
+                                       total=len(fields)) if fields else "—")
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_telegram_message(
+        c, message.chat.id,
+        ("✅ Запрос данных сброшен на стандартный." if raw == "-" else "✅ Шаблон сохранён.")
+        + f"\n\n<blockquote>{_esc(preview)}</blockquote>", kb=kb)
+
+
+def _mapping_preview_texts(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    """
+    Полный сценарий общения глазами покупателя.
+
+    Продавцу важно видеть весь диалог до первой продажи: приветствие,
+    вопросы, подтверждение и выдачу — включая тексты, зависящие от типа товара.
+    """
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    kind = str(mapping.get("category_kind") or "")
+    profile = _kind_profile(kind)
+    fields = _build_metadata_fields(mapping)
+
+    blocks = [f"👁 <b>Как видит покупатель</b>\n"
+              f"<i>{_esc(_mapping_display_name(mapping))} · профиль «{_esc(profile['name'])}»</i>\n"]
+
+    # Показываем ровно то, что уйдёт в чат: тот же фильтр, что в _send_buyer,
+    # иначе предпросмотр обманет продавца (в шаблоне «FazerCards» есть, а в
+    # чат уходит без него).
+    scrubbed = 0
+
+    def _as_sent(text: str) -> str:
+        nonlocal scrubbed
+        out = _scrub_buyer_text(text)
+        if out != (text or "").strip():
+            scrubbed += 1
+        return out
+
+    greeting = _as_sent(_greeting_text(cfg, mapping, quantity=1, will_ask=bool(fields)))
+    if greeting:
+        blocks.append(f"<blockquote><b>1. Сразу после оплаты</b>\n{_esc(greeting)}</blockquote>")
+
+    step = 2
+    values: Dict[str, str] = {}
+    if cfg["settings"].get("auto_select_single", True):
+        _autofill_single_options(fields, values)
+    asked = [f for f in fields if str(f.get("key") or "") not in values]
+    for i, field in enumerate(asked[:3]):
+        prompt = _as_sent(_format_metadata_prompt(cfg, field, mapping, index=i, total=len(asked)))
+        blocks.append(f"<blockquote><b>{step}. Вопрос {i + 1}</b>\n{_esc(prompt)}</blockquote>")
+        step += 1
+    if len(asked) > 3:
+        blocks.append(f"<i>…и ещё вопросов: {len(asked) - 3}</i>")
+
+    if asked:
+        # v3.14: покупатель теперь подтверждает каждое значение — продавец должен
+        # видеть это в предпросмотре, иначе новые сообщения станут сюрпризом
+        if _confirm_enabled(cfg, "confirm_metadata"):
+            confirm_demo = _as_sent(_confirm_question(asked[-1], "значение"))
+            blocks.append(f"<blockquote><b>{step}. Подтверждение</b>\n"
+                          f"{_esc(confirm_demo)}</blockquote>")
+            step += 1
+        if _confirm_enabled(cfg, "confirm_summary") and len(asked) > 1:
+            demo_values = {str(f.get("key") or ""): "значение" for f in asked}
+            summary_demo = _as_sent(_summary_question(asked, demo_values))
+            blocks.append(f"<blockquote><b>{step}. Итоговая сводка</b>\n"
+                          f"{_esc(summary_demo)}</blockquote>")
+            step += 1
+        progress = _as_sent(_progress_text(cfg, mapping))
+        if progress:
+            blocks.append(f"<blockquote><b>{step}. Данные получены</b>\n"
+                          f"✔ {_esc(asked[-1].get('label') or '')}: …\n\n"
+                          f"{_esc(progress)}</blockquote>")
+            step += 1
+
+    # выдача: с кодом и без — зависит от типа товара
+    demo_meta = {f["key"]: "…" for f in fields}
+    has_codes = kind in ("giftcards", "gamekeys")
+    codes = ["XXXX-YYYY-ZZZZ"] if has_codes else []
+    delivered = _as_sent(_delivery_text(cfg, mapping, codes, fzr_order_id="ord-123456",
+                                        funpay_order_id="FP-1", buyer="buyer",
+                                        sku=str(mapping.get("fzr_sku_id") or ""),
+                                        metadata=demo_meta))
+    blocks.append(f"<blockquote><b>{step}. Выдача</b>\n{_esc(delivered)}</blockquote>")
+    step += 1
+    # v3.17: просьба подтвердить заказ уходит вторым сообщением — показываем её
+    # в предпросмотре, иначе продавец не знает, что покупатель получит два
+    review = _as_sent(_review_request_text(cfg, mapping, funpay_order_id="123456789",
+                                           buyer="buyer", fzr_order_id="ord-123456"))
+    if cfg["settings"].get("review_request", True) and review:
+        blocks.append(f"<blockquote><b>{step}. Отдельным сообщением</b>\n{_esc(review)}</blockquote>")
+        step += 1
+    # v3.20: что покупатель увидит, если поставщик вернёт деньги
+    refund = _as_sent(_fzr_refund_text(cfg, mapping, order_id="123456789",
+                                       fzr_order_id="ord-123456", buyer="buyer"))
+    if refund:
+        blocks.append(f"<blockquote><b>↩️ Если поставщик вернёт деньги</b>\n"
+                      f"{_esc(refund)}</blockquote>")
+    if scrubbed:
+        blocks.append("🔒 <i>В шаблонах встретилось название поставщика — "
+                      "покупателю уходит уже без него (показано выше как есть).</i>")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("👋 Приветствие", callback_data=f"{CB_PREFIX}:mapping_greet:{mapping_id}"),
+           _inline_button("❓ Запрос данных", callback_data=f"{CB_PREFIX}:mapping_ask:{mapping_id}"))
+    kb.add(_inline_button("⭐ Просьба об отзыве", callback_data=f"{CB_PREFIX}:mapping_review:{mapping_id}"),
+           _inline_button("↩️ Текст при возврате", callback_data=f"{CB_PREFIX}:mapping_refund:{mapping_id}"))
+    kb.add(_inline_button("🔙 К привязке", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_or_edit(c, call, _fit_blocks(blocks[0], blocks[1:]), kb=kb)
+
+
+def _mapping_units_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    upi = _units_per_item(mapping)
+    set_state(call.from_user.id, "mapping_units_edit", {"mapping_id": mapping_id})
+    _send_or_edit(
+        c, call,
+        "📐 <b>Номинал лота</b>\n\n"
+        f"Сейчас: <b>1 шт = {upi}</b>\n\n"
+        "<blockquote>Для пополнения Steam в API уходит <b>сумма</b>, а не число позиций.\n\n"
+        "• Лот «Steam — 1 ₽», покупатель берёт нужное количество → номинал <b>1</b>\n"
+        "• Лот «Steam 500 ₽» за штуку → номинал <b>500</b>\n"
+        "• Лот «Steam 100 ₽», покупают 3 шт → пополнение на 300 ₽</blockquote>\n\n"
+        "Отправьте число (например <code>500</code>):",
+    )
+
+
+def _step_mapping_units_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id) if mapping_id else None
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        value = int(float(raw))
+    except ValueError:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Введите целое число, например <code>500</code>.", reply_to=message)
+        return
+    if value < 1 or value > 1000000:
+        _send_telegram_message(c, message.chat.id, "❌ Номинал должен быть от 1 до 1 000 000.",
+                               reply_to=message)
+        return
+    mapping["units_per_item"] = value
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    logger.info("mapping units_per_item set", extra={"mapping_id": mapping_id, "value": value})
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ Номинал: <b>1 шт = {value}</b>\n"
+        f"<i>Покупка 2 шт даст пополнение на {value * 2}.</i>",
+        kb=_main_keyboard())
+
+
+def _mapping_refresh_fields(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    """Перечитывает поля и цену товара из API — серверы/цены меняются."""
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        _send_or_edit(c, call, "❌ Сначала задайте API-ключ.", kb=_main_keyboard())
+        return
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        kind, category_id, offer_id = _resolve_order_sku(mapping)
+        offer_info = _resolve_offer_info(api, kind, category_id, offer_id)
+    except Exception as ex:
+        _send_or_edit(c, call, f"❌ Не удалось обновить:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_main_keyboard())
+        return
+    changes = []
+    fresh_fields = offer_info.get("fields")
+    if fresh_fields:
+        mapping["fields"] = fresh_fields
+        mapping["metadata_fields"] = _refresh_mapping_fields(mapping)
+        changes.append(f"поля ({len(fresh_fields)})")
+    new_price = offer_info.get("price_usd")
+    if new_price not in (None, "") and str(new_price) != str(mapping.get("price_usd")):
+        changes.append(f"цена {mapping.get('price_usd')} → {new_price}")
+        mapping["price_usd"] = new_price
+    for key in ("stock", "min_quantity", "max_quantity"):
+        if offer_info.get(key) not in (None, ""):
+            mapping[key] = offer_info[key]
+    _db_save_mapping(mapping)
+    logger.info("mapping refreshed from api", extra={"mapping_id": mapping_id, "changes": changes})
+    _mapping_open(c, call, mapping_id)
+
+
+def _mapping_toggle_validate_id(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    new_value = 0 if mapping.get("validate_id") not in (0, "0", False) else 1
+    mapping["validate_id"] = new_value
+    _db_save_mapping(mapping)
+    logger.info("mapping validate_id toggled", extra={"mapping_id": mapping_id, "value": new_value})
+    _mapping_open(c, call, mapping_id)
+
+
+def _markup_source_text(bd: Dict[str, Any]) -> str:
+    """Короткая подпись, откуда взялась наценка — «своя» или «из настроек»."""
+    p_own = bd.get("markup_percent_own") is not None
+    f_own = bd.get("markup_fixed_own") is not None
+    if p_own and f_own:
+        return "своя"
+    if not p_own and not f_own:
+        return "общая из настроек"
+    return "своя " + ("%" if p_own else "₽") + " + общая " + ("₽" if p_own else "%")
+
+
+def _markup_prompt_text(mapping: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """Экран кнопки «Наценка» у привязки."""
+    bd = _markup_breakdown(mapping.get("price_usd"), mapping, cfg)
+    s = cfg["settings"]
+    p_own = _markup_own(mapping, "markup_percent")
+    f_own = _markup_own(mapping, "markup_fixed")
+
+    def _line(label: str, own: Optional[float], glob: Any, unit: str) -> str:
+        if own is None:
+            return (f"{label}: <i>из настроек</i> — <b>{_esc(glob or 0)}{unit}</b>")
+        return f"{label}: <b>{_esc(own)}{unit}</b> <i>(своя)</i>"
+
+    price_line = (f"\n🏷 Цена лота сейчас: <b>{_esc(bd['price_rub'])}₽</b>"
+                  if bd["price_rub"] is not None else
+                  "\n<i>Цена не рассчитана — укажите курс RUB/USD в настройках.</i>")
+    return (
+        "💰 <b>Наценка этой привязки</b>\n"
+        f"<i>{_esc(mapping.get('offer_name') or mapping.get('fzr_sku_id'))}</i>\n\n"
+        f"<blockquote>{_line('📈 Процент', p_own, s.get('markup_percent'), '%')}\n"
+        f"{_line('➕ Фикс', f_own, s.get('markup_fixed'), '₽')}"
+        f"{price_line}</blockquote>\n\n"
+        "<blockquote><b>Что отправить:</b>\n"
+        "<code>15 20</code> — 15% и +20₽\n"
+        "<code>15</code> — только процент, фикс остаётся как был\n"
+        "<code>0 0</code> — <b>ровно ноль</b>, продавать без наценки\n"
+        "<code>-</code> — <b>наследовать</b> общие настройки\n"
+        "<code>- 20</code> — процент общий, фикс свой 20₽</blockquote>\n"
+        "<i>Меняется только этот лот. Общая наценка в «Настройках → Цены» "
+        "остаётся как есть и действует на все привязки без своей наценки.</i>"
+    )
+
+
+_KEEP = object()   # маркер «не менять это поле»
+
+
+def _parse_markup_input(text: str) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
+    """
+    Разбор ввода наценки: возвращает (percent, fixed, ошибка).
+
+    percent/fixed: float — своё значение, None — наследовать, _KEEP — не менять.
+    Прочерк («-», «—», «*») означает «наследовать глобальную».
+    """
+    parts = (text or "").replace(",", ".").split()
+    if not parts:
+        return None, None, "Введите значения: <code>15 20</code>, <code>0 0</code> или <code>-</code>."
+
+    def _one(raw: str, label: str, lo: float, hi: float) -> Tuple[Any, Optional[str]]:
+        if raw in ("-", "—", "*", "def", "default", "наследовать"):
+            return None, None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None, (f"{label}: «{raw}» — не число. Используйте число или "
+                          f"<code>-</code> для наследования.")
+        if not (lo <= value <= hi):
+            return None, f"{label} должен быть от {lo:g} до {hi:g}."
+        return value, None
+
+    percent, err = _one(parts[0], "Процент", -100.0, 10000.0)
+    if err:
+        return None, None, err
+    if len(parts) == 1:
+        return percent, _KEEP, None
+    fixed, err = _one(parts[1], "Фикс", -1000000.0, 1000000.0)
+    if err:
+        return None, None, err
+    return percent, fixed, None
+
+
+def _mapping_markup_prompt(c: "Cardinal", call: Any, mapping_id: str) -> None:
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    set_state(call.from_user.id, "mapping_markup_edit", {"mapping_id": mapping_id})
+    kb = InlineKeyboardMarkup(row_width=2)
+    if _markup_own(mapping, "markup_percent") is not None or \
+            _markup_own(mapping, "markup_fixed") is not None:
+        kb.add(_inline_button("↩️ Вернуть общую наценку",
+                              callback_data=f"{CB_PREFIX}:mapping_markup_reset:{mapping_id}"))
+    kb.add(_inline_button("0️⃣ Без наценки (0%)",
+                          callback_data=f"{CB_PREFIX}:mapping_markup_zero:{mapping_id}"))
+    kb.add(_inline_button("⚙️ Общая наценка", callback_data=f"{CB_PREFIX}:settings_sec:price"),
+           _inline_button("🔙 Привязка", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_or_edit(c, call, _markup_prompt_text(mapping, load_config()), kb=kb)
+
+
+def _mapping_markup_set(c: "Cardinal", call: Any, mapping_id: str,
+                        percent: Optional[float], fixed: Optional[float],
+                        note: str) -> None:
+    """Общий путь для кнопок «вернуть общую» / «без наценки»."""
+    mapping = _get_mapping_by_id(mapping_id)
+    if not mapping:
+        _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+        return
+    mapping["markup_percent"] = percent
+    mapping["markup_fixed"] = fixed
+    _db_save_mapping(mapping)
+    clear_state(getattr(getattr(call, "from_user", None), "id", None))
+    logger.info("mapping markup set", extra={"mapping_id": mapping_id,
+                                             "percent": percent, "fixed": fixed})
+    fresh = _get_mapping_by_id(mapping_id) or mapping
+    bd = _markup_breakdown(fresh.get("price_usd"), fresh, load_config())
+    price_txt = (f"\n🏷 Цена лота: <b>{_esc(bd['price_rub'])}₽</b>"
+                 if bd["price_rub"] is not None else "")
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("💰 Наценка", callback_data=f"{CB_PREFIX}:mapping_markup:{mapping_id}"),
+           _inline_button("🔙 Привязка", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_or_edit(c, call, f"✅ {note}{price_txt}", kb=kb)
+
+
+def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    mapping_id = state["data"].get("mapping_id")
+    mapping = _get_mapping_by_id(mapping_id) if mapping_id else None
+    if not mapping:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Привязка не найдена.", kb=_main_keyboard())
+        return
+    percent, fixed, error = _parse_markup_input(message.text or "")
+    if error:
+        _send_telegram_message(c, message.chat.id, f"❌ {error}", reply_to=message)
+        return
+    mapping["markup_percent"] = percent
+    if fixed is not _KEEP:
+        mapping["markup_fixed"] = fixed
+    _db_save_mapping(mapping)
+    clear_state(message.from_user.id)
+    cfg = load_config()
+    fresh = _get_mapping_by_id(mapping_id) or mapping
+    bd = _markup_breakdown(fresh.get("price_usd"), fresh, cfg)
+
+    def _fmt_side(own: Optional[float], glob: Any, unit: str) -> str:
+        if own is None:
+            return f"<i>общая</i> {_esc(glob or 0)}{unit}"
+        return f"<b>{_esc(own)}{unit}</b>"
+
+    price_txt = (f"\n🏷 Новая цена лота: <b>{_esc(bd['price_rub'])}₽</b>"
+                 if bd["price_rub"] is not None else
+                 "\n<i>Задайте курс RUB/USD в настройках, чтобы увидеть цену.</i>")
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("💰 Изменить снова",
+                          callback_data=f"{CB_PREFIX}:mapping_markup:{mapping_id}"),
+           _inline_button("🔙 Привязка", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ <b>Наценка обновлена</b> — только у этой привязки.\n"
+        f"📈 Процент: {_fmt_side(_markup_own(fresh, 'markup_percent'), cfg['settings'].get('markup_percent'), '%')}\n"
+        f"➕ Фикс: {_fmt_side(_markup_own(fresh, 'markup_fixed'), cfg['settings'].get('markup_fixed'), '₽')}"
+        f"{price_txt}",
+        kb=kb)
+
+# =============================================================================
+# импорт / экспорт настроек и привязок (v3.8)
+#
+# Три вида файла: только настройки, только привязки, и «всё вместе».
+# Формат один и тот же — JSON с конвертом (kind/version/exported_at), различие
+# лишь в наборе секций. Это позволяет одной кнопкой «Импорт» принимать любой
+# файл и самому понимать, что в нём лежит.
+#
+# Принципы, которые дались опытом:
+#   * API-ключ по умолчанию НЕ выгружается: файл уходит в Telegram, оттуда в
+#     облако, и утечка ключа = чужие покупки за твой счёт. Выгрузка с ключом —
+#     отдельная явная кнопка.
+#   * Привязки НЕ содержат ничего специфичного для аккаунта, кроме funpay_lot_id.
+#     При переносе на другой аккаунт лоты другие, поэтому импорт умеет
+#     «только настройки товара» — с сохранением текущих ID лотов.
+#   * Импорт всегда сначала показывает, что произойдёт (сколько добавится,
+#     сколько обновится, что не так), и лишь потом применяет по кнопке.
+#   * Перед применением делаем бэкап текущего состояния в файл — откат одной
+#     кнопкой, без «а где мои настройки».
+# =============================================================================
+
+_EXPORT_FORMAT_VERSION = 1
+_EXPORT_KIND_SETTINGS = "fzr_settings"
+_EXPORT_KIND_MAPPINGS = "fzr_mappings"
+_EXPORT_KIND_FULL = "fzr_full"
+_EXPORT_KINDS = (_EXPORT_KIND_SETTINGS, _EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL)
+
+# Ключи конфига, которые нельзя переносить между установками как есть.
+# api_key — секрет, mappings — переехали в БД (остаток от старых версий).
+_EXPORT_SECRET_KEYS = ("api_key",)
+_EXPORT_SKIP_CONFIG_KEYS = ("mappings",)
+
+# Поля привязки, привязанные к конкретному аккаунту FunPay: при переносе на
+# другой аккаунт их нужно либо сохранить свои, либо признать «нужна донастройка».
+_MAPPING_ACCOUNT_FIELDS = ("funpay_lot_id", "funpay_subcategory_id", "funpay_title")
+
+# Поля-кэш: перезаписывать их из файла бессмысленно, они обновятся сами.
+_MAPPING_VOLATILE_FIELDS = ("stock", "price_synced_at", "last_lot_price",
+                            "last_price_usd", "created_at", "updated_at")
+
+_IMPORT_STAGING: Dict[int, Dict[str, Any]] = {}
+_IMPORT_STAGING_LOCK = threading.RLock()
+_IMPORT_STAGING_TTL = 900.0        # 15 минут на подтверждение
+_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _export_envelope(kind: str) -> Dict[str, Any]:
+    return {
+        "kind": kind,
+        "version": _EXPORT_FORMAT_VERSION,
+        "plugin": NAME,
+        "plugin_version": VERSION,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _export_settings_payload(cfg: Dict[str, Any], with_secrets: bool = False) -> Dict[str, Any]:
+    """Секция настроек: базовый URL, settings, шаблоны. Ключ — только по просьбе."""
+    out: Dict[str, Any] = {
+        "base_url": cfg.get("base_url") or DEFAULT_CONFIG["base_url"],
+        "settings": copy.deepcopy(cfg.get("settings") or {}),
+        "templates": copy.deepcopy(cfg.get("templates") or {}),
+    }
+    if with_secrets and cfg.get("api_key"):
+        out["api_key"] = cfg["api_key"]
+    return out
+
+
+_LOTS_INDEX_CACHE: Dict[str, Any] = {"ts": 0.0, "by_id": {}, "by_title": {},
+                                     "by_title_loose": {}}
+_LOTS_INDEX_TTL = 300.0
+
+
+def _title_loose_key(title: Optional[str]) -> str:
+    """
+    «Мягкий» ключ названия лота: только буквы и цифры.
+
+    v3.17: продавец правит названия в текстовом редакторе, и промах на эмодзи,
+    дефис или двойной пробел не должен приводить к «лот не найден» и
+    выключенной привязке. Регистр и любые знаки игнорируем.
+    """
+    return re.sub(r"[^0-9a-zA-Zа-яёА-ЯЁ]+", "", (title or "")).lower()
+
+
+def _lot_search_keys(info: Dict[str, Any]) -> List[str]:
+    """
+    Все строки, по которым лот можно узнать (v3.22).
+
+    Раньше искали только по `title`. Но у части категорий FunPay название
+    лота лежит не в кратком описании, а в поле «сервер» (или в стороне), и
+    тогда `by_title` для такого лота пуст — сопоставление по названию
+    проваливалось для ВСЕХ лотов аккаунта.
+    """
+    title = str(info.get("title") or "").strip()
+    server = str(info.get("server") or "").strip()
+    side = str(info.get("side") or "").strip()
+    keys = [title, server, side]
+    # ГЛАВНОЕ (v3.22, по живому аккаунту): FunPay отдаёт в кратком описании
+    # лота название И доп. поля через запятую:
+    #   «💙9288 АЛМАЗОВ💙…💙, Global, Пополнение по ID, 7500+ алмазов»
+    # А в привязке лежит только само название. Поэтому первый сегмент до
+    # запятой — это и есть название лота, и по нему сопоставление точное.
+    for source in (title, server, side):
+        if source and "," in source:
+            head = source.split(",")[0].strip()
+            if head:
+                keys.append(head)
+    if server and title:
+        keys.append(f"{server}, {title}")
+    if side and title:
+        keys.append(f"{side}, {title}")
+    if server and side:
+        keys.append(f"{server}, {side}")
+    out: List[str] = []
+    for k in keys:
+        k = k.strip()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _digits_key(text: Optional[str]) -> Tuple[str, ...]:
+    """
+    Набор чисел из названия — «страховка» при неточном сравнении (v3.22).
+
+    «5 АЛМАЗОВ» и «95 АЛМАЗОВ» отличаются одной цифрой: по буквам они почти
+    одинаковы, и любое нечёткое сравнение их путает. Номиналы у цифровых
+    товаров — главное, что нельзя перепутать, поэтому числа должны совпадать.
+    """
+    return tuple(re.findall(r"\d+", text or ""))
+
+
+def _lots_search_rows(lots: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Плоский список «лот → как его можно узнать» для нечёткого поиска."""
+    cached = lots.get("_search_rows")
+    if isinstance(cached, list):
+        return cached
+    rows: List[Dict[str, Any]] = []
+    for lot_id, info in (lots.get("by_id") or {}).items():
+        for key in _lot_search_keys(info):
+            lk = _title_loose_key(key)
+            if not lk:
+                continue
+            rows.append({"id": str(lot_id), "text": key, "loose": lk,
+                         "digits": _digits_key(key),
+                         "subcategory_id": info.get("subcategory_id")})
+    if isinstance(lots, dict):
+        try:
+            lots["_search_rows"] = rows
+        except Exception:
+            pass
+    return rows
+
+
+def _lots_index(c: Optional["Cardinal"], force: bool = False) -> Dict[str, Any]:
+    """
+    Индекс лотов аккаунта: id → название, и название → список id.
+
+    Нужен и для экспорта (чтобы в файле были настоящие названия лотов, а не
+    только числовые ID), и для импорта (проверить, существует ли лот, и
+    сопоставить лот по названию, если продавец правил файл руками).
+
+    КРИТИЧНО: FunPay в NewOrderEvent НЕ передаёт ID лота — только название
+    лота (`description`) и подкатегорию. Поэтому выдача находит привязку по
+    `funpay_title` + `funpay_subcategory_id`, а не по `funpay_lot_id`. Значит
+    при импорте название и подкатегорию нужно брать ЖИВЫМИ из этого индекса,
+    иначе привязка есть, лот есть, а заказ не сматчится.
+    """
+    if c is None:
+        return {"by_id": {}, "by_title": {}, "by_title_loose": {}}
+    now = time.time()
+    if not force and _LOTS_INDEX_CACHE["ts"] and now - _LOTS_INDEX_CACHE["ts"] < _LOTS_INDEX_TTL:
+        return _LOTS_INDEX_CACHE
+    by_id: Dict[str, Dict[str, Any]] = {}
+    by_title: Dict[str, List[str]] = {}
+    by_title_loose: Dict[str, List[str]] = {}
+    try:
+        profile = c.account.get_user(c.account.id)
+        for lot in (profile.get_lots() if profile else []):
+            title = str(getattr(lot, "description", None) or getattr(lot, "title", None) or "").strip()
+            sub = getattr(lot, "subcategory", None)
+            info = {
+                "title": title,
+                # сервер и сторона: именно они попадают в описание заказа,
+                # а название лота — нет (см. _resolve_order_lot_ids)
+                "server": str(getattr(lot, "server", None) or "").strip(),
+                "side": str(getattr(lot, "side", None) or "").strip(),
+                "subcategory_id": getattr(sub, "id", None),
+                "subcategory_name": getattr(sub, "fullname", None) or getattr(sub, "name", None),
+            }
+            by_id[str(lot.id)] = info
+            # v3.22: индексируем не только краткое описание. У части категорий
+            # FunPay название лота лежит в «сервере» или «стороне», и раньше
+            # такой лот не находился по названию вообще.
+            for key in _lot_search_keys(info):
+                # v3.17: ключ нормализованный (регистр + лишние пробелы), иначе
+                # правка названия руками почти всегда «не находила» лот
+                norm_key = _normalize_title(key)
+                if norm_key and str(lot.id) not in by_title.setdefault(norm_key, []):
+                    by_title[norm_key].append(str(lot.id))
+                loose = _title_loose_key(key)
+                if loose and str(lot.id) not in by_title_loose.setdefault(loose, []):
+                    by_title_loose[loose].append(str(lot.id))
+    except Exception as e:
+        logger.warning("lots index failed", extra={"error": _redact_sensitive(str(e))})
+        # пустой индекс не кэшируем: лучше попробовать снова на следующем шаге
+        return {"by_id": by_id, "by_title": by_title, "by_title_loose": by_title_loose}
+    _LOTS_INDEX_CACHE.update({"ts": now, "by_id": by_id, "by_title": by_title,
+                              "by_title_loose": by_title_loose})
+    logger.info("lots index built", extra={"lots": len(by_id)})
+    return _LOTS_INDEX_CACHE
+
+
+def _lot_url(lot_id: Any) -> str:
+    return f"https://funpay.com/lots/offer?id={lot_id}" if lot_id else ""
+
+
+def _export_mapping(mapping: Dict[str, Any],
+                    lots: Optional[Dict[str, Any]] = None) -> "OrderedDict[str, Any]":
+    """
+    Одна привязка для файла.
+
+    Порядок ключей осмысленный: сверху то, что продавец правит руками
+    (название лота, ID лота), ниже — техника. Волатильные поля (сток, время
+    синхронизации) не выгружаем: они только сбивают diff и обновятся сами.
+    """
+    lot_id = mapping.get("funpay_lot_id")
+    live = ((lots or {}).get("by_id") or {}).get(str(lot_id)) or {}
+    # название берём живое из профиля FunPay: в привязке оно могло устареть
+    title = live.get("title") or mapping.get("funpay_title") or ""
+    out: "OrderedDict[str, Any]" = OrderedDict()
+    out["funpay_lot_title"] = title
+    out["funpay_lot_id"] = lot_id
+    out["funpay_lot_url"] = _lot_url(lot_id)
+    out["funpay_subcategory_name"] = (live.get("subcategory_name")
+                                      or mapping.get("funpay_subcategory_name") or "")
+    out["fzr_offer_name"] = mapping.get("offer_name") or ""
+    out["fzr_sku_id"] = mapping.get("fzr_sku_id") or ""
+    for key, value in mapping.items():
+        if key in _MAPPING_VOLATILE_FIELDS or key in out:
+            continue
+        if key == "funpay_title":
+            continue        # уже отдали как funpay_lot_title
+        out[key] = value
+    # наценка: None должен остаться None (наследование), а не превратиться в 0
+    for key in ("markup_percent", "markup_fixed"):
+        out[key] = _markup_own(mapping, key)
+    return out
+
+
+_EXPORT_README = [
+    "Файл настроек плагина FazerCards Reseller. Можно править в текстовом редакторе.",
+    "ПЕРЕНОС НА ДРУГОЙ АККАУНТ: в каждой привязке впишите funpay_lot_title как "
+    "называется лот на НОВОМ аккаунте, а funpay_lot_id поставьте null.",
+    "Название сверяется без учёта регистра, лишних пробелов и знаков "
+    "(эмодзи, дефисы, «!!!»), поэтому точность до символа не нужна.",
+    "Если знаете ID лота — впишите его в funpay_lot_id, это надёжнее названия. "
+    "Можно вставить и ссылку на лот целиком.",
+    "Название нужно только для поиска лота при импорте. Дальше выдача опознаёт "
+    "лот по его ID и по тому, как он выглядит в заказе (сервер / сторона), "
+    "поэтому опечатка в названии выдачу не сломает.",
+    "После импорта нажмите «Проверить выдачу» в разделе «Экспорт/импорт»: "
+    "она прогоняет каждый лот так же, как реальный заказ.",
+    "Привязка ищется по fzr_sku_id — его менять не нужно, иначе создастся новая.",
+    "Копируете блок привязки для нового товара — смените fzr_sku_id И id "
+    "(или удалите строку id: плагин выдаст новый).",
+    "markup_percent/markup_fixed: null = взять общую наценку из настроек, "
+    "число (в т.ч. 0) = своя наценка этого лота.",
+    "enabled: true/false — выключенная привязка не выдаёт товар.",
+    "В панели можно выгрузить только выбранные привязки и сразу задать, "
+    "приедут они включёнными или выключенными: «Экспорт/импорт» → "
+    "«Выбрать привязки для экспорта».",
+    "refund_template — свой текст покупателю, если поставщик вернул деньги "
+    "за эту игру (пусто = общий текст из настроек).",
+    "Если после импорта ID лотов не сошлись — в списке привязок есть кнопка "
+    "«Привязать ID лотов FunPay»: она найдёт лоты по названию и впишет живые "
+    "ID всем привязкам без лота. Рядом «Включить все привязки».",
+]
+
+
+def _build_export(kind: str, with_secrets: bool = False,
+                  c: Optional["Cardinal"] = None,
+                  enabled_override: Optional[bool] = None,
+                  only_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """
+    Собирает файл выгрузки.
+
+    v3.20:
+      * `enabled_override` — принудительно выставить всем привязкам в файле
+        enabled=True/False. Нужно при переносе на другой аккаунт: там лоты
+        сначала проверяют, а не включают сразу (или наоборот — включают все).
+      * `only_ids` — выгрузить только выбранные привязки.
+    """
+    cfg = load_config()
+    data: Dict[str, Any] = OrderedDict(_export_envelope(kind))
+    data["_readme"] = list(_EXPORT_README)
+    if kind in (_EXPORT_KIND_SETTINGS, _EXPORT_KIND_FULL):
+        data["config"] = _export_settings_payload(cfg, with_secrets=with_secrets)
+        data["has_api_key"] = bool(with_secrets and cfg.get("api_key"))
+    if kind in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
+        lots = _lots_index(c)
+        source = _db_get_mappings()
+        total_all = len(source)
+        if only_ids is not None:
+            source = [m for m in source if str(m.get("id")) in only_ids]
+        mappings = [_export_mapping(m, lots) for m in source]
+        if enabled_override is not None:
+            for m in mappings:
+                m["enabled"] = bool(enabled_override)
+        # Сортируем по подкатегории и названию лота: файл правят руками, и
+        # стабильный, сгруппированный порядок делает это гораздо удобнее
+        # (плюс diff между двумя выгрузками остаётся читаемым).
+        mappings.sort(key=lambda m: (str(m.get("funpay_subcategory_name") or "").casefold(),
+                                     str(m.get("funpay_lot_title") or "").casefold(),
+                                     str(m.get("fzr_sku_id") or "")))
+        data["mappings"] = mappings
+        data["mappings_count"] = len(mappings)
+        if only_ids is not None and len(mappings) != total_all:
+            # видно прямо в файле, что это выборка, а не весь список
+            data["mappings_selected"] = True
+            data["mappings_total_on_account"] = total_all
+        if enabled_override is not None:
+            data["mappings_enabled_forced"] = bool(enabled_override)
+        # сводка «что где лежит» — чтобы не открывать весь файл ради обзора
+        data["lots_overview"] = [
+            f"{'🟢' if m.get('enabled', True) else '🔴'} "
+            f"{m['funpay_lot_id'] or '—'} · {m['funpay_lot_title'] or '(без названия)'}"
+            f" ← {m['fzr_sku_id']}"
+            for m in mappings
+        ]
+    return data
+
+
+def _export_filename(kind: str) -> str:
+    stamp = time.strftime("%Y%m%d_%H%M")
+    suffix = {_EXPORT_KIND_SETTINGS: "settings",
+              _EXPORT_KIND_MAPPINGS: "mappings",
+              _EXPORT_KIND_FULL: "full"}.get(kind, kind)
+    return f"fzr_{suffix}_{stamp}.json"
+
+
+def _export_bytes(data: Dict[str, Any]) -> bytes:
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _detect_export_kind(data: Dict[str, Any]) -> Optional[str]:
+    """
+    Что за файл нам дали.
+
+    Сначала смотрим заявленный kind, но доверяем содержимому: файл могли
+    склеить руками или выгрузить старой версией без конверта.
+    """
+    kind = str(data.get("kind") or "").strip()
+    has_cfg = isinstance(data.get("config"), dict)
+    has_maps = isinstance(data.get("mappings"), list)
+    if kind in _EXPORT_KINDS:
+        # заявленный kind должен подтверждаться содержимым
+        if kind == _EXPORT_KIND_FULL and (has_cfg or has_maps):
+            return _EXPORT_KIND_FULL
+        if kind == _EXPORT_KIND_SETTINGS and has_cfg:
+            return _EXPORT_KIND_SETTINGS
+        if kind == _EXPORT_KIND_MAPPINGS and has_maps:
+            return _EXPORT_KIND_MAPPINGS
+    if has_cfg and has_maps:
+        return _EXPORT_KIND_FULL
+    if has_cfg:
+        return _EXPORT_KIND_SETTINGS
+    if has_maps:
+        return _EXPORT_KIND_MAPPINGS
+    # старый формат: сам конфиг плагина без конверта
+    if isinstance(data.get("settings"), dict) or isinstance(data.get("templates"), dict):
+        return _EXPORT_KIND_SETTINGS
+    return None
+
+
+def _normalize_import_payload(data: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Приводим и новый (с конвертом), и старый (сырой конфиг) формат к одному виду."""
+    if isinstance(data.get("config"), dict):
+        config = dict(data["config"])
+    elif kind == _EXPORT_KIND_SETTINGS:
+        config = {k: v for k, v in data.items()
+                  if k in ("base_url", "settings", "templates", "api_key")}
+    else:
+        config = {}
+    mappings = data.get("mappings") if isinstance(data.get("mappings"), list) else []
+    return {"config": config, "mappings": mappings}
+
+
+def _validate_import_settings(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Отбираем из файла только известные настройки и проверяем значения.
+
+    Незнакомые ключи отбрасываем: чужой/старый файл не должен пропихнуть в
+    конфиг мусор, из-за которого потом падает UI.
+    """
+    warnings: List[str] = []
+    clean: Dict[str, Any] = {}
+
+    src_settings = config.get("settings")
+    if not isinstance(src_settings, dict):
+        src_settings = {}
+    known = DEFAULT_CONFIG["settings"]
+    settings: Dict[str, Any] = {}
+    unknown: List[str] = []
+    bad: List[str] = []
+    for key, value in src_settings.items():
+        if key not in known:
+            unknown.append(key)
+            continue
+        default = known[key]
+        try:
+            if isinstance(default, bool):
+                settings[key] = bool(value)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                settings[key] = int(float(value))
+            elif isinstance(default, float):
+                settings[key] = float(value)
+            else:
+                settings[key] = value
+        except (TypeError, ValueError):
+            bad.append(key)
+    # числовые настройки проверяем теми же границами, что и ручной ввод
+    for key, meta in _SETTINGS_EDITABLE.items():
+        if key not in settings:
+            continue
+        _label, _caster, min_v, max_v = meta
+        try:
+            value = float(settings[key])
+        except (TypeError, ValueError):
+            bad.append(key)
+            settings.pop(key, None)
+            continue
+        if value < min_v or value > max_v:
+            bad.append(f"{key} ({settings[key]})")
+            settings.pop(key, None)
+    if settings:
+        clean["settings"] = settings
+    if unknown:
+        warnings.append(f"неизвестных настроек пропущено: {len(unknown)}")
+    if bad:
+        warnings.append("значения вне допустимых границ пропущены: " + ", ".join(bad[:5]))
+
+    src_templates = config.get("templates")
+    if isinstance(src_templates, dict):
+        templates = {}
+        for key, value in src_templates.items():
+            if key in DEFAULT_CONFIG["templates"] and isinstance(value, str):
+                templates[key] = value[:4000]
+        if templates:
+            clean["templates"] = templates
+        skipped = len(src_templates) - len(templates)
+        if skipped > 0:
+            warnings.append(f"неизвестных шаблонов пропущено: {skipped}")
+
+    base_url = config.get("base_url")
+    if isinstance(base_url, str) and base_url.startswith("http"):
+        clean["base_url"] = base_url.strip()
+    elif base_url:
+        warnings.append("base_url в файле некорректен — оставлен текущий")
+
+    if config.get("api_key"):
+        clean["api_key"] = str(config["api_key"])
+    return clean, warnings
+
+
+def _validate_import_mappings(raw: List[Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Оставляем только пригодные привязки: с SKU и разобранным kind/category/offer."""
+    warnings: List[str] = []
+    out: List[Dict[str, Any]] = []
+    skipped_no_sku = 0
+    skipped_bad = 0
+    seen_ids: Set[str] = set()
+    allowed = set(_MAPPING_COLUMNS) | {"fields", "metadata_fields"}
+    for item in raw:
+        if not isinstance(item, dict):
+            skipped_bad += 1
+            continue
+        sku = str(item.get("fzr_sku_id") or "").strip()
+        kind = str(item.get("category_kind") or "").strip()
+        category_id = str(item.get("category_id") or "").strip()
+        offer_id = str(item.get("offer_id") or "").strip()
+        if not sku and kind and category_id and offer_id:
+            sku = f"{kind}:{category_id}:{offer_id}"
+        if not sku:
+            skipped_no_sku += 1
+            continue
+        if not (kind and category_id and offer_id):
+            try:
+                kind, category_id, offer_id = _parse_sku(sku)
+            except ValueError:
+                skipped_bad += 1
+                continue
+        has_price_sync = "price_sync" in item
+        clean = {k: v for k, v in item.items() if k in allowed}
+        clean["fzr_sku_id"] = sku
+        clean["category_kind"] = kind
+        clean["category_id"] = category_id
+        clean["offer_id"] = offer_id
+        # человекочитаемые поля экспорта: название лота продавец правит руками
+        title = str(item.get("funpay_lot_title") or item.get("funpay_title") or "").strip()
+        if title:
+            clean["funpay_title"] = title[:500]
+        if item.get("fzr_offer_name") and not clean.get("offer_name"):
+            clean["offer_name"] = str(item["fzr_offer_name"])[:500]
+        # ID лота могли стереть (null) или вписать ссылку целиком
+        lot_raw = item.get("funpay_lot_id")
+        lot_text: Optional[str] = None
+        if lot_raw in (None, "", "null", "-"):
+            pass
+        else:
+            lot_text = str(lot_raw).strip()
+            # из ссылки берём id; не требуем \d+ — пусть работает и с нечисловыми
+            m = re.search(r"[?&]id=([A-Za-z0-9_\-]+)", lot_text)
+            if m:
+                lot_text = m.group(1)
+        clean["funpay_lot_id"] = lot_text
+        if not has_price_sync and lot_text:
+            clean["price_sync"] = True
+        # запомним желаемое название лота отдельно — по нему будем искать лот
+        clean["_wanted_lot_title"] = title
+        # Указан ли лот в файле вообще. Важно различать «поля нет» (частичный
+        # файл — лот существующей привязки не трогаем) и «стоит null» (продавец
+        # намеренно стёр ID, чтобы нашли по названию).
+        clean["_lot_specified"] = bool(
+            "funpay_lot_id" in item or "funpay_lot_title" in item or title)
+        mid = str(clean.get("id") or "").strip()
+        if not mid or mid in seen_ids:
+            mid = str(uuid.uuid4())
+        clean["id"] = mid
+        seen_ids.add(mid)
+        # наценка: пусто/None = наследовать, число = своё (в т.ч. 0)
+        for key in ("markup_percent", "markup_fixed"):
+            clean[key] = _markup_own(clean, key)
+        out.append(clean)
+    if skipped_no_sku:
+        warnings.append(f"привязок без SKU пропущено: {skipped_no_sku}")
+    if skipped_bad:
+        warnings.append(f"привязок с нечитаемым SKU пропущено: {skipped_bad}")
+    return out, warnings
+
+
+def _resolve_import_lot(incoming: Dict[str, Any],
+                        lots: Dict[str, Any]) -> Tuple[Optional[str], str, str]:
+    """
+    Какой лот FunPay использовать для импортируемой привязки.
+
+    Возвращает (lot_id, статус, пояснение). Статусы:
+      'id'        — указанный ID существует на аккаунте,
+      'by_title'  — ID не подошёл, но лот найден по названию,
+      'ambiguous' — по названию несколько лотов, выбрать нельзя,
+      'missing'   — лота нет; привязку добавим выключенной.
+
+    Побочно заполняет `_resolved_lot_title` / `_resolved_subcategory_id` —
+    ЖИВЫЕ название и подкатегорию найденного лота. Именно по ним потом
+    матчится заказ (FunPay не присылает ID лота), поэтому подставлять надо
+    их, а не то, что написано в файле.
+    """
+    by_id = lots.get("by_id") or {}
+    by_title = lots.get("by_title") or {}
+    lot_id = incoming.get("funpay_lot_id")
+    title = str(incoming.get("_wanted_lot_title") or "").strip()
+
+    def _fill(found_id: str) -> None:
+        live = by_id.get(str(found_id)) or {}
+        if live.get("title"):
+            incoming["_resolved_lot_title"] = live["title"]
+        if live.get("subcategory_id") is not None:
+            incoming["_resolved_subcategory_id"] = live["subcategory_id"]
+
+    if lot_id and str(lot_id) in by_id:
+        _fill(str(lot_id))
+        live_title = by_id[str(lot_id)].get("title") or ""
+        note = f"лот {lot_id} — {live_title}" if live_title else f"лот {lot_id}"
+        return str(lot_id), "id", note
+    # индекс пуст (профиль недоступен) — верим файлу, иначе выключим всё зря
+    if lot_id and not by_id:
+        return str(lot_id), "id", f"лот {lot_id} (список лотов недоступен, взят из файла)"
+    if title:
+        found = by_title.get(_normalize_title(title)) or []
+        if len(found) == 1:
+            _fill(found[0])
+            return found[0], "by_title", f"найден по названию «{title}» → лот {found[0]}"
+        if not found:
+            # v3.17: сравнение «по буквам и цифрам» — спасает от промаха на
+            # эмодзи, дефисе или двойном пробеле при правке файла руками
+            loose = (lots.get("by_title_loose") or {}).get(_title_loose_key(title)) or []
+            if len(loose) == 1:
+                _fill(loose[0])
+                live = (by_id.get(loose[0]) or {}).get("title") or ""
+                return loose[0], "by_title", (f"найден по названию (без учёта знаков) "
+                                              f"«{live or title}» → лот {loose[0]}")
+            found = loose
+        if len(found) > 1:
+            return None, "ambiguous", f"«{title}»: подходит {len(found)} лотов, уточните ID"
+    if lot_id:
+        return None, "missing", f"лота {lot_id} нет на этом аккаунте"
+    return None, "missing", (f"лот не указан" if not title else f"лот «{title}» не найден")
+
+
+def _mapping_import_key(mapping: Dict[str, Any]) -> str:
+    """
+    Ключ сопоставления «файл ↔ база».
+
+    Именно SKU, а не id: при переносе с другого аккаунта id совпадут только
+    если файл выгружен из этой же установки, а товар — тот же самый.
+    """
+    return str(mapping.get("fzr_sku_id") or "").strip().lower()
+
+
+def _plan_import(payload: Dict[str, Any], kind: str,
+                 keep_lots: bool = False,
+                 c: Optional["Cardinal"] = None) -> Dict[str, Any]:
+    """
+    Что произойдёт при импорте — без изменения данных.
+
+    keep_lots=True: у существующих привязок оставить их текущие лоты и
+    игнорировать лоты из файла. По умолчанию False — файл правят руками именно
+    для того, чтобы указать лоты нового аккаунта.
+    """
+    plan: Dict[str, Any] = {
+        "kind": kind, "warnings": [], "settings": {}, "settings_diff": [],
+        "templates_diff": [], "mappings_new": [], "mappings_update": [],
+        "mappings_conflict": [], "has_api_key": False, "keep_lots": keep_lots,
+        "lot_notes": [], "lots_known": 0,
+    }
+    cfg = load_config()
+
+    if kind in (_EXPORT_KIND_SETTINGS, _EXPORT_KIND_FULL):
+        clean, warns = _validate_import_settings(payload.get("config") or {})
+        plan["warnings"] += warns
+        plan["settings"] = clean
+        plan["has_api_key"] = bool(clean.get("api_key"))
+        for key, value in (clean.get("settings") or {}).items():
+            current = cfg["settings"].get(key)
+            if current != value:
+                plan["settings_diff"].append((key, current, value))
+        for key, value in (clean.get("templates") or {}).items():
+            if (cfg["templates"].get(key) or "") != value:
+                plan["templates_diff"].append(key)
+        if clean.get("base_url") and clean["base_url"] != cfg.get("base_url"):
+            plan["settings_diff"].append(("base_url", cfg.get("base_url"), clean["base_url"]))
+
+    if kind in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
+        mappings, warns = _validate_import_mappings(payload.get("mappings") or [])
+        plan["warnings"] += warns
+        lots = _lots_index(c)
+        plan["lots_known"] = len(lots.get("by_id") or {})
+        db_mappings = _db_get_mappings()
+        existing = {_mapping_import_key(m): m for m in db_mappings}
+        # v3.17: внутренние id уже занятых привязок. Привязки сопоставляются по
+        # SKU, а в БД пишутся по id — если в файле у НОВОЙ привязки окажется id
+        # существующей (типичный случай: скопировали блок в редакторе и сменили
+        # SKU), запись молча затирала чужую привязку. Такие id заменяем.
+        used_ids = {str(m.get("id")): _mapping_import_key(m) for m in db_mappings}
+        used_ids_new: Set[str] = set()
+        used_lots: Dict[str, str] = {}
+        for m in mappings:
+            key = _mapping_import_key(m)
+            current = existing.get(key)
+            if current is None:
+                mid = str(m.get("id") or "")
+                if (mid and used_ids.get(mid) not in (None, key)) or mid in used_ids_new:
+                    m["id"] = str(uuid.uuid4())
+                    plan["warnings"].append(
+                        f"{m.get('fzr_sku_id')}: внутренний id совпал с другой привязкой — "
+                        f"добавлю с новым (данные существующей не тронуты)")
+                used_ids_new.add(str(m.get("id")))
+            # Лот не трогаем, если продавец попросил сохранить свои лоты ИЛИ
+            # в файле про лот вообще ничего не сказано (частичный файл).
+            keep_this = bool(current) and (keep_lots or not m.get("_lot_specified"))
+            if not keep_this:
+                lot_id, lot_state, note = _resolve_import_lot(m, lots)
+                m["_resolved_lot_id"] = lot_id
+                m["_lot_state"] = lot_state
+                # один лот на две привязки — почти всегда опечатка в файле
+                if lot_id and lot_id in used_lots and used_lots[lot_id] != key:
+                    plan["warnings"].append(
+                        f"лот {lot_id} указан у нескольких привязок — проверьте файл")
+                if lot_id:
+                    used_lots[lot_id] = key
+            else:
+                m["_resolved_lot_id"] = current.get("funpay_lot_id")
+                m["_lot_state"] = "keep"
+                lot_state = "keep"
+                note = (f"лот {current.get('funpay_lot_id')} остаётся как есть"
+                        if current.get("funpay_lot_id") else "лот не задан, оставляем как есть")
+            title = m.get("_wanted_lot_title") or m.get("funpay_title") or "—"
+            # Название в файле может расходиться с настоящим названием лота.
+            # Матчинг заказа идёт по названию, поэтому мы берём живое, но
+            # продавцу об этом надо сказать — иначе он будет искать причину.
+            live_title = m.get("_resolved_lot_title")
+            if live_title and _normalize_title(live_title) != _normalize_title(title):
+                note += f"; название в привязке будет «{live_title}»"
+                plan["title_fixed"] = plan.get("title_fixed", 0) + 1
+            plan["lot_notes"].append((title, m.get("fzr_sku_id"), lot_state, note))
+            if current is None:
+                if lot_state in ("id", "by_title", "keep") and m["_resolved_lot_id"]:
+                    plan["mappings_new"].append(m)
+                else:
+                    plan["mappings_conflict"].append(m)
+            else:
+                m["_keep_lot"] = keep_this
+                plan["mappings_update"].append((current, m))
+        plan["mappings_total"] = len(mappings)
+    return plan
+
+
+def _apply_import(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Применяем подготовленный план. Бэкап делается вызывающей стороной."""
+    result = {"settings_changed": 0, "templates_changed": 0,
+              "mappings_added": 0, "mappings_updated": 0, "api_key_set": False,
+              "lots_relinked": 0, "disabled": 0}
+    kind = plan["kind"]
+
+    if kind in (_EXPORT_KIND_SETTINGS, _EXPORT_KIND_FULL) and plan.get("settings"):
+        cfg = load_config()
+        clean = plan["settings"]
+        for key, value in (clean.get("settings") or {}).items():
+            if cfg["settings"].get(key) != value:
+                cfg["settings"][key] = value
+                result["settings_changed"] += 1
+        for key, value in (clean.get("templates") or {}).items():
+            if (cfg["templates"].get(key) or "") != value:
+                cfg["templates"][key] = value
+                result["templates_changed"] += 1
+        if clean.get("base_url"):
+            cfg["base_url"] = clean["base_url"]
+        if clean.get("api_key") and plan.get("import_api_key"):
+            cfg["api_key"] = clean["api_key"]
+            result["api_key_set"] = True
+        save_config(cfg)
+        # интервал курса мог измениться — применяем без ожидания старого цикла
+        _EXCHANGE_RATE_WAKE.set()
+
+    keep_lots = plan.get("keep_lots", False)
+
+    def _strip(d: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in d.items() if not k.startswith("_")}
+
+    def _apply_lot(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+        """
+        Прописать лот в привязку.
+
+        Заказ матчится по названию лота и подкатегории (ID лота FunPay в
+        событии не присылает), поэтому берём ЖИВЫЕ значения найденного лота.
+        Если название из файла расходится с настоящим — оно бы сломало выдачу.
+        """
+        target["funpay_lot_id"] = incoming.get("_resolved_lot_id")
+        live_title = incoming.get("_resolved_lot_title")
+        if live_title:
+            target["funpay_title"] = live_title
+        live_sub = incoming.get("_resolved_subcategory_id")
+        if live_sub is not None:
+            target["funpay_subcategory_id"] = live_sub
+
+    for current, incoming in plan.get("mappings_update", []):
+        merged = dict(current)
+        old_lot = str(current.get("funpay_lot_id") or "")
+        keep_this = bool(incoming.get("_keep_lot"))
+        for key, value in _strip(incoming).items():
+            if key == "id":
+                continue        # id в базе не меняем, иначе потеряем историю заказов
+            if keep_this and key in _MAPPING_ACCOUNT_FIELDS:
+                continue        # лоты этого аккаунта не трогаем
+            if key in _MAPPING_VOLATILE_FIELDS:
+                continue
+            merged[key] = value
+        if not keep_this:
+            _apply_lot(merged, incoming)
+            if not merged["funpay_lot_id"]:
+                # лот не нашли — выключаем, чтобы не выдавать «в пустоту»
+                merged["enabled"] = False
+                result["disabled"] += 1
+            elif str(merged["funpay_lot_id"]) != old_lot:
+                result["lots_relinked"] += 1
+        _db_save_mapping(merged)
+        result["mappings_updated"] += 1
+
+    for incoming in plan.get("mappings_new", []) + plan.get("mappings_conflict", []):
+        new = _strip(incoming)
+        _apply_lot(new, incoming)
+        if not new["funpay_lot_id"]:
+            new["funpay_subcategory_id"] = None
+            new["enabled"] = False
+            result["disabled"] += 1
+        _db_save_mapping(new)
+        result["mappings_added"] += 1
+
+    logger.info("import applied", extra=dict(result, kind=kind, keep_lots=keep_lots))
+    return result
+
+
+def _backups_dir() -> str:
+    """
+    Папка бэкапов — рядом с конфигом этого аккаунта.
+
+    BASE_CACHE_DIR общий для всех аккаунтов FunPay, а бэкап должен
+    восстанавливать состояние того аккаунта, где его сделали.
+    """
+    return os.path.join(os.path.dirname(CONFIG_FILE) or BASE_CACHE_DIR, "backups")
+
+
+def _backup_before_import(c: Optional["Cardinal"] = None) -> Optional[str]:
+    """Полный дамп текущего состояния — чтобы импорт можно было откатить."""
+    try:
+        backup_dir = _backups_dir()
+        os.makedirs(backup_dir, exist_ok=True)
+        path = os.path.join(backup_dir, f"before_import_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        data = _build_export(_EXPORT_KIND_FULL, with_secrets=True, c=c)
+        with open(path, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as f:
+            f.write(_export_bytes(data))
+        _set_private_file(path)
+        # держим последние 10 бэкапов, остальное чистим
+        backups = sorted(fn for fn in os.listdir(backup_dir) if fn.startswith("before_import_"))
+        for old in backups[:-10]:
+            try:
+                os.remove(os.path.join(backup_dir, old))
+            except OSError:
+                pass
+        logger.info("pre-import backup saved", extra={"path": path})
+        return path
+    except Exception as e:
+        logger.error("pre-import backup failed", extra={"error": repr(e)})
+        return None
+
+
+def _staging_put(user_id: int, entry: Dict[str, Any]) -> None:
+    with _IMPORT_STAGING_LOCK:
+        now = time.time()
+        for uid in [u for u, v in _IMPORT_STAGING.items()
+                    if now - v.get("at", 0) > _IMPORT_STAGING_TTL]:
+            _IMPORT_STAGING.pop(uid, None)
+        entry["at"] = now
+        _IMPORT_STAGING[user_id] = entry
+
+
+def _staging_get(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if user_id is None:
+        return None
+    with _IMPORT_STAGING_LOCK:
+        entry = _IMPORT_STAGING.get(user_id)
+        if entry and time.time() - entry.get("at", 0) > _IMPORT_STAGING_TTL:
+            _IMPORT_STAGING.pop(user_id, None)
+            return None
+        return entry
+
+
+def _staging_clear(user_id: Optional[int]) -> None:
+    if user_id is None:
+        return
+    with _IMPORT_STAGING_LOCK:
+        _IMPORT_STAGING.pop(user_id, None)
+
+
+_EXPORT_KIND_LABEL = {
+    _EXPORT_KIND_SETTINGS: "настройки",
+    _EXPORT_KIND_MAPPINGS: "привязки",
+    _EXPORT_KIND_FULL: "настройки + привязки",
+}
+
+
+def _import_plan_text(plan: Dict[str, Any], file_name: str = "") -> str:
+    kind_label = _EXPORT_KIND_LABEL.get(plan["kind"], plan["kind"])
+    lines = ["📥 <b>Проверка файла перед импортом</b>"]
+    if file_name:
+        lines.append(f"<i>{_esc(file_name)}</i>")
+    lines.append(f"\n<blockquote>Содержимое: <b>{kind_label}</b>")
+
+    if plan["kind"] in (_EXPORT_KIND_SETTINGS, _EXPORT_KIND_FULL):
+        diff = plan["settings_diff"]
+        if diff:
+            lines.append(f"⚙️ Настроек изменится: <b>{len(diff)}</b>")
+            for key, old, new in diff[:6]:
+                lines.append(f"• {_esc(key)}: <code>{_esc(old)}</code> → <code>{_esc(new)}</code>")
+            if len(diff) > 6:
+                lines.append(f"<i>…и ещё {len(diff) - 6}</i>")
+        else:
+            lines.append("⚙️ Настройки: <i>совпадают, менять нечего</i>")
+        if plan["templates_diff"]:
+            lines.append(f"📝 Шаблонов изменится: <b>{len(plan['templates_diff'])}</b> "
+                         f"({_esc(', '.join(plan['templates_diff'][:4]))})")
+
+    if plan["kind"] in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
+        lines.append(f"🔗 Привязок в файле: <b>{plan.get('mappings_total', 0)}</b>")
+        if plan["mappings_update"]:
+            lines.append(f"♻️ Обновится: <b>{len(plan['mappings_update'])}</b> "
+                         f"<i>(совпал SKU)</i>")
+        added = len(plan["mappings_new"]) + len(plan["mappings_conflict"])
+        if added:
+            lines.append(f"➕ Добавится: <b>{added}</b>")
+    lines.append("</blockquote>")
+
+    # Самое важное при переносе — во что превратятся лоты. Показываем построчно.
+    notes = plan.get("lot_notes") or []
+    if notes:
+        icon = {"id": "✅", "by_title": "🔎", "ambiguous": "⚠️", "missing": "🚫", "keep": "🛡"}
+        lines.append("\n<b>Лоты FunPay</b>")
+        if not plan.get("lots_known"):
+            lines.append("<i>Список лотов аккаунта недоступен — ID беру из файла как есть.</i>")
+        block = []
+        for title, sku, state, note in notes[:12]:
+            block.append(f"{icon.get(state, '•')} {_esc(str(title)[:38])}\n"
+                         f"   <i>{_esc(note)}</i>")
+        lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+        if len(notes) > 12:
+            lines.append(f"<i>…и ещё {len(notes) - 12} привязок</i>")
+        bad = [n for n in notes if n[2] in ("missing", "ambiguous")]
+        if bad:
+            lines.append(f"⚠️ <b>Без лота: {len(bad)}</b> — добавлю выключенными. "
+                         f"Впишите в файл <code>funpay_lot_id</code> "
+                         f"(или точное название лота) и импортируйте снова.")
+        if plan.get("title_fixed"):
+            lines.append(f"ℹ️ <b>Названий поправлю: {plan['title_fixed']}</b> — возьму настоящие "
+                         f"названия лотов с этого аккаунта, чтобы в панели было видно, "
+                         f"что за лот.")
+        if plan.get("keep_lots"):
+            lines.append("🛡 <i>Лоты существующих привязок сохраняются — "
+                         "значения из файла для них игнорируются.</i>")
+
+    if plan["has_api_key"]:
+        lines.append("\n🔑 <b>В файле есть API-ключ.</b> "
+                     "По умолчанию он <b>не</b> импортируется — нажмите отдельную кнопку, "
+                     "если хотите заменить текущий ключ.")
+    if plan["warnings"]:
+        lines.append("\n⚠️ <b>Замечания:</b>")
+        for w in plan["warnings"][:6]:
+            lines.append(f"• {_esc(w)}")
+
+    nothing = (not plan["settings_diff"] and not plan["templates_diff"]
+               and not plan["mappings_update"] and not plan["mappings_new"]
+               and not plan["mappings_conflict"])
+    if nothing:
+        lines.append("\n<i>Изменять нечего — данные уже такие же.</i>")
+    else:
+        lines.append("\n<i>Перед применением сохраню бэкап текущего состояния — "
+                     "откат одной кнопкой.</i>")
+        if plan.get("lot_notes") and any(n[2] in ("missing", "ambiguous")
+                                        for n in plan["lot_notes"]):
+            lines.append("<i>Если лоты не сошлись — после импорта нажмите "
+                         "«🔗 Привязать ID лотов FunPay» в списке привязок: "
+                         "она подберёт лоты по названию.</i>")
+    return "\n".join(lines)
+
+
+def _send_document(c: "Cardinal", chat_id: Any, data: bytes, file_name: str,
+                   caption: str = "", kb: Optional[InlineKeyboardMarkup] = None) -> bool:
+    """Отправка файла в Telegram из памяти — на диск ничего не пишем."""
+    if not getattr(c, "telegram", None):
+        return False
+    try:
+        buffer = io.BytesIO(data)
+        buffer.name = file_name
+        c.telegram.bot.send_document(
+            chat_id, buffer, visible_file_name=file_name,
+            caption=caption[:1024], parse_mode="HTML", reply_markup=kb)
+        return True
+    except Exception as e:
+        logger.error("send_document failed", extra={"error": repr(e), "file": file_name})
+        _send_telegram_message(
+            c, chat_id,
+            f"❌ <b>Не удалось отправить файл.</b>\n\n<blockquote>{_esc(e)}</blockquote>")
+        return False
+
+
+def _delivery_readiness(c: Optional["Cardinal"]) -> Dict[str, Any]:
+    """
+    Проверка «сработает ли выдача» для каждой включённой привязки.
+
+    Смысл: FunPay в событии нового заказа НЕ присылает ID лота — только
+    описание заказа («сервер, сторона, N шт., доп. поля») и подкатегорию.
+    Название лота в это описание попадает лишь тогда, когда у лота нет
+    сервера и стороны. Поэтому здесь мы собираем описание заказа ровно так,
+    как его составит FunPay для каждого лота, и прогоняем через тот же
+    `find_mapping`, что работает при реальной покупке.
+    """
+    lots = _lots_index(c)
+    by_id = lots.get("by_id") or {}
+    out: Dict[str, Any] = {"ok": [], "problems": [], "lots_known": len(by_id)}
+
+    class _Sub:
+        def __init__(self, sid: Any) -> None:
+            self.id = sid
+
+    class _FakeOrder:
+        """Минимальная копия OrderShortcut: матчинг смотрит только эти поля."""
+        def __init__(self, description: str, subcategory_id: Any) -> None:
+            self.description = description
+            self.subcategory = _Sub(subcategory_id) if subcategory_id is not None else None
+            self.amount = 1
+
+    class _FakeEvent:
+        def __init__(self, order: Any) -> None:
+            self.order = order
+
+    def _order_desc(info: Dict[str, Any], fallback_title: str) -> str:
+        """Описание заказа так, как его составит FunPay для этого лота."""
+        parts = [p for p in (info.get("server"), info.get("side")) if p]
+        if parts:
+            # у лота есть сервер/сторона -> название лота в заказ НЕ попадёт,
+            # зато FunPay вставит количество между ними и доп. полями
+            return ", ".join(parts + ["1 шт."])
+        return info.get("title") or fallback_title
+
+    for m in _db_get_mappings():
+        if not m.get("enabled", True):
+            continue
+        name = _mapping_display_name(m)
+        lot_id = m.get("funpay_lot_id")
+        live = by_id.get(str(lot_id)) if lot_id else None
+        if lot_id and by_id and live is None:
+            out["problems"].append((name, "lot_gone", f"лота {lot_id} нет на аккаунте"))
+            continue
+        title = (live or {}).get("title") or m.get("funpay_title") or ""
+        if not title and not (live or {}).get("server"):
+            out["problems"].append((name, "no_title", "у привязки нет названия лота"))
+            continue
+        sub_id = (live or {}).get("subcategory_id")
+        if sub_id is None:
+            sub_id = m.get("funpay_subcategory_id")
+        desc = _order_desc(live or {}, title)
+        try:
+            found = find_mapping(_FakeEvent(_FakeOrder(desc, sub_id)), c)
+        except Exception as e:      # матчинг не должен падать, но проверка не должна ломать ПУ
+            out["problems"].append((name, "error", f"ошибка проверки: {e}"))
+            continue
+        shown = title or desc
+        if found is None:
+            out["problems"].append((name, "no_match", f"заказ по лоту «{shown}» ни с чем не сойдётся"))
+        elif str(found.get("id")) != str(m.get("id")):
+            out["problems"].append(
+                (name, "wrong_match",
+                 f"заказ по лоту «{shown}» уйдёт в привязку «{_mapping_display_name(found)}»"))
+        else:
+            out["ok"].append((name, shown))
+    return out
+
+
+def _readiness_text(rep: Dict[str, Any]) -> str:
+    ok, problems = rep["ok"], rep["problems"]
+    lines = ["🧪 <b>Проверка выдачи</b>",
+             "<i>Собираю заказ по каждому лоту ровно так, как его пришлёт FunPay, "
+             "и проверяю, что он найдёт нужную привязку — как при реальной покупке.</i>", ""]
+    if not rep["lots_known"]:
+        lines.append("⚠️ <b>Список лотов FunPay недоступен</b> — проверял по данным привязок, "
+                     "а не по живым лотам. Повторите позже.\n")
+    if not ok and not problems:
+        lines.append("<blockquote><i>Нет включённых привязок — проверять нечего.</i></blockquote>")
+        return "\n".join(lines)
+    lines.append(f"<blockquote>✅ Готовы к выдаче: <b>{len(ok)}</b>"
+                 + (f"\n❌ Не сработают: <b>{len(problems)}</b>" if problems else "")
+                 + "</blockquote>")
+    if problems:
+        hint = {
+            "lot_gone": "ID лота чужой — нажмите «Привязать ID лотов FunPay»",
+            "no_title": "впишите название лота",
+            "no_match": "лот не опознаётся — нажмите «Привязать ID лотов FunPay»",
+            "wrong_match": "два лота слишком похожи — уточните названия",
+            "error": "внутренняя ошибка",
+        }
+        lines.append("\n<b>Требуют внимания</b>")
+        block = []
+        for name, code, note in problems[:10]:
+            block.append(f"❌ {_esc(name[:40])}\n   <i>{_esc(note)}</i>\n   ↳ {hint.get(code, '')}")
+        lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+        if len(problems) > 10:
+            lines.append(f"<i>…и ещё {len(problems) - 10}</i>")
+        lines.append("\n<i>Пока это не исправлено, такие заказы попадут в «Чужие лоты» "
+                     "и товар не выдастся.</i>")
+    else:
+        lines.append("\n<i>Всё сходится: заказ по любому из этих лотов найдёт свою "
+                     "привязку и товар уйдёт покупателю.</i>")
+    if ok:
+        shown = [f"✅ {_esc(t[:44])}" for _n, t in ok[:8]]
+        lines.append("\n<blockquote>" + "\n".join(shown)
+                     + (f"\n<i>…и ещё {len(ok) - 8}</i>" if len(ok) > 8 else "")
+                     + "</blockquote>")
+    return "\n".join(lines)
+
+
+def _show_readiness(c: "Cardinal", call: Any) -> None:
+    rep = _delivery_readiness(c)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔄 Проверить снова", callback_data=f"{CB_PREFIX}:readiness"))
+    if rep["problems"]:
+        # v3.21: чаще всего проблема — потерянный ID лота после переноса
+        kb.add(_inline_button("🔗 Привязать ID лотов FunPay",
+                              callback_data=f"{CB_PREFIX}:relink_all"))
+        kb.add(_inline_button("🔎 Определить ID лотов (подробно)",
+                              callback_data=f"{CB_PREFIX}:relink"))
+        kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"))
+    kb.add(_inline_button("💾 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, _readiness_text(rep), kb=kb)
+
+
+def _backup_menu_text() -> str:
+    cfg = load_config()
+    mappings = _db_get_mappings()
+    own_markup = sum(1 for m in mappings
+                     if _markup_own(m, "markup_percent") is not None
+                     or _markup_own(m, "markup_fixed") is not None)
+    psync = sum(1 for m in mappings if m.get("price_sync"))
+    changed = sum(1 for k, v in DEFAULT_CONFIG["settings"].items()
+                  if cfg["settings"].get(k) != v)
+    return (
+        "💾 <b>Экспорт и импорт</b>\n\n"
+        f"<blockquote>🔗 Привязок: <b>{len(mappings)}</b>"
+        + (f" · со своей наценкой: {own_markup}" if own_markup else "")
+        + (f" · с синхронизацией цен: {psync}" if psync else "")
+        + f"\n⚙️ Настроек изменено от стандартных: <b>{changed}</b></blockquote>\n\n"
+        "<blockquote><b>Что во что кладётся</b>\n"
+        "⚙️ <b>Настройки</b> — курс, наценки, тайминги, шаблоны сообщений.\n"
+        "🔗 <b>Привязки</b> — лоты, SKU, свои наценки и тексты, поля покупателя.\n"
+        "📦 <b>Всё вместе</b> — один файл для переноса на другой сервер.</blockquote>\n\n"
+        "<blockquote><b>Перенос на другой аккаунт FunPay</b>\n"
+        "В файле у каждой привязки сверху лежат <code>funpay_lot_title</code>, "
+        "<code>funpay_lot_id</code> и ссылка на лот — правьте их в текстовом "
+        "редакторе под лоты нового аккаунта.\n"
+        "Не знаете ID — оставьте <code>null</code> и впишите точное название: "
+        "плагин найдёт лот сам.</blockquote>\n\n"
+        "<blockquote><b>Только нужные лоты</b>\n"
+        "«☑️ Выбрать привязки» — отметить конкретные лоты и выгрузить только их. "
+        "Там же выбирается, приедут они <b>включёнными</b> или "
+        "<b>выключенными</b>: выключенными удобно сначала прогнать «Проверить "
+        "выдачу», а включить уже потом.</blockquote>\n\n"
+        "<i>API-ключ в файл не попадает. Для переноса на новый сервер есть "
+        "отдельная кнопка «с API-ключом» — такой файл никому не пересылайте.\n"
+        "Импорт понимает любой из трёх файлов сам и сначала покажет, что изменится.</i>"
+    )
+
+
+def _backup_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("⚙️ Экспорт настроек",
+                          callback_data=f"{CB_PREFIX}:export:{_EXPORT_KIND_SETTINGS}"),
+           _inline_button("🔗 Экспорт привязок",
+                          callback_data=f"{CB_PREFIX}:export:{_EXPORT_KIND_MAPPINGS}"))
+    kb.add(_inline_button("📦 Экспорт всего",
+                          callback_data=f"{CB_PREFIX}:export:{_EXPORT_KIND_FULL}"))
+    # v3.20: выбрать конкретные привязки и статус (вкл/выкл) для файла
+    kb.add(_inline_button("☑️ Выбрать привязки для экспорта",
+                          callback_data=f"{CB_PREFIX}:exp_sel:0"))
+    kb.add(_inline_button("🔐 Всё + API-ключ (для переноса)",
+                          callback_data=f"{CB_PREFIX}:export_secret"))
+    kb.add(_inline_button("📥 Импорт из файла", callback_data=f"{CB_PREFIX}:import"))
+    kb.add(_inline_button("🧪 Проверить выдачу", callback_data=f"{CB_PREFIX}:readiness"))
+    kb.add(_inline_button("🗄 Бэкапы перед импортом", callback_data=f"{CB_PREFIX}:import_backups"))
+    kb.add(_inline_button("🗑 Удалить все привязки",
+                          callback_data=f"{CB_PREFIX}:mappings_wipe", style="danger"))
+    kb.add(_inline_button("⚙️ Настройки", callback_data=f"{CB_PREFIX}:settings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _show_backup_menu(c: "Cardinal", call: Any) -> None:
+    _send_or_edit(c, call, _backup_menu_text(), kb=_backup_menu_kb())
+
+
+def _do_export(c: "Cardinal", call: Any, kind: str, with_secrets: bool = False,
+               only_ids: Optional[Set[str]] = None,
+               enabled_override: Optional[bool] = None) -> None:
+    if kind not in _EXPORT_KINDS:
+        _send_or_edit(c, call, "❌ <b>Неизвестный тип экспорта.</b>", kb=_backup_menu_kb())
+        return
+    chat_id = getattr(getattr(getattr(call, "message", None), "chat", None), "id", None)
+    data = _build_export(kind, with_secrets=with_secrets, c=c,
+                         only_ids=only_ids, enabled_override=enabled_override)
+    payload = _export_bytes(data)
+    parts = []
+    if "config" in data:
+        parts.append(f"настроек: {len(data['config'].get('settings') or {})}")
+        parts.append(f"шаблонов: {len(data['config'].get('templates') or {})}")
+    if "mappings" in data:
+        parts.append(f"привязок: {data['mappings_count']}")
+    caption = (f"💾 <b>{_EXPORT_KIND_LABEL.get(kind, kind).capitalize()}</b>\n"
+               f"{', '.join(parts)}\n"
+               f"Размер: {len(payload) / 1024:.1f} КБ")
+    if only_ids is not None:
+        total = data.get("mappings_total_on_account")
+        caption += (f"\n\n📤 <b>Выборка</b>: {data.get('mappings_count', 0)}"
+                    + (f" из {total}" if total else "") + " привязок.")
+    if enabled_override is not None:
+        caption += ("\n🟢 <b>В файле все привязки включены.</b>"
+                    if enabled_override else
+                    "\n🔴 <b>В файле все привязки выключены</b> — после импорта "
+                    "проверьте выдачу и включите нужные.")
+    if with_secrets:
+        caption += "\n\n🔐 <b>Внутри API-ключ — не пересылайте этот файл.</b>"
+    else:
+        caption += "\n\n<i>API-ключ не включён.</i>"
+    kb = InlineKeyboardMarkup(row_width=1)
+    if only_ids is not None:
+        kb.add(_inline_button("🔗 Изменить выбор", callback_data=f"{CB_PREFIX}:exp_sel:0"))
+    kb.add(_inline_button("💾 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+    if _send_document(c, chat_id, payload, _export_filename(kind), caption, kb):
+        logger.info("export sent", extra={"kind": kind, "secrets": with_secrets,
+                                          "bytes": len(payload),
+                                          "selected": len(only_ids or ()) or None,
+                                          "enabled_override": enabled_override})
+
+
+# =============================================================================
+# выбор привязок для экспорта + массовое удаление (v3.20)
+#
+# Экспорт «всего» неудобен, когда на аккаунте 50 лотов, а перенести надо 5.
+# Держим выбор в памяти на пользователя (как staging импорта): в callback_data
+# список ID не влезет (лимит 64 байта), а в БД такому состоянию не место.
+# =============================================================================
+
+_EXPORT_PICK: Dict[int, Dict[str, Any]] = {}
+_EXPORT_PICK_LOCK = threading.RLock()
+_EXPORT_PICK_TTL = 900.0        # 15 минут — столько же, сколько staging импорта
+
+
+def _export_pick_get(user_id: Optional[int]) -> Set[str]:
+    if user_id is None:
+        return set()
+    with _EXPORT_PICK_LOCK:
+        entry = _EXPORT_PICK.get(user_id)
+        if not entry or time.time() - entry.get("at", 0) > _EXPORT_PICK_TTL:
+            _EXPORT_PICK.pop(user_id, None)
+            return set()
+        return set(entry.get("ids") or set())
+
+
+def _export_pick_set(user_id: Optional[int], ids: Set[str]) -> None:
+    if user_id is None:
+        return
+    with _EXPORT_PICK_LOCK:
+        now = time.time()
+        for uid in [u for u, v in _EXPORT_PICK.items()
+                    if now - v.get("at", 0) > _EXPORT_PICK_TTL]:
+            _EXPORT_PICK.pop(uid, None)
+        _EXPORT_PICK[user_id] = {"ids": set(ids), "at": now}
+
+
+def _export_pick_toggle(user_id: Optional[int], mapping_id: str) -> Set[str]:
+    ids = _export_pick_get(user_id)
+    if mapping_id in ids:
+        ids.discard(mapping_id)
+    else:
+        ids.add(mapping_id)
+    _export_pick_set(user_id, ids)
+    return ids
+
+
+_EXPORT_ENABLED_MODES = {
+    "as_is": ("как сейчас", "🔀"),
+    "on": ("все включёнными", "🟢"),
+    "off": ("все выключенными", "🔴"),
+}
+
+
+def _export_enabled_mode(user_id: Optional[int]) -> str:
+    if user_id is None:
+        return "as_is"
+    with _EXPORT_PICK_LOCK:
+        entry = _EXPORT_PICK.get(user_id) or {}
+        mode = str(entry.get("enabled_mode") or "as_is")
+    return mode if mode in _EXPORT_ENABLED_MODES else "as_is"
+
+
+def _export_enabled_set(user_id: Optional[int], mode: str) -> None:
+    if user_id is None:
+        return
+    with _EXPORT_PICK_LOCK:
+        entry = _EXPORT_PICK.setdefault(user_id, {"ids": set(), "at": time.time()})
+        entry["enabled_mode"] = mode if mode in _EXPORT_ENABLED_MODES else "as_is"
+        entry["at"] = time.time()
+
+
+def _export_enabled_override(mode: str) -> Optional[bool]:
+    return {"on": True, "off": False}.get(mode)
+
+
+_EXPORT_PICK_PER_PAGE = 8
+
+
+def _show_export_pick(c: "Cardinal", call: Any, arg: str = "0") -> None:
+    """Экран «выбрать привязки для экспорта» (v3.20)."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    try:
+        page = max(0, int(arg or 0))
+    except (TypeError, ValueError):
+        page = 0
+    mappings = _db_get_mappings()
+    if not mappings:
+        _send_or_edit(c, call, "🔗 <b>Привязок пока нет</b> — экспортировать нечего.",
+                      kb=_backup_menu_kb())
+        return
+    picked = _export_pick_get(user_id)
+    # привязки, удалённые после выбора, из набора убираем
+    alive = {str(m["id"]) for m in mappings}
+    if picked - alive:
+        picked &= alive
+        _export_pick_set(user_id, picked)
+
+    per_page = _EXPORT_PICK_PER_PAGE
+    pages = max(1, (len(mappings) + per_page - 1) // per_page)
+    page = min(page, pages - 1)
+    chunk = mappings[page * per_page:(page + 1) * per_page]
+
+    mode = _export_enabled_mode(user_id)
+    mode_label, mode_icon = _EXPORT_ENABLED_MODES[mode]
+    lines = [
+        f"🔗 <b>Выбор привязок для экспорта</b> <i>(стр. {page + 1}/{pages})</i>",
+        f"\n<blockquote>Выбрано: <b>{len(picked)}</b> из {len(mappings)}\n"
+        f"{mode_icon} В файле лоты будут: <b>{mode_label}</b></blockquote>",
+    ]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for m in chunk:
+        mid = str(m["id"])
+        mark = "☑️" if mid in picked else "⬜"
+        state = "🟢" if m.get("enabled", True) else "🔴"
+        name = m.get("offer_name") or m["fzr_sku_id"]
+        kb.add(_inline_button(f"{mark} {state} {name} ➜ {m.get('funpay_lot_id') or '—'}",
+                             callback_data=f"{CB_PREFIX}:exp_pick:{mid}:{page}"))
+    nav = []
+    if page > 0:
+        nav.append(_inline_button("⬅️", callback_data=f"{CB_PREFIX}:exp_sel:{page - 1}"))
+    if page < pages - 1:
+        nav.append(_inline_button("➡️", callback_data=f"{CB_PREFIX}:exp_sel:{page + 1}"))
+    if nav:
+        kb.add(*nav)
+    kb.add(_inline_button("✅ Выбрать все", callback_data=f"{CB_PREFIX}:exp_all:{page}"),
+           _inline_button("🧹 Снять выбор", callback_data=f"{CB_PREFIX}:exp_none:{page}"))
+    kb.add(_inline_button("🟢 Только включённые", callback_data=f"{CB_PREFIX}:exp_on:{page}"),
+           _inline_button("🔴 Только выключенные", callback_data=f"{CB_PREFIX}:exp_off:{page}"))
+    kb.add(_inline_button(f"{mode_icon} Статус в файле: {mode_label}",
+                         callback_data=f"{CB_PREFIX}:exp_mode:{page}"))
+    if picked:
+        kb.add(_inline_button(f"📤 Экспортировать выбранное ({len(picked)})",
+                             callback_data=f"{CB_PREFIX}:exp_go:{_EXPORT_KIND_MAPPINGS}"))
+        kb.add(_inline_button("📦 Выбранное + настройки",
+                             callback_data=f"{CB_PREFIX}:exp_go:{_EXPORT_KIND_FULL}"))
+    kb.add(_inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+
+    lines.append(
+        "<i>Отметьте нужные лоты и нажмите «Экспортировать выбранное».\n"
+        "«Статус в файле» решает, какими привязки приедут на другой аккаунт: "
+        "выключенными их удобно сначала проверить кнопкой «Проверить выдачу», "
+        "а потом включить.</i>")
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _export_pick_action(c: "Cardinal", call: Any, action: str, arg: str = "") -> None:
+    """Кнопки экрана выбора: отметить, выбрать всё/ничего, сменить статус."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    parts = str(arg or "").split(":")
+    page = "0"
+    if action == "exp_pick":
+        mapping_id = parts[0] if parts else ""
+        page = parts[1] if len(parts) > 1 else "0"
+        if mapping_id:
+            _export_pick_toggle(user_id, mapping_id)
+    else:
+        page = parts[0] if parts and parts[0] else "0"
+        mappings = _db_get_mappings()
+        if action == "exp_all":
+            _export_pick_set(user_id, {str(m["id"]) for m in mappings})
+        elif action == "exp_none":
+            _export_pick_set(user_id, set())
+        elif action == "exp_on":
+            _export_pick_set(user_id, {str(m["id"]) for m in mappings
+                                       if m.get("enabled", True)})
+        elif action == "exp_off":
+            _export_pick_set(user_id, {str(m["id"]) for m in mappings
+                                       if not m.get("enabled", True)})
+        elif action == "exp_mode":
+            order = ["as_is", "off", "on"]
+            current = _export_enabled_mode(user_id)
+            nxt = order[(order.index(current) + 1) % len(order)]
+            _export_enabled_set(user_id, nxt)
+    _show_export_pick(c, call, page)
+
+
+def _export_selected(c: "Cardinal", call: Any, kind: str) -> None:
+    """Выгрузка только выбранных привязок (v3.20)."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    picked = _export_pick_get(user_id)
+    if not picked:
+        _send_or_edit(c, call,
+                      "⚠️ <b>Ничего не выбрано.</b>\n\n"
+                      "<i>Отметьте привязки галочками и попробуйте снова.</i>",
+                      kb=_backup_menu_kb())
+        return
+    if kind not in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
+        kind = _EXPORT_KIND_MAPPINGS
+    mode = _export_enabled_mode(user_id)
+    _do_export(c, call, kind, only_ids=picked,
+               enabled_override=_export_enabled_override(mode))
+
+
+def _mappings_delete_all_prompt(c: "Cardinal", call: Any) -> None:
+    """
+    Подтверждение массового удаления привязок (v3.20).
+
+    Действие необратимое для автовыдачи, поэтому:
+      * показываем, сколько и что удалится;
+      * требуем ввести слово «удалить» текстом, а не просто нажать кнопку
+        (кнопку легко нажать случайно, особенно с телефона);
+      * перед удалением сохраняем бэкап и даём кнопку откатить.
+    """
+    mappings = _db_get_mappings()
+    if not mappings:
+        _send_or_edit(c, call, "🔗 <b>Привязок нет</b> — удалять нечего.",
+                      kb=_backup_menu_kb())
+        return
+    enabled = sum(1 for m in mappings if m.get("enabled", True))
+    active_orders = sum(_db_status_counts().get(s, 0) for s in _ACTIVE_STATUSES)
+    set_state(getattr(getattr(call, "from_user", None), "id", None),
+              "mappings_wipe", {})
+    warn = ""
+    if active_orders:
+        warn = (f"\n⚠️ <b>Сейчас в работе заказов: {active_orders}</b> — после "
+                f"удаления привязок их не получится выдать автоматически.")
+    _send_or_edit(
+        c, call,
+        "🗑 <b>Удалить ВСЕ привязки?</b>\n\n"
+        f"<blockquote>🔗 Всего: <b>{len(mappings)}</b> · включённых: <b>{enabled}</b>\n"
+        f"Удалятся все лоты, их наценки, тексты и поля покупателя.</blockquote>"
+        f"{warn}\n\n"
+        "Лоты на FunPay <b>останутся</b> — плагин просто перестанет их выдавать.\n"
+        "Перед удалением сохраню бэкап, откат будет одной кнопкой.\n\n"
+        "Для подтверждения отправьте слово <code>удалить</code>.",
+        kb=_cancel_kb())
+
+
+def _step_mappings_wipe(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    text = (message.text or "").strip().lower()
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if text not in ("удалить", "delete", "да, удалить"):
+        clear_state(user_id)
+        _send_telegram_message(
+            c, message.chat.id,
+            "🚫 <b>Удаление отменено</b> — привязки на месте.\n"
+            "<i>Нужно было отправить слово «удалить».</i>",
+            kb=_main_keyboard())
+        return
+    backup = _backup_before_import(c)
+    removed = _db_delete_all_mappings()
+    clear_state(user_id)
+    logger.warning("mappings wiped by admin", extra={"count": removed})
+    kb = InlineKeyboardMarkup(row_width=1)
+    if backup:
+        kb.add(_inline_button("↩️ Вернуть как было",
+                              callback_data=f"{CB_PREFIX}:import_undo:{os.path.basename(backup)}",
+                              style="danger"))
+    kb.add(_inline_button("📦 Каталог", callback_data=f"{CB_PREFIX}:catalog:"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ <b>Удалено привязок: {removed}</b>\n\n"
+        + (f"<blockquote>🗄 Бэкап: <code>{_esc(os.path.basename(backup))}</code>\n"
+           f"<i>Можно вернуть всё кнопкой ниже.</i></blockquote>\n" if backup else "")
+        + "<i>Лоты на FunPay не тронуты. Автовыдача по ним больше не работает — "
+          "добавьте привязки заново через «Каталог».</i>",
+        kb=kb)
+
+
+def _import_prompt(c: "Cardinal", call: Any) -> None:
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    _staging_clear(user_id)
+    set_state(user_id, "import_wait_file", {})
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+    _send_or_edit(
+        c, call,
+        "📥 <b>Импорт</b>\n\n"
+        "Пришлите <b>файл .json</b>, который выгрузили этим же плагином "
+        "(настройки, привязки или «всё вместе» — разберусь сам).\n\n"
+        "<blockquote>Что будет дальше:\n"
+        "1️⃣ проверю файл и покажу, что именно изменится\n"
+        "2️⃣ вы подтверждаете кнопкой\n"
+        "3️⃣ перед применением сохраню бэкап — можно откатить</blockquote>\n"
+        "<i>Ничего не меняется, пока вы не нажмёте «Применить».</i>", kb=kb)
+
+
+def _import_handle_document(c: "Cardinal", message: Any) -> None:
+    """
+    Приём файла импорта.
+
+    Разбираем и валидируем, но НЕ применяем: показываем план и ждём кнопку.
+    """
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    doc = getattr(message, "document", None)
+    kb_back = InlineKeyboardMarkup(row_width=1)
+    kb_back.add(_inline_button("📥 Попробовать снова", callback_data=f"{CB_PREFIX}:import"),
+                _inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+    if doc is None:
+        _send_telegram_message(c, chat_id, "❌ Это не файл. Пришлите .json документом "
+                                           "(не картинкой и не текстом).", kb=kb_back)
+        return
+    name = str(getattr(doc, "file_name", "") or "")
+    if not name.lower().endswith(".json"):
+        _send_telegram_message(c, chat_id,
+                               f"❌ Нужен файл <b>.json</b>, а пришёл <code>{_esc(name)}</code>.",
+                               kb=kb_back)
+        return
+    size = int(getattr(doc, "file_size", 0) or 0)
+    if size > _IMPORT_MAX_BYTES:
+        _send_telegram_message(c, chat_id,
+                               f"❌ Файл слишком большой ({size / 1024 / 1024:.1f} МБ). "
+                               f"Лимит {_IMPORT_MAX_BYTES // 1024 // 1024} МБ.", kb=kb_back)
+        return
+    try:
+        info = c.telegram.bot.get_file(doc.file_id)
+        raw = c.telegram.bot.download_file(info.file_path)
+    except Exception as e:
+        logger.error("import download failed", extra={"error": repr(e)})
+        _send_telegram_message(c, chat_id,
+                               f"❌ Не смог скачать файл:\n<blockquote>{_esc(e)}</blockquote>",
+                               kb=kb_back)
+        return
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        _send_telegram_message(c, chat_id, "❌ Файл не в UTF-8 — это точно экспорт плагина?",
+                               kb=kb_back)
+        return
+    except json.JSONDecodeError as e:
+        _send_telegram_message(c, chat_id,
+                               f"❌ Файл повреждён (не читается как JSON):\n"
+                               f"<blockquote>{_esc(e)}</blockquote>", kb=kb_back)
+        return
+    if not isinstance(data, dict):
+        _send_telegram_message(c, chat_id, "❌ Ожидал объект JSON, а внутри что-то другое.",
+                               kb=kb_back)
+        return
+
+    kind = _detect_export_kind(data)
+    if kind is None:
+        _send_telegram_message(
+            c, chat_id,
+            "❌ <b>Не понимаю этот файл.</b>\n\n"
+            "<i>Внутри нет ни настроек, ни привязок. Выгрузите файл кнопками "
+            "«Экспорт» в разделе «Экспорт/импорт» и пришлите его.</i>", kb=kb_back)
+        return
+    version = data.get("version")
+    if isinstance(version, int) and version > _EXPORT_FORMAT_VERSION:
+        _send_telegram_message(
+            c, chat_id,
+            f"⚠️ Файл сделан более новой версией плагина (формат {version}, "
+            f"я понимаю {_EXPORT_FORMAT_VERSION}). Импортирую то, что знаю — "
+            f"часть настроек может не примениться.")
+
+    payload = _normalize_import_payload(data, kind)
+    plan = _plan_import(payload, kind, keep_lots=False, c=c)
+    clear_state(user_id)
+    _staging_put(user_id, {"payload": payload, "kind": kind,
+                           "file_name": name, "plan": plan})
+    _send_telegram_message(c, chat_id, _import_plan_text(plan, name),
+                           kb=_import_plan_kb(plan))
+
+
+def _import_plan_kb(plan: Dict[str, Any]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    nothing = (not plan["settings_diff"] and not plan["templates_diff"]
+               and not plan["mappings_update"] and not plan["mappings_new"]
+               and not plan["mappings_conflict"])
+    if not nothing:
+        kb.add(_inline_button("✅ Применить", callback_data=f"{CB_PREFIX}:import_apply"))
+    if plan["kind"] in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
+        if plan.get("keep_lots"):
+            kb.add(_inline_button("🔗 Взять лоты из файла",
+                                  callback_data=f"{CB_PREFIX}:import_lots:0"))
+        else:
+            kb.add(_inline_button("🛡 Не менять мои лоты",
+                                  callback_data=f"{CB_PREFIX}:import_lots:1"))
+    if plan["has_api_key"]:
+        label = ("🔑 Ключ будет заменён" if plan.get("import_api_key")
+                 else "🔑 Заменить и API-ключ")
+        kb.add(_inline_button(label, callback_data=f"{CB_PREFIX}:import_key"))
+    kb.add(_inline_button("❌ Отменить импорт", callback_data=f"{CB_PREFIX}:backup"))
+    return kb
+
+
+def _import_replan(c: "Cardinal", call: Any, keep_lots: Optional[bool] = None,
+                   toggle_key: bool = False) -> None:
+    """Пересчёт плана при смене опций — данные всё ещё не меняются."""
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    entry = _staging_get(user_id)
+    if not entry:
+        _send_or_edit(c, call,
+                      "⏳ <b>Файл уже не в памяти</b> (прошло больше 15 минут).\n\n"
+                      "<i>Пришлите его заново.</i>", kb=_backup_menu_kb())
+        return
+    plan = entry["plan"]
+    if keep_lots is not None:
+        plan = _plan_import(entry["payload"], entry["kind"], keep_lots=keep_lots, c=c)
+        plan["import_api_key"] = entry["plan"].get("import_api_key", False)
+    if toggle_key:
+        plan["import_api_key"] = not plan.get("import_api_key")
+    entry["plan"] = plan
+    _staging_put(user_id, entry)
+    note = ""
+    if keep_lots is False:
+        note = ("\n\n🔗 <i>Лоты берутся из файла: по <code>funpay_lot_id</code>, "
+                "а если он пустой — по названию лота.</i>")
+    elif keep_lots is True:
+        note = ("\n\n🛡 <i>Лоты существующих привязок не меняются. Новые привязки "
+                "всё равно нуждаются в лоте — им он подбирается из файла.</i>")
+    elif toggle_key:
+        note = ("\n\n🔑 <i>API-ключ будет заменён на ключ из файла.</i>"
+                if plan.get("import_api_key") else
+                "\n\n🔑 <i>API-ключ из файла проигнорирую.</i>")
+    _send_or_edit(c, call, _import_plan_text(plan, entry.get("file_name", "")) + note,
+                  kb=_import_plan_kb(plan))
+
+
+def _import_apply(c: "Cardinal", call: Any) -> None:
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    entry = _staging_get(user_id)
+    if not entry:
+        _send_or_edit(c, call,
+                      "⏳ <b>Файл уже не в памяти</b> (прошло больше 15 минут).\n\n"
+                      "<i>Пришлите его заново.</i>", kb=_backup_menu_kb())
+        return
+    plan = entry["plan"]
+    backup = _backup_before_import(c)
+    try:
+        result = _apply_import(plan)
+    except Exception as e:
+        logger.exception("import failed", extra={"error": repr(e)})
+        _send_or_edit(c, call,
+                      f"❌ <b>Импорт не удался</b>\n\n<blockquote>{_esc(e)}</blockquote>\n"
+                      + (f"<i>Состояние до импорта сохранено: "
+                         f"<code>{_esc(os.path.basename(backup))}</code></i>"
+                         if backup else ""),
+                      kb=_backup_menu_kb())
+        return
+    _staging_clear(user_id)
+
+    lines = ["✅ <b>Импорт применён</b>", ""]
+    lines.append("<blockquote>"
+                 + f"⚙️ настроек изменено: <b>{result['settings_changed']}</b>\n"
+                 + f"📝 шаблонов изменено: <b>{result['templates_changed']}</b>\n"
+                 + f"➕ привязок добавлено: <b>{result['mappings_added']}</b>\n"
+                 + f"♻️ привязок обновлено: <b>{result['mappings_updated']}</b>"
+                 + (f"\n🔗 перевязано на другие лоты: <b>{result['lots_relinked']}</b>"
+                    if result.get("lots_relinked") else "")
+                 + ("\n🔑 API-ключ заменён" if result["api_key_set"] else "")
+                 + "</blockquote>")
+    if result.get("disabled"):
+        lines.append(f"\n⚠️ <b>Выключено привязок: {result['disabled']}</b> — "
+                     f"для них не нашёлся лот FunPay. Откройте «Привязки», "
+                     f"укажите лот и включите — либо поправьте "
+                     f"<code>funpay_lot_id</code> в файле и импортируйте снова.")
+    if backup:
+        lines.append(f"\n🗄 <i>Бэкап до импорта: <code>{_esc(os.path.basename(backup))}</code> — "
+                     f"можно откатить кнопкой ниже.</i>")
+    kb = InlineKeyboardMarkup(row_width=2)
+    if backup:
+        kb.add(_inline_button("↩️ Откатить импорт",
+                              callback_data=f"{CB_PREFIX}:import_undo:{os.path.basename(backup)}",
+                              style="danger"))
+    kb.add(_inline_button("🧪 Проверить выдачу", callback_data=f"{CB_PREFIX}:readiness"))
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("⚙️ Настройки", callback_data=f"{CB_PREFIX}:settings"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _import_backups_list(c: "Cardinal", call: Any) -> None:
+    backup_dir = _backups_dir()
+    try:
+        files = sorted((fn for fn in os.listdir(backup_dir)
+                        if fn.startswith("before_import_") and fn.endswith(".json")),
+                       reverse=True)
+    except OSError:
+        files = []
+    kb = InlineKeyboardMarkup(row_width=1)
+    if not files:
+        kb.add(_inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+        _send_or_edit(c, call,
+                      "🗄 <b>Бэкапов пока нет.</b>\n\n"
+                      "<i>Они создаются автоматически перед каждым импортом.</i>", kb=kb)
+        return
+    lines = ["🗄 <b>Бэкапы перед импортом</b>",
+             "<i>Создаются автоматически. Храню последние 10.</i>", ""]
+    for fn in files[:10]:
+        stamp = fn.replace("before_import_", "").replace(".json", "")
+        try:
+            pretty = time.strftime("%d.%m.%Y %H:%M",
+                                   time.strptime(stamp, "%Y%m%d_%H%M%S"))
+        except ValueError:
+            pretty = stamp
+        size = os.path.getsize(os.path.join(backup_dir, fn)) / 1024
+        lines.append(f"<blockquote>📅 {pretty} · {size:.1f} КБ</blockquote>")
+        kb.add(_inline_button(f"↩️ Откатить к {pretty}",
+                              callback_data=f"{CB_PREFIX}:import_undo:{fn}", style="danger"))
+    kb.add(_inline_button("🔙 Экспорт/импорт", callback_data=f"{CB_PREFIX}:backup"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _import_undo(c: "Cardinal", call: Any, file_name: str) -> None:
+    """
+    Откат к бэкапу.
+
+    Осторожность: имя файла приходит из callback, поэтому берём только basename
+    и проверяем, что файл действительно лежит в папке бэкапов.
+    """
+    backup_dir = _backups_dir()
+    safe = os.path.basename(str(file_name or ""))
+    path = os.path.join(backup_dir, safe)
+    if not safe.startswith("before_import_") or not os.path.exists(path):
+        _send_or_edit(c, call, "❌ <b>Бэкап не найден.</b>", kb=_backup_menu_kb())
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        payload = _normalize_import_payload(data, _EXPORT_KIND_FULL)
+        # откат — это точная копия прежнего состояния: берём и лоты, и ключ
+        plan = _plan_import(payload, _EXPORT_KIND_FULL, keep_lots=False, c=c)
+        plan["import_api_key"] = True
+        # привязки, которых в бэкапе нет, а сейчас есть — удаляем: иначе откат
+        # оставит лишние привязки, созданные импортом
+        backup_keys = {_mapping_import_key(m) for m in payload.get("mappings") or []}
+        removed = 0
+        for existing in _db_get_mappings():
+            if _mapping_import_key(existing) not in backup_keys:
+                _db_delete_mapping(existing["id"])
+                removed += 1
+        result = _apply_import(plan)
+    except Exception as e:
+        logger.exception("import undo failed", extra={"error": repr(e)})
+        _send_or_edit(c, call,
+                      f"❌ <b>Откат не удался</b>\n\n<blockquote>{_esc(e)}</blockquote>",
+                      kb=_backup_menu_kb())
+        return
+    logger.info("import undone", extra={"backup": safe, "removed": removed})
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔗 Привязки", callback_data=f"{CB_PREFIX}:mappings"),
+           _inline_button("⚙️ Настройки", callback_data=f"{CB_PREFIX}:settings"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(
+        c, call,
+        f"↩️ <b>Откат выполнен</b>\n\n"
+        f"<blockquote>восстановлено настроек: <b>{result['settings_changed']}</b>\n"
+        f"привязок восстановлено: <b>{result['mappings_updated'] + result['mappings_added']}</b>"
+        + (f"\nлишних привязок удалено: <b>{removed}</b>" if removed else "")
+        + "</blockquote>\n<i>Состояние соответствует моменту до импорта.</i>", kb=kb)
+
+
+def _on_off(value: Any) -> str:
+    return "🟢 вкл" if value else "🔴 выкл"
+
+
+def _settings_root(cfg: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    s = cfg["settings"]
+    masked = _mask_api_key(cfg.get("api_key", ""))
+    rate = s.get("exchange_rate") or 0
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"<blockquote>"
+        f"🔑 API-ключ: <code>{_esc(masked) if masked else '⚠️ не задан'}</code>\n"
+        f"⚡️ Автовыдача: {_on_off(s.get('auto_delivery'))}\n"
+        f"💱 Курс: <b>{_esc(rate) if rate else '⚠️ не задан'}</b>   "
+        f"💰 Наценка: <b>{_esc(s.get('markup_percent', 0))}% + {_esc(s.get('markup_fixed', 0))}₽</b>\n"
+        f"🛡 Проверки покупателя: {_on_off(s.get('validate_player_id', True))}\n"
+        f"</blockquote>\n\n"
+        "<i>Выберите раздел — внутри только относящиеся к нему параметры.</i>"
+    )
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button(f"⚡️ Автовыдача: {'ON' if s.get('auto_delivery') else 'OFF'}",
+                          callback_data=f"{CB_PREFIX}:settings_toggle:auto_delivery"),
+           _inline_button("🔑 API-ключ", callback_data=f"{CB_PREFIX}:apikey"))
+    kb.add(_inline_button("💰 Цены и наценка", callback_data=f"{CB_PREFIX}:settings_sec:price"),
+           _inline_button("🛡 Проверки", callback_data=f"{CB_PREFIX}:settings_sec:checks"))
+    kb.add(_inline_button("⏱ Тайминги", callback_data=f"{CB_PREFIX}:settings_sec:timing"),
+           _inline_button("🔌 Интеграции", callback_data=f"{CB_PREFIX}:settings_sec:integr"))
+    kb.add(_inline_button("📝 Шаблоны сообщений", callback_data=f"{CB_PREFIX}:settings_sec:tpl"))
+    kb.add(_inline_button("💾 Экспорт / импорт", callback_data=f"{CB_PREFIX}:backup"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return text, kb
+
+
+def _settings_section(cfg: Dict[str, Any], section: str) -> Tuple[str, InlineKeyboardMarkup]:
+    s = cfg["settings"]
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    if section == "price":
+        rate = s.get("exchange_rate") or 0
+        text = (
+            "💰 <b>Цены и наценка</b>\n\n"
+            f"<blockquote>"
+            f"💱 Курс RUB/USD: <b>{_esc(rate) if rate else '⚠️ не задан'}</b>\n"
+            f"{_exchange_rate_health(cfg)}\n"
+            f"🕐 Обновлять курс каждые: "
+            f"<b>{_esc(_fmt_minutes(s.get('exchange_rate_interval', 360)))}</b>\n"
+            f"📈 Наценка: <b>{_esc(s.get('markup_percent', 0))}%</b> + <b>{_esc(s.get('markup_fixed', 0))}₽</b>\n"
+            f"🔢 Округление: <b>{_esc(s.get('price_round', 2))}</b> знака\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Синхронизация цен лотов</b>\n"
+            f"🔁 Автопересчёт: {_on_off(s.get('price_sync'))}\n"
+            f"🧪 Только проверка (лоты не менять): {_on_off(s.get('price_sync_dry_run'))}\n"
+            f"🕐 Интервал: <b>{_esc(int(float(s.get('price_sync_interval', 21600) or 21600) // 60))} мин</b>\n"
+            f"📉 Порог изменения: <b>{_esc(s.get('price_sync_threshold', 1.0))}%</b>\n"
+            f"🛑 Макс. шаг за раз: <b>{_esc(s.get('price_sync_max_step', 30.0))}%</b>\n"
+            f"🔗 Привязок с синхронизацией: <b>{len(_price_sync_candidates())}</b>\n"
+            f"</blockquote>\n\n"
+            "<i>Цена лота = закупка в USD × курс + наценка. У привязки можно задать "
+            "свою наценку — она перекрывает эту.\n"
+            "Синхронизация пересчитывает цены, когда изменился курс ИЛИ закупка на "
+            "FazerCards. Включается отдельно у каждой привязки.</i>"
+        )
+        kb.add(_inline_button("💱 Курс", callback_data=f"{CB_PREFIX}:settings_edit:exchange_rate"),
+               _inline_button(f"🔄 Автокурс: {'ON' if s.get('auto_update_exchange_rate') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:auto_update_exchange_rate"))
+        kb.add(_inline_button("🕐 Как часто обновлять курс",
+                              callback_data=f"{CB_PREFIX}:settings_edit:exchange_rate_interval"),
+               _inline_button("💱 Обновить курс сейчас",
+                              callback_data=f"{CB_PREFIX}:rate_now"))
+        kb.add(_inline_button("📈 Наценка %", callback_data=f"{CB_PREFIX}:settings_edit:markup_percent"),
+               _inline_button("➕ Наценка ₽", callback_data=f"{CB_PREFIX}:settings_edit:markup_fixed"))
+        kb.add(_inline_button("🔢 Округление", callback_data=f"{CB_PREFIX}:settings_edit:price_round"))
+        kb.add(_inline_button(f"🔁 Автопересчёт цен: {'ON' if s.get('price_sync') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:price_sync"))
+        kb.add(_inline_button(f"🧪 Только проверка: {'ON' if s.get('price_sync_dry_run') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:price_sync_dry_run"))
+        kb.add(_inline_button("🕐 Интервал", callback_data=f"{CB_PREFIX}:settings_edit:price_sync_interval"),
+               _inline_button("📉 Порог", callback_data=f"{CB_PREFIX}:settings_edit:price_sync_threshold"))
+        kb.add(_inline_button("🛑 Макс. шаг", callback_data=f"{CB_PREFIX}:settings_edit:price_sync_max_step"))
+        kb.add(_inline_button("💱 Проверить цены сейчас", callback_data=f"{CB_PREFIX}:price_sync_now"))
+
+    elif section == "checks":
+        max_topup = s.get("max_topup_amount") or 0
+        text = (
+            "🛡 <b>Проверки и лимиты</b>\n\n"
+            f"<blockquote>"
+            f"🆔 Player ID / логин Steam: {_on_off(s.get('validate_player_id', True))}\n"
+            f"💡 Подсказки формата покупателю: {_on_off(s.get('show_field_hints', True))}\n"
+            f"1️⃣ Автовыбор единственного варианта: {_on_off(s.get('auto_select_single', True))}\n"
+            f"🔃 Свежие варианты из API: {_on_off(s.get('fresh_options', True))}\n"
+            f"📦 Макс. количество за заказ: <b>{_esc(s.get('max_quantity', _MAX_QUANTITY))}</b>\n"
+            f"💳 Лимит суммы пополнения Steam: <b>{_esc(max_topup) if max_topup else 'без лимита'}</b>\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Локальный баланс</b>\n"
+            f"💼 Свой учёт денег: {_on_off(s.get('local_balance', True))}\n"
+            + (f"💰 Сейчас: <b>{_fmt_usd(_db_local_balance())}</b>\n"
+               f"🔔 Предупреждать ниже: <b>"
+               f"{_fmt_usd(s.get('local_balance_low')) if s.get('local_balance_low') else 'только минус'}</b>\n"
+               f"🕐 Повторный алерт не чаще: <b>{_esc(s.get('balance_alert_cooldown', 60))} мин</b>\n"
+               if s.get("local_balance", True) else "")
+            + f"</blockquote>\n"
+            f"<blockquote><b>Аккаунт FazerCards</b>\n"
+            f"🎫 Алерт об истечении подписки: {_on_off(s.get('sub_alert', True))}\n"
+            f"📅 Предупреждать за: <b>{_esc(s.get('sub_alert_days', 5))} дн.</b>\n"
+            f"💰 Алерт при балансе ниже: "
+            f"<b>{_esc(s.get('low_balance_threshold') or 0) if s.get('low_balance_threshold') else 'выключен'}</b>\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Если не хватило баланса на закупку</b>\n"
+            f"🔄 Автоповтор после пополнения: {_on_off(s.get('funds_auto_retry', True))}\n"
+            f"🕐 Проверять баланс каждые: "
+            f"<b>{_esc(int(float(s.get('funds_retry_interval', 1800) or 1800) // 60))} мин</b>\n"
+            f"↩️ Автовозврат покупателю: {_on_off(s.get('funds_auto_refund'))}\n"
+            f"⏳ Возврат, если не выдали за: "
+            f"<b>{_esc(_fmt_minutes(s.get('funds_refund_after', 120)))}</b>\n"
+            f"💬 Предупреждать покупателя: {_on_off(s.get('funds_refund_warn_buyer', True))}\n"
+            f"💸 Сейчас ждут баланса: <b>{len(_funds_orders())}</b>\n"
+            f"</blockquote>\n\n"
+            "<i>Локальный баланс нужен, когда одним API-ключом FazerCards "
+            "пользуется несколько человек: плагин считает только ваши деньги. "
+            "Заказы он НЕ блокирует — уходит в минус и пишет вам об этом.\n"
+            "Проверки выполняются до списания баланса: неверный ID или логин "
+            "останавливает заказ, деньги не тратятся.\n"
+            "Подписка и баланс — две причины, по которым автовыдача встаёт целиком, "
+            "поэтому о них лучше узнать заранее.\n"
+            "Если денег не хватило, заказ не пропадает: покупатель получает "
+            "сообщение «оформляю», а вы — кнопку «Повторить». Автовозврат нужен, "
+            "чтобы деньги покупателя не висели: по истечении времени плагин сам "
+            "вернёт оплату и закроет заказ.</i>"
+        )
+        kb.add(_inline_button(f"🆔 Проверки: {'ON' if s.get('validate_player_id', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:validate_player_id"),
+               _inline_button(f"💡 Подсказки: {'ON' if s.get('show_field_hints', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:show_field_hints"))
+        kb.add(_inline_button(f"1️⃣ Автовыбор: {'ON' if s.get('auto_select_single', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:auto_select_single"),
+               _inline_button(f"🔃 Свежие: {'ON' if s.get('fresh_options', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:fresh_options"))
+        kb.add(_inline_button("📦 Макс. количество", callback_data=f"{CB_PREFIX}:settings_edit:max_quantity"),
+               _inline_button("💳 Лимит Steam", callback_data=f"{CB_PREFIX}:settings_edit:max_topup_amount"))
+        kb.add(_inline_button(f"💼 Локальный баланс: {'ON' if s.get('local_balance', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:local_balance"))
+        if s.get("local_balance", True):
+            kb.add(_inline_button("💰 Открыть баланс", callback_data=f"{CB_PREFIX}:balance"),
+                   _inline_button("🔔 Предупредить ниже",
+                                  callback_data=f"{CB_PREFIX}:settings_edit:local_balance_low"))
+            kb.add(_inline_button("🕐 Частота алертов баланса",
+                                  callback_data=f"{CB_PREFIX}:settings_edit:balance_alert_cooldown"))
+        kb.add(_inline_button(f"🎫 Алерт подписки: {'ON' if s.get('sub_alert', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:sub_alert"),
+               _inline_button("📅 За сколько дней", callback_data=f"{CB_PREFIX}:settings_edit:sub_alert_days"))
+        kb.add(_inline_button("💰 Порог баланса", callback_data=f"{CB_PREFIX}:settings_edit:low_balance_threshold"),
+               _inline_button("👤 Аккаунт", callback_data=f"{CB_PREFIX}:account"))
+        kb.add(_inline_button(f"🔄 Автоповтор без баланса: {'ON' if s.get('funds_auto_retry', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:funds_auto_retry"))
+        kb.add(_inline_button("🕐 Интервал проверки баланса",
+                              callback_data=f"{CB_PREFIX}:settings_edit:funds_retry_interval"),
+               _inline_button("💸 Ждут баланса", callback_data=f"{CB_PREFIX}:funds_list"))
+        kb.add(_inline_button(f"↩️ Автовозврат: {'ON' if s.get('funds_auto_refund') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:funds_auto_refund"),
+               _inline_button("⏳ Через сколько",
+                              callback_data=f"{CB_PREFIX}:settings_edit:funds_refund_after"))
+        kb.add(_inline_button(f"💬 Предупреждать покупателя: "
+                              f"{'ON' if s.get('funds_refund_warn_buyer', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:funds_refund_warn_buyer"))
+
+    elif section == "timing":
+        text = (
+            "⏱ <b>Тайминги</b>\n\n"
+            f"<blockquote>"
+            f"🕐 Опрос статуса заказа: каждые <b>{_esc(s['poll_interval'])} с</b>\n"
+            f"⚡ Быстрый опрос: <b>{_esc(s.get('poll_interval_fast', 2))} с</b> "
+            f"× первые <b>{_esc(s.get('poll_fast_attempts', 12))}</b> попыток\n"
+            f"🧵 Параллельный опрос: {_on_off(s.get('poll_parallel', True))}\n"
+            f"⏳ Таймаут заказа: <b>{_esc(s['poll_timeout'])} с</b>\n"
+            f"💬 Таймаут диалога с покупателем: <b>{_esc(s['dialog_timeout'])} с</b>\n"
+            f"🔔 Напоминание покупателю через: <b>{_esc(s['dialog_reminder'])} с</b>\n"
+            f"</blockquote>\n\n"
+            "<i>Таймаут диалога — сколько ждём данные (ID, логин), после чего заказ "
+            "помечается ошибкой.\n"
+            "Быстрый опрос ускоряет выдачу: сразу после создания заказа плагин "
+            "спрашивает статус часто, а на длинных заказах переходит на обычный "
+            "интервал. Параллельный опрос нужен, когда заказов много одновременно.</i>"
+        )
+        kb.add(_inline_button("🕐 Опрос", callback_data=f"{CB_PREFIX}:settings_edit:poll_interval"),
+               _inline_button("⏳ Таймаут заказа", callback_data=f"{CB_PREFIX}:settings_edit:poll_timeout"))
+        kb.add(_inline_button("⚡ Быстрый интервал",
+                              callback_data=f"{CB_PREFIX}:settings_edit:poll_interval_fast"),
+               _inline_button("⚡ Быстрых попыток",
+                              callback_data=f"{CB_PREFIX}:settings_edit:poll_fast_attempts"))
+        kb.add(_inline_button(f"🧵 Параллельно: {'ON' if s.get('poll_parallel', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:poll_parallel"))
+        kb.add(_inline_button("💬 Таймаут диалога", callback_data=f"{CB_PREFIX}:settings_edit:dialog_timeout"),
+               _inline_button("🔔 Напоминание", callback_data=f"{CB_PREFIX}:settings_edit:dialog_reminder"))
+
+    elif section == "integr":
+        text = (
+            "🔌 <b>Интеграции и реакции</b>\n\n"
+            f"<blockquote>"
+            f"📢 Уведомления об ошибках: {_on_off(s.get('notify_on_error'))}\n"
+            f"🚫 Авто-отмена заказа FZR при возврате: {_on_off(s.get('auto_cancel_fzr_order'))}\n"
+            f"↩️ Возврат покупателю, если поставщик вернул деньги: "
+            f"{_on_off(s.get('refund_on_fzr_refund', True))}"
+            + ("" if s.get("funds_auto_refund")
+               else " <i>(не работает: автовозврат выключен)</i>") + "\n"
+            f"🛑 Авто-деактивация лота при out of stock: {_on_off(s.get('auto_disable_lot'))}\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Ручные услуги</b>\n"
+            f"💬 Следить за чатом: {_on_off(s.get('manual_chat_watch', True))}\n"
+            f"📨 Пересылать сообщения покупателю: {_on_off(s.get('manual_chat_autorelay'))}\n"
+            f"🕐 Интервал опроса: <b>{_esc(s.get('manual_chat_interval', 60))} с</b>\n"
+            f"⏱ Следить после закрытия: <b>{_esc(s.get('manual_chat_grace_hours', 24))} ч</b>\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Отчёт о прибыли</b>\n"
+            f"💰 Присылать после создания заказа: {_on_off(s.get('profit_report', True))}\n"
+            f"➖ Комиссия вывода с FunPay: <b>{_esc(s.get('withdraw_fee_percent', 3.0))}%</b>\n"
+            f"</blockquote>\n\n"
+            "<i>Отчёт о прибыли приходит сюда, в панель, когда заказ создан на "
+            "стороне поставщика: цена на FunPay, комиссия вывода, себестоимость "
+            "и прибыль. Себестоимость берётся живой из API в момент закупки, "
+            "рубли считаются по курсу из раздела «Цены».\n"
+            "Если поставщик вернул деньги за закупку (статус «Возврат»), товара "
+            "не будет: плагин оформляет полный возврат покупателю на FunPay и "
+            "пишет ему, что заказ отменён. Свой текст на каждый товар — "
+            "в карточке привязки, «Текст при возврате».\n"
+            "⚠️ Деньги возвращаются только когда включён общий «Автовозврат "
+            "покупателю» (раздел «Проверки»): распоряжаться чужими деньгами "
+            "плагин без вашего разрешения не будет. Если автовозврат выключен, "
+            "заказ уйдёт на ручной разбор с уведомлением.\n"
+            "По ручным услугам исполнитель пишет в чат FazerCards. Плагин читает его "
+            "и присылает сюда с кнопкой «Ответить». Автопересылку покупателю включайте "
+            "осознанно: сообщения исполнителя пойдут в чат FunPay как есть.\n"
+            "Интервал — базовый: при активной переписке плагин опрашивает чаще, "
+            "при тишине реже. «Следить после закрытия» нужно потому, что исполнитель "
+            "нередко пишет уже после выдачи.\n"
+            "Webhook — дополнительный канал уведомлений; статусы плагин опрашивает сам.</i>"
+        )
+        kb.add(_inline_button(f"📢 Уведомления: {'ON' if s.get('notify_on_error') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:notify_on_error"))
+        kb.add(_inline_button(f"🚫 Авто-отмена: {'ON' if s.get('auto_cancel_fzr_order') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:auto_cancel_fzr_order"))
+        _fzr_ref_on = bool(s.get("refund_on_fzr_refund", True))
+        _auto_ref_on = bool(s.get("funds_auto_refund"))
+        kb.add(_inline_button(
+            f"↩️ Возврат при отказе поставщика: {'ON' if _fzr_ref_on else 'OFF'}"
+            + ("" if _auto_ref_on or not _fzr_ref_on else " ⚠️"),
+            callback_data=f"{CB_PREFIX}:settings_toggle:refund_on_fzr_refund"))
+        if _fzr_ref_on and not _auto_ref_on:
+            # без общего автовозврата плагин деньги не возвращает — даём попасть
+            # в нужный тумблер одной кнопкой, а не искать его по разделам
+            kb.add(_inline_button("⚠️ Включить автовозврат покупателю",
+                                  callback_data=f"{CB_PREFIX}:settings_toggle:funds_auto_refund"))
+        kb.add(_inline_button(f"🛑 Деактивация лота: {'ON' if s.get('auto_disable_lot') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:auto_disable_lot"))
+        kb.add(_inline_button(f"💬 Чат ручных услуг: {'ON' if s.get('manual_chat_watch', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:manual_chat_watch"))
+        kb.add(_inline_button(f"📨 Пересылать покупателю: {'ON' if s.get('manual_chat_autorelay') else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:manual_chat_autorelay"))
+        kb.add(_inline_button("🕐 Интервал опроса чата",
+                              callback_data=f"{CB_PREFIX}:settings_edit:manual_chat_interval"),
+               _inline_button("⏱ Следить после закрытия",
+                              callback_data=f"{CB_PREFIX}:settings_edit:manual_chat_grace_hours"))
+        kb.add(_inline_button(f"💰 Отчёт о прибыли: {'ON' if s.get('profit_report', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:profit_report"),
+               _inline_button("➖ Комиссия вывода",
+                              callback_data=f"{CB_PREFIX}:settings_edit:withdraw_fee_percent"))
+        kb.add(_inline_button("🔔 Webhook", callback_data=f"{CB_PREFIX}:webhook"))
+
+    else:  # tpl
+        t = cfg.get("templates", {})
+        text = (
+            "📝 <b>Сообщения покупателю</b>\n\n"
+            f"<blockquote>"
+            f"👋 Приветствие после оплаты: {_on_off(s.get('greeting', True))}\n"
+            f"⏳ «Заказ в обработке»: {_on_off(s.get('progress_notice', True))}\n"
+            f"💡 Подсказки формата: {_on_off(s.get('show_field_hints', True))}\n"
+            f"✅ Подтверждение каждого значения (+/-): {_on_off(s.get('confirm_metadata', True))}\n"
+            f"📋 Итоговая сводка перед закупкой: {_on_off(s.get('confirm_summary', True))}\n"
+            f"🙈 Игнорировать «привет/спасибо»: {_on_off(s.get('smalltalk_filter', True))}\n"
+            f"⭐ Просьба подтвердить заказ и отзыв: {_on_off(s.get('review_request', True))}"
+            + (f" <i>(через {_esc(s.get('review_request_delay', 3))} с)</i>"
+               if s.get('review_request', True) else "")
+            + f"\n"
+            f"</blockquote>\n"
+            f"<blockquote><b>Приветствие:</b>\n{_esc(str(t.get('greeting', ''))[:200])}</blockquote>\n"
+            f"<blockquote><b>Запрос данных:</b>\n{_esc(str(t.get('ask_metadata', ''))[:200])}</blockquote>\n"
+            f"<blockquote><b>В обработке:</b>\n{_esc(str(t.get('progress', ''))[:200])}</blockquote>\n"
+            f"<blockquote><b>Выдача:</b>\n{_esc(str(t.get('delivery', ''))[:250])}</blockquote>\n"
+            f"<blockquote><b>Просьба об отзыве:</b>\n{_esc(str(t.get('review_request', ''))[:250])}</blockquote>\n"
+            f"<blockquote><b>Ошибка:</b>\n{_esc(str(t.get('error', ''))[:200])}</blockquote>\n\n"
+            "<i>Переменные: {code}, {codes}, {order_number}, {funpay_order_id}, "
+            "{buyer}, {sku}, {prompt}, {sku_name}, {kind_name}, {eta}, {quantity}, "
+            "{order_link} (ссылка на заказ FunPay).\n"
+            "Просьба об отзыве уходит ОТДЕЛЬНЫМ сообщением сразу после выдачи: "
+            "код покупатель копирует, и просьба в том же сообщении теряется. "
+            "Ссылка на заказ подставляется всегда, даже если убрать {order_link} "
+            "из шаблона.\n"
+            "Тексты под конкретный товар (приветствие, запрос данных, выдача) "
+            "задаются в карточке привязки — там же есть предпросмотр «как видит "
+            "покупатель». Для товаров без кода (пополнения, подписки) плагин "
+            "подставляет свой текст по типу категории, а не «Ваш товар: —».\n"
+            "Чат FunPay — обычный текст, HTML-теги там не работают.\n"
+            "Подтверждение «+/-» защищает от опечаток в логине и ID: пополнение "
+            "не на тот аккаунт вернуть невозможно.\n"
+            "🔒 Название поставщика в чат покупателя не попадёт: если оно "
+            "окажется в шаблоне, плагин уберёт его перед отправкой.</i>"
+        )
+        kb.add(_inline_button(f"👋 Приветствие: {'ON' if s.get('greeting', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:greeting"),
+               _inline_button(f"⏳ В обработке: {'ON' if s.get('progress_notice', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:progress_notice"))
+        kb.add(_inline_button(f"✅ Подтверждение: {'ON' if s.get('confirm_metadata', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:confirm_metadata"),
+               _inline_button(f"📋 Сводка: {'ON' if s.get('confirm_summary', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:confirm_summary"))
+        kb.add(_inline_button(f"🙈 Игнор болтовни: {'ON' if s.get('smalltalk_filter', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:smalltalk_filter"))
+        kb.add(_inline_button(f"⭐ Просьба об отзыве: {'ON' if s.get('review_request', True) else 'OFF'}",
+                              callback_data=f"{CB_PREFIX}:settings_toggle:review_request"))
+        if s.get("review_request", True):
+            kb.add(_inline_button("📝 Текст просьбы об отзыве",
+                                  callback_data=f"{CB_PREFIX}:tpl_edit:review_request"),
+                   _inline_button("⏱ Пауза перед просьбой",
+                                  callback_data=f"{CB_PREFIX}:settings_edit:review_request_delay"))
+        kb.add(_inline_button("🔗 Тексты по товарам", callback_data=f"{CB_PREFIX}:mappings"))
+
+    kb.add(_inline_button("🔙 Настройки", callback_data=f"{CB_PREFIX}:settings"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return text, kb
+
+
+def _show_settings(c: "Cardinal", call: Any, section: str = "") -> None:
+    cfg = load_config()
+    if section == "price":
+        # v3.15: поток курса мог умереть (падение/перезагрузка плагина без
+        # рестарта FPC) — поднимаем его при заходе в раздел «Цены», иначе
+        # автообновление молча не работает до перезапуска FunPayCardinal
+        _ensure_exchange_rate_updater(c)
+    if section:
+        text, kb = _settings_section(cfg, section)
+    else:
+        text, kb = _settings_root(cfg)
+    _send_or_edit(c, call, text, kb=kb)
+
+
+# в каком разделе настроек лежит параметр — чтобы вернуться туда после правки
+_SETTING_SECTION = {
+    "exchange_rate": "price", "markup_percent": "price", "markup_fixed": "price",
+    "price_round": "price",
+    "exchange_rate_interval": "price",
+    "price_sync": "price", "price_sync_dry_run": "price",
+    "price_sync_interval": "price", "price_sync_threshold": "price",
+    "price_sync_max_step": "price",
+    "max_quantity": "checks", "max_topup_amount": "checks",
+    "sub_alert": "checks", "sub_alert_days": "checks", "low_balance_threshold": "checks",
+    "funds_auto_retry": "checks", "funds_retry_interval": "checks",
+    "funds_auto_refund": "checks", "funds_refund_after": "checks",
+    "funds_refund_warn_buyer": "checks",
+    "greeting": "tpl", "progress_notice": "tpl",
+    "review_request": "tpl", "review_request_delay": "tpl",
+    "profit_report": "integr", "withdraw_fee_percent": "integr",
+    "refund_on_fzr_refund": "integr",
+    "local_balance": "checks", "local_balance_low": "checks",
+    "balance_alert_cooldown": "checks",
+    "confirm_metadata": "tpl", "confirm_summary": "tpl", "smalltalk_filter": "tpl",
+    "validate_player_id": "checks", "auto_select_single": "checks", "fresh_options": "checks",
+    "show_field_hints": "checks",
+    "poll_interval": "timing", "poll_timeout": "timing",
+    "poll_interval_fast": "timing", "poll_fast_attempts": "timing",
+    "poll_parallel": "timing",
+    "dialog_timeout": "timing", "dialog_reminder": "timing",
+    "notify_on_error": "integr", "auto_cancel_fzr_order": "integr",
+    "manual_chat_watch": "integr", "manual_chat_autorelay": "integr",
+    "manual_chat_interval": "integr", "manual_chat_grace_hours": "integr",
+    "auto_disable_lot": "integr",
+}
+
+
+def _toggle_setting(c: "Cardinal", call: Any, arg: str) -> None:
+    cfg = load_config()
+    if arg in cfg["settings"]:
+        cfg["settings"][arg] = not cfg["settings"][arg]
+        save_config(cfg)
+        logger.info("setting toggled", extra={"key": arg, "value": cfg["settings"][arg]})
+        if arg == "auto_update_exchange_rate":
+            # v3.15: при включении тянем курс СРАЗУ. Раньше поток лишь начинал
+            # новое ожидание и продавец видел «курс не задан» ещё часы.
+            if cfg["settings"][arg]:
+                _EXCHANGE_RATE_FORCE.set()
+                _ensure_exchange_rate_updater(c)
+            _EXCHANGE_RATE_WAKE.set()
+        # включение автовозврата — необратимое действие для денег покупателя,
+        # поэтому сразу показываем, что и когда произойдёт
+        if arg == "funds_auto_refund" and cfg["settings"][arg]:
+            waiting = len(_funds_orders())
+            _notify_admin(
+                c, f"↩️ Автовозврат включён: если заказ ждёт баланса дольше "
+                   f"{_fmt_minutes(cfg['settings'].get('funds_refund_after'))}, "
+                   f"плагин сам вернёт деньги покупателю."
+                   + (f"\nСейчас в ожидании: {waiting} — отсчёт для них уже идёт "
+                      f"с момента постановки в очередь." if waiting else ""))
+    _show_settings(c, call, _SETTING_SECTION.get(arg, ""))
+
+
+def _rate_update_now(c: "Cardinal", call: Any) -> None:
+    """Кнопка «Обновить курс сейчас» — тянет курс независимо от автообновления."""
+    before = float(load_config()["settings"].get("exchange_rate") or 0)
+    restarted = _ensure_exchange_rate_updater(c)
+    rate = _update_exchange_rate(c, force=True)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔙 Цены", callback_data=f"{CB_PREFIX}:settings_sec:price"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    if rate is None:
+        # v3.15: показываем, какие именно источники не ответили — раньше текст
+        # говорил «ЦБ РФ не ответил», даже когда падал первый провайдер
+        errs = _EXCHANGE_RATE_STATUS.get("errors") or []
+        detail = "\n".join(f"• {_esc(e)}" for e in errs[:4]) or "• источники не ответили"
+        _send_or_edit(c, call,
+                      "❌ <b>Не удалось получить курс</b>\n\n"
+                      f"<blockquote>{detail}</blockquote>\n"
+                      "<i>Попробуйте позже или задайте курс вручную кнопкой «Курс».</i>", kb=kb)
+        return
+    sync_hint = ""
+    if restarted:
+        sync_hint += "\n\n<i>⚠️ Поток автообновления не работал — перезапустил его.</i>"
+    if _price_sync_candidates():
+        sync_hint += ("\n\n<i>Цены лотов пересчитаются на следующей синхронизации — "
+                      "или нажмите «Проверить цены сейчас».</i>")
+        kb.add(_inline_button("💱 Пересчитать цены", callback_data=f"{CB_PREFIX}:price_sync_now"))
+    src = _EXCHANGE_RATE_STATUS.get("source") or "?"
+    _send_or_edit(c, call,
+                  f"💱 <b>Курс обновлён</b>\n\n"
+                  f"<blockquote>{_esc(f'{before:.4f}')} → <b>{_esc(f'{rate:.4f}')}</b> ₽/$\n"
+                  f"<i>источник: {_esc(src)}</i></blockquote>{sync_hint}", kb=kb)
+
+
+def _show_metrics(c: "Cardinal", call: Any) -> None:
+    m = _get_metrics()
+    received = m.get("orders_received", 0)
+    matched = m.get("orders_matched", 0)
+    created = m.get("orders_created", 0)
+    delivered = m.get("orders_delivered", 0)
+    failed = m.get("orders_failed", 0)
+
+    def _pct(part: int, whole: int) -> str:
+        return f" <i>({part * 100 // whole}%)</i>" if whole else ""
+
+    counts = _db_status_counts()
+    active = sum(counts.get(k, 0) for k in _ACTIVE_STATUSES)
+    problems = sum(counts.get(k, 0) for k in _PROBLEM_STATUSES)
+    foreign = sum(counts.get(k, 0) for k in _FOREIGN_STATUSES)
+    # Воронку считаем от НАШИХ заказов: продавец торгует и другими товарами,
+    # поэтому «получено всего» включает чужие лоты и портит все проценты.
+    others = max(0, received - matched)
+
+    text = (
+        "📊 <b>Метрики</b>\n\n"
+        "<blockquote><b>Воронка (лоты FazerCards)</b>\n"
+        f"🔗 Заказов по нашим лотам: <b>{matched}</b>\n"
+        f"🛒 Создано в FazerCards: <b>{created}</b>{_pct(created, matched)}\n"
+        f"✅ Выдано покупателям: <b>{delivered}</b>{_pct(delivered, matched)}</blockquote>\n\n"
+        "<blockquote><b>Проблемы</b>\n"
+        f"❌ Ошибок заказа: <b>{failed}</b>\n"
+        f"💸 Отложено из-за баланса: <b>{m.get('orders_awaiting_funds', 0)}</b>\n"
+        f"📤 Не удалось доставить: <b>{m.get('delivery_failures', 0)}</b>\n"
+        f"🔌 Ошибок API: <b>{m.get('api_errors', 0)}</b></blockquote>\n\n"
+        "<blockquote><b>Сейчас в базе</b>\n"
+        f"⏳ В работе: <b>{active}</b>\n"
+        f"💸 Ждут баланса: <b>{counts.get(OrderStatus.AWAITING_FUNDS.value, 0)}</b>\n"
+        f"⚠️ Требуют внимания: <b>{problems}</b></blockquote>"
+    )
+    if others or foreign:
+        text += (f"\n\n<blockquote><b>Мимо плагина</b>\n"
+                 f"🚫 Заказов по чужим лотам: <b>{others}</b>"
+                 + (f" · в базе сейчас: {foreign}" if foreign else "")
+                 + "\n<i>Это ваша торговля другими товарами — плагин их не "
+                   "трогает и в проблемные не кладёт.</i></blockquote>")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    if counts.get(OrderStatus.AWAITING_FUNDS.value, 0):
+        kb.add(_inline_button(f"💸 Ждут баланса ({counts[OrderStatus.AWAITING_FUNDS.value]})",
+                              callback_data=f"{CB_PREFIX}:funds_list"))
+    if problems:
+        kb.add(_inline_button(f"⚠️ Разобрать ({problems})",
+                              callback_data=f"{CB_PREFIX}:orders:problems:0"))
+    if foreign:
+        kb.add(_inline_button(f"🚫 Чужие лоты ({foreign})",
+                              callback_data=f"{CB_PREFIX}:orders:foreign:0"))
+    kb.add(
+        _inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:metrics"),
+        _inline_button("🧹 Сбросить", callback_data=f"{CB_PREFIX}:metrics_reset", style="danger"),
+    )
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, text, kb=kb)
+
+
+def _reset_metrics() -> None:
+    global _METRICS
+    with _METRICS_LOCK:
+        _METRICS = {
+            "orders_received": 0, "orders_matched": 0, "orders_created": 0,
+            "orders_delivered": 0, "orders_failed": 0, "delivery_failures": 0, "api_errors": 0,
+        }
+        _save_metrics()
+
+
+_SETTINGS_EDITABLE = {
+    "poll_interval": ("Опрос заказа (сек)", int, 5, 3600),
+    "poll_timeout": ("Таймаут заказа (сек)", int, 10, 86400),
+    "dialog_timeout": ("Таймаут диалога (сек)", int, 60, 86400),
+    "dialog_reminder": ("Напоминание через (сек)", int, 30, 86400),
+    "max_quantity": ("Макс. количество за заказ", int, 1, 10000),
+    "exchange_rate": ("Курс RUB/USD (0 = авто)", float, 0.0, 100000.0),
+    "markup_percent": ("Наценка, %", float, -100.0, 10000.0),
+    "markup_fixed": ("Наценка, ₽ (фикс.)", float, -1000000.0, 1000000.0),
+    "price_round": ("Знаков после запятой в цене", int, 0, 6),
+    "max_topup_amount": ("Лимит суммы пополнения Steam (0 = без лимита)", float, 0.0, 10000000.0),
+    "manual_chat_interval": ("Опрос чата ручных услуг (сек)", int, 5, 3600),
+    "manual_chat_grace_hours": ("Следить за чатом после закрытия (часов)", int, 1, 168),
+    "poll_interval_fast": ("Быстрый опрос заказа (сек)", int, 1, 60),
+    "poll_fast_attempts": ("Сколько попыток считать быстрыми", int, 0, 200),
+    "sub_alert_days": ("Предупреждать об истечении подписки за (дней)", int, 1, 60),
+    "low_balance_threshold": ("Алерт при балансе ниже (USD, 0 = выкл)", float, 0.0, 100000.0),
+    "price_sync_interval": ("Интервал синхронизации цен (сек)", int, 600, 604800),
+    "price_sync_threshold": ("Порог изменения цены, %", float, 0.1, 100.0),
+    "price_sync_max_step": ("Макс. изменение цены за раз, % (0 = без лимита)", float, 0.0, 1000.0),
+    "funds_retry_interval": ("Проверять баланс для отложенных заказов (сек)", int, 300, 86400),
+    "funds_refund_after": ("Автовозврат, если не выдали за (минут)", int, 5, 20160),
+    "exchange_rate_interval": ("Как часто обновлять курс RUB/USD (минут)", int, 15, 10080),
+    # v3.17: пауза перед просьбой подтвердить заказ
+    "review_request_delay": ("Пауза перед просьбой об отзыве (сек)", int, 0, 30),
+    # v3.18: комиссия вывода с FunPay — вычитается при расчёте прибыли
+    "withdraw_fee_percent": ("Комиссия вывода с FunPay, %", float, 0.0, 50.0),
+    # v3.19: локальный баланс
+    "local_balance_low": ("Предупредить, когда локального баланса меньше (USD)", float, 0.0, 1000000.0),
+    "balance_alert_cooldown": ("Повторный алерт о балансе не чаще (минут)", int, 0, 10080),
+}
+
+
+_SETTINGS_HINTS = {
+    "poll_interval": "Как часто спрашивать FazerCards о готовности заказа. Меньше — быстрее выдача, больше запросов.",
+    "poll_timeout": "Сколько всего ждём готовности, после чего заказ помечается таймаутом.",
+    "dialog_timeout": "Сколько ждём от покупателя данные (ID, логин), прежде чем отменить.",
+    "dialog_reminder": "Через сколько напомнить покупателю, если он молчит.",
+    "max_quantity": "Больше этого количества за один заказ плагин не пропустит.",
+    "exchange_rate": "Курс для пересчёта цены из USD в рубли. 0 — брать автоматически.",
+    "markup_percent": ("Процент к цене закупки. Действует на привязки, у которых "
+                       "нет своей наценки (в карточке привязки — «Наценка»)."),
+    "markup_fixed": ("Фиксированная надбавка в рублях, прибавляется после процента. "
+                     "Тоже перекрывается наценкой конкретной привязки."),
+    "price_round": "До скольких знаков округлять итоговую цену лота.",
+    "max_topup_amount": "Защита от опечатки в количестве: пополнения Steam выше лимита блокируются. 0 — без лимита.",
+    "manual_chat_interval": ("Базовый интервал опроса чата ручных услуг. При активной переписке "
+                             "плагин опрашивает чаще, при тишине — реже (до 4×)."),
+    "manual_chat_grace_hours": ("Сколько следить за чатом после закрытия заказа. Исполнитель "
+                                "нередко пишет уже после выдачи — с маленьким значением "
+                                "эти сообщения теряются."),
+    "poll_interval_fast": ("Интервал опроса сразу после создания заказа. Именно он определяет, "
+                           "как быстро покупатель получит код."),
+    "poll_fast_attempts": ("Сколько первых попыток идут быстрым интервалом. Дальше плагин "
+                           "переходит на обычный, чтобы не тратить лимиты API на долгих заказах. "
+                           "0 — быстрый опрос выключен."),
+    "sub_alert_days": ("За сколько дней до конца подписки начать предупреждать. "
+                       "После истечения API перестанет принимать заказы."),
+    "low_balance_threshold": ("Предупредить, когда денег на FazerCards осталось меньше этой суммы. "
+                              "0 — не следить."),
+    "price_sync_interval": "Как часто сверять цены лотов с курсом и закупкой FazerCards.",
+    "price_sync_threshold": ("Ниже этого отклонения цену лота не трогаем — "
+                             "чтобы не дёргать лот из-за копеек."),
+    "price_sync_max_step": ("Защита от аномалий в каталоге: скачок больше этого процента "
+                            "не применяется, приходит алерт на проверку."),
+    "funds_retry_interval": ("Как часто проверять баланс, чтобы автоматически докупить "
+                             "заказы, которые ждут пополнения."),
+    "funds_refund_after": ("Сколько ждать пополнения, прежде чем вернуть деньги покупателю. "
+                           "Отсчёт идёт с момента, когда заказ встал из-за баланса. "
+                           "Возврат полный и необратимый — не ставьте слишком мало."),
+    "exchange_rate_interval": ("Как часто тянуть курс RUB/USD из ЦБ РФ. Влияет и на "
+                               "синхронизацию цен: цены пересчитываются по свежему курсу."),
+    "review_request_delay": ("Пауза между сообщением о выдаче и просьбой подтвердить заказ. "
+                             "Без паузы FunPay склеивает их в одно уведомление, и второе "
+                             "покупатель не читает."),
+    "withdraw_fee_percent": ("Сколько FunPay удерживает при выводе. Вычитается из суммы "
+                             "заказа в отчёте о прибыли, чтобы цифра была «как на руки». "
+                             "Стандартно 3%."),
+    "local_balance_low": ("Предупредить заранее, пока баланс ещё не в минусе. "
+                          "0 — сообщать только когда ушли в минус."),
+    "balance_alert_cooldown": ("Чтобы на серии заказов не пришло десять одинаковых "
+                               "сообщений. Если долг вырос заметно, плагин напишет "
+                               "раньше этого срока."),
+}
+
+
+def _start_settings_edit(c: "Cardinal", call: Any, key: str) -> None:
+    if key not in _SETTINGS_EDITABLE:
+        _send_or_edit(c, call, "❌ <b>Неизвестный параметр.</b>")
+        return
+    label, _caster, min_v, max_v = _SETTINGS_EDITABLE[key]
+    cfg = load_config()
+    current = cfg["settings"].get(key)
+    hint = _SETTINGS_HINTS.get(key)
+    text = (f"⚙️ <b>{_esc(label)}</b>\n\n"
+            f"Сейчас: <code>{_esc(current)}</code>\n"
+            f"Допустимо: от <code>{_esc(min_v)}</code> до <code>{_esc(max_v)}</code>\n")
+    if hint:
+        text += f"\n<blockquote>{_esc(hint)}</blockquote>\n"
+    text += "\nОтправьте новое значение:"
+    set_state(call.from_user.id, "settings_edit",
+              {"key": key, "message_id": getattr(call.message, "message_id", None)})
+    _send_or_edit(c, call, text, kb=_cancel_kb())
+
+
+def _step_settings_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    key = state["data"].get("key")
+    meta = _SETTINGS_EDITABLE.get(key)
+    if not meta:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Ошибка состояния.", kb=_main_keyboard())
+        return
+    label, caster, min_v, max_v = meta
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        value = caster(raw)
+    except ValueError:
+        _send_telegram_message(c, message.chat.id, f"❌ <b>{label}:</b> введите число.", reply_to=message)
+        return
+    if value < min_v or value > max_v:
+        _send_telegram_message(c, message.chat.id, f"❌ <b>{label}:</b> значение должно быть от {min_v} до {max_v}.", reply_to=message)
+        return
+    cfg = load_config()
+    old = cfg["settings"].get(key)
+    cfg["settings"][key] = value
+    save_config(cfg)
+    clear_state(message.from_user.id)
+    logger.info("setting changed", extra={"key": key, "old": old, "new": value})
+    if old != value and key in ("markup_percent", "markup_fixed",
+                                "exchange_rate", "price_round"):
+        _submit_task(_sync_lot_prices_after_setting_change, c, cfg, key)
+    # интервал обновления курса применяем сразу, не ждём старого цикла
+    if key == "exchange_rate_interval":
+        _ensure_exchange_rate_updater(c)
+        _EXCHANGE_RATE_WAKE.set()
+    # v3.15: курс, выставленный руками, не должен через минуту затираться
+    # автообновлением — предупреждаем об этом честно
+    if key == "exchange_rate" and value and cfg["settings"].get("auto_update_exchange_rate"):
+        _EXCHANGE_RATE_WAKE.set()
+    kb = InlineKeyboardMarkup(row_width=2)
+    section = _SETTING_SECTION.get(key, "")
+    if section:
+        kb.add(_inline_button("⚙️ К разделу", callback_data=f"{CB_PREFIX}:settings_sec:{section}"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    extra = ""
+    if old != value and key in ("markup_percent", "markup_fixed",
+                                "exchange_rate", "price_round"):
+        extra += "\n<i>Пересчёт цен привязанных лотов запущен.</i>"
+    if key in ("funds_refund_after", "exchange_rate_interval", "funds_retry_interval",
+               "price_sync_interval"):
+        shown = value if key.endswith("_after") or key == "exchange_rate_interval" else value / 60
+        extra = f"\n<i>= {_esc(_fmt_minutes(shown))}</i>"
+    if key == "funds_refund_after" and not cfg["settings"].get("funds_auto_refund"):
+        extra += "\n<i>⚠️ Автовозврат выключен — включите его, чтобы срок работал.</i>"
+    if key == "exchange_rate" and value and cfg["settings"].get("auto_update_exchange_rate"):
+        extra += ("\n<i>⚠️ Автокурс включён — это значение перезапишется при следующем "
+                  "обновлении. Выключите «Автокурс», чтобы курс остался вашим.</i>")
+    _send_telegram_message(
+        c, message.chat.id,
+        f"✅ <b>{_esc(label)}</b>\n<code>{_esc(old)}</code> → <code>{_esc(value)}</code>{extra}",
+        kb=kb)
+
+
+# =============================================================================
+# manual chat UI (v3.4)
+# =============================================================================
+
+def _manual_chat_kb(order_id: str, read_only: bool = False) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    if not read_only:
+        kb.add(_inline_button("✍️ Ответить", callback_data=f"{CB_PREFIX}:mchat_reply:{order_id}"))
+    kb.add(_inline_button("🔄 Обновить", callback_data=f"{CB_PREFIX}:mchat:{order_id}"),
+           _inline_button("📨 Покупателю", callback_data=f"{CB_PREFIX}:mchat_relay:{order_id}"))
+    kb.add(_inline_button("📄 Заказ", callback_data=f"{CB_PREFIX}:order_view:{order_id}"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    return kb
+
+
+def _fit_blocks(header: str, blocks: List[str], budget: int = 3900) -> str:
+    """
+    Собирает сообщение из блоков, укладываясь в лимит Telegram (4096).
+
+    Блоки берём с конца (свежие сообщения важнее). Обрезать готовый текст
+    нельзя — разорвётся HTML-тег и Telegram отклонит сообщение целиком.
+    """
+    text = header
+    kept: List[str] = []
+    used = len(header)
+    for block in reversed(blocks):
+        if used + len(block) + 1 > budget:
+            kept.insert(0, "<i>…более старые сообщения скрыты</i>")
+            break
+        kept.insert(0, block)
+        used += len(block) + 1
+    if kept:
+        text += "\n" + "\n".join(kept)
+    return text
+
+
+def _show_manual_chat(c: "Cardinal", call: Any, order_id: str) -> None:
+    """История переписки с исполнителем + подтяжка свежего из API."""
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    fzr_id = str(order.get("fzr_order_id") or "")
+    cfg = load_config()
+    read_only = False
+
+    # тянем свежее прямо сейчас: продавец открыл чат — ждать тик не нужно
+    if fzr_id and cfg.get("api_key"):
+        try:
+            api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+            data = api.get_manual_chat(fzr_id)
+            _db_manual_chat_new(order_id, fzr_id, data.get("messages") or [])
+            read_only = bool(data.get("chat_read_only")) or bool(data.get("chat_frozen"))
+        except Exception as ex:
+            logger.warning("manual chat fetch failed", extra={
+                "funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+
+    history = _db_manual_chat_history(order_id, limit=15)
+    header_lines = [f"💬 <b>Чат по заказу</b> <code>{_esc(order_id)}</code>",
+                    f"🛒 {_esc(_short_sku(order.get('sku_id')))} · FZR <code>{_esc(fzr_id or '—')}</code>"]
+    if read_only:
+        header_lines.append("🔒 <i>чат закрыт для ответа</i>")
+    header = "\n".join(header_lines) + "\n"
+
+    if not history:
+        text = header + "\n<blockquote><i>Сообщений пока нет.</i></blockquote>"
+    else:
+        blocks = []
+        for m in history:
+            who = "🟢 вы" if m.get("outgoing") else f"👤 {_esc(m.get('sender') or '?')}"
+            when = _esc(str(m.get("created_at") or "")[:16])
+            body = _esc(str(m.get("body") or "").strip()[:600]) or "<i>(вложение)</i>"
+            block = f"<blockquote><b>{who}</b> <i>{when}</i>\n{body}"
+            for url in (m.get("images") or [])[:3]:
+                block += f"\n🖼 {_esc(url)}"
+            if m.get("relayed_to_buyer"):
+                block += "\n<i>↪ переслано покупателю</i>"
+            blocks.append(block + "</blockquote>")
+        text = _fit_blocks(header, blocks)
+
+    _send_or_edit(c, call, text, kb=_manual_chat_kb(order_id, read_only))
+
+
+def _show_manual_chat_list(c: "Cardinal", call: Any) -> None:
+    """Все ручные заказы, где есть переписка."""
+    order_ids = _db_manual_chat_orders()
+    if not order_ids:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+        _send_or_edit(c, call,
+                      "💬 <b>Чаты ручных услуг</b>\n\n"
+                      "<blockquote>Переписки пока нет.\n\n"
+                      "Плагин сам следит за чатом по заказам ручных услуг "
+                      "и присылает сюда сообщения исполнителя.</blockquote>", kb=kb)
+        return
+    lines = ["💬 <b>Чаты ручных услуг</b>", ""]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for oid in order_ids[:12]:
+        order = _db_get_order(oid) or {}
+        cnt = _db_manual_chat_count(oid)
+        last = _db_manual_chat_history(oid, limit=1)
+        preview = ""
+        if last:
+            who = "вы" if last[-1].get("outgoing") else (last[-1].get("sender") or "исполнитель")
+            preview = f"\n<i>{_esc(who)}: {_esc(str(last[-1].get('body') or '(вложение)')[:60])}</i>"
+        lines.append(f"<blockquote><code>{_esc(oid)}</code> · {cnt} сообщ. · "
+                     f"{_esc(_order_status_text(order.get('status')))}{preview}</blockquote>")
+        kb.add(_inline_button(f"💬 {oid} ({cnt})", callback_data=f"{CB_PREFIX}:mchat:{oid}"))
+    kb.add(_inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_or_edit(c, call, "\n".join(lines), kb=kb)
+
+
+def _manual_chat_reply_prompt(c: "Cardinal", call: Any, order_id: str) -> None:
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    if not order.get("fzr_order_id"):
+        _send_or_edit(c, call, "❌ У заказа нет ID в FazerCards — отвечать некуда.")
+        return
+    set_state(call.from_user.id, "manual_chat_reply", {"order_id": order_id})
+    last = _db_manual_chat_history(order_id, limit=1)
+    quote = ""
+    if last:
+        quote = (f"\n<blockquote>{_esc(last[-1].get('sender') or '?')}: "
+                 f"{_esc(str(last[-1].get('body') or '')[:200])}</blockquote>")
+    _send_or_edit(
+        c, call,
+        f"✍️ <b>Ответ исполнителю</b>\n"
+        f"Заказ <code>{_esc(order_id)}</code>{quote}\n\n"
+        "Отправьте текст сообщения — оно уйдёт в чат FazerCards.\n"
+        "<i>Покупатель этого сообщения не увидит.</i>",
+        kb=_cancel_kb())
+
+
+def _step_manual_chat_reply(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    order_id = str(state["data"].get("order_id") or "")
+    order = _db_get_order(order_id)
+    if not order:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Заказ не найден.", kb=_main_keyboard())
+        return
+    body = (message.text or "").strip()
+    if not body:
+        _send_telegram_message(c, message.chat.id, "❌ Пустое сообщение.", reply_to=message)
+        return
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Не задан API-ключ.", kb=_main_keyboard())
+        return
+    fzr_id = str(order.get("fzr_order_id") or "")
+    try:
+        api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+        api.send_manual_chat(fzr_id, body=body)
+    except Exception as ex:
+        logger.warning("manual chat send failed", extra={
+            "funpay_order_id": order_id, "error": _redact_sensitive(str(ex))})
+        _send_telegram_message(c, message.chat.id,
+                               f"❌ Не удалось отправить:\n<blockquote>{_esc(ex)}</blockquote>",
+                               reply_to=message)
+        return
+    clear_state(message.from_user.id)
+    _db_manual_chat_log_outgoing(order_id, fzr_id, body)
+    _db_log_event(order_id, "manual_chat_sent", {"length": len(body)})
+    logger.info("manual chat message sent", extra={"funpay_order_id": order_id, "length": len(body)})
+    # после нашего сообщения ответ обычно приходит быстро — опрашиваем чаще
+    _manual_chat_mark(order_id, True)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("💬 Открыть чат", callback_data=f"{CB_PREFIX}:mchat:{order_id}"),
+           _inline_button("🏠 Меню", callback_data=f"{CB_PREFIX}:menu"))
+    _send_telegram_message(c, message.chat.id, "✅ Сообщение отправлено исполнителю.", kb=kb)
+
+
+def _manual_chat_relay_now(c: "Cardinal", call: Any, order_id: str) -> None:
+    """Переслать покупателю последние сообщения исполнителя (кнопка)."""
+    order = _db_get_order(order_id)
+    if not order:
+        _send_or_edit(c, call, "❌ <b>Заказ не найден.</b>")
+        return
+    history = _db_manual_chat_history(order_id, limit=5)
+    pending = [
+        {"sender": m.get("sender"), "body": m.get("body"),
+         "images": m.get("images") or [], "hash": m.get("msg_hash")}
+        for m in history
+        if not m.get("outgoing") and not m.get("relayed_to_buyer")
+    ]
+    if not pending:
+        _send_or_edit(c, call, "ℹ️ Нечего пересылать: новых сообщений исполнителя нет.",
+                      kb=_manual_chat_kb(order_id))
+        return
+    count = _manual_chat_relay_to_buyer(c, order, pending)
+    _send_or_edit(c, call,
+                  (f"📨 Переслано покупателю: <b>{count}</b>" if count
+                   else "❌ Не удалось отправить покупателю (нет чата)."),
+                  kb=_manual_chat_kb(order_id))
+
+
+# =============================================================================
+# webhook (v3.1)
+# =============================================================================
+
+def _webhook_api(c: "Cardinal", call: Any) -> Optional["FazerCardsAPI"]:
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        _send_or_edit(c, call, "❌ Сначала задайте API-ключ.", kb=_main_keyboard())
+        return None
+    return get_fzr_client(cfg["api_key"], cfg["base_url"])
+
+
+def _webhook_kb(configured: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button("🔗 Указать URL", callback_data=f"{CB_PREFIX}:webhook_set"))
+    if configured:
+        kb.add(_inline_button("📨 Тест", callback_data=f"{CB_PREFIX}:webhook_test"),
+               _inline_button("📜 Доставки", callback_data=f"{CB_PREFIX}:webhook_log"))
+        kb.add(_inline_button("♻️ Новый секрет", callback_data=f"{CB_PREFIX}:webhook_secret"))
+        kb.add(_inline_button("🗑 Удалить webhook", callback_data=f"{CB_PREFIX}:webhook_del", style="danger"))
+    kb.add(_inline_button("🔙 Настройки", callback_data=f"{CB_PREFIX}:settings_sec:integr"))
+    return kb
+
+
+def _show_webhook(c: "Cardinal", call: Any) -> None:
+    api = _webhook_api(c, call)
+    if not api:
+        return
+    try:
+        data = api.get_webhook()
+    except FazerCardsAPIError as ex:
+        if ex.status_code == 404:
+            _send_or_edit(c, call, "🔔 <b>Webhook</b>\n\nНе настроен.", kb=_webhook_kb(False))
+            return
+        _send_or_edit(c, call, f"❌ Не удалось получить webhook:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_webhook_kb(False))
+        return
+
+    # когда webhook не настроен, API отвечает {"ok": true, "webhook": null}
+    hook = data.get("webhook") or {}
+    if not isinstance(hook, dict):
+        hook = {}
+    url = hook.get("url")
+    if not url:
+        _send_or_edit(c, call, "🔔 <b>Webhook</b>\n\nНе настроен.", kb=_webhook_kb(False))
+        return
+    events = hook.get("events") or []
+    text = (
+        "🔔 <b>Webhook</b>\n\n"
+        f"<blockquote>URL: <code>{_esc(url)}</code>\n"
+        f"События: <b>{_esc(', '.join(events) if events else 'все')}</b>\n"
+        f"Секрет: <b>{'задан' if hook.get('secret') or hook.get('hasSecret') else '—'}</b></blockquote>\n\n"
+        "<i>Плагин продолжает опрашивать статусы сам (polling), webhook — дополнительный канал.</i>"
+    )
+    _send_or_edit(c, call, text, kb=_webhook_kb(True))
+
+
+def _step_webhook_url(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
+    url = (message.text or "").strip()
+    clear_state(message.from_user.id)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        _send_telegram_message(c, message.chat.id,
+                               "❌ Нужен корректный <b>https://</b> URL.", reply_to=message)
+        return
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        _send_telegram_message(c, message.chat.id, "❌ Сначала задайте API-ключ.", kb=_main_keyboard())
+        return
+    api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+    try:
+        resp = api.set_webhook(url)
+    except Exception as ex:
+        _send_telegram_message(c, message.chat.id,
+                               f"❌ Не удалось сохранить webhook:\n<blockquote>{_esc(ex)}</blockquote>",
+                               kb=_main_keyboard())
+        return
+    hook = resp.get("webhook") or {}
+    if not isinstance(hook, dict):
+        hook = {}
+    secret = hook.get("secret")
+    extra = (f"\n\n🔑 Секрет для проверки подписи:\n<code>{_esc(secret)}</code>\n"
+             "<i>Сохраните его — второй раз не покажут.</i>") if secret else ""
+    logger.info("webhook configured", extra={"url": url})
+    _send_telegram_message(c, message.chat.id,
+                           f"✅ Webhook сохранён:\n<code>{_esc(url)}</code>{extra}",
+                           kb=_main_keyboard())
+
+
+def _webhook_delete(c: "Cardinal", call: Any) -> None:
+    api = _webhook_api(c, call)
+    if not api:
+        return
+    try:
+        api.delete_webhook()
+    except Exception as ex:
+        _send_or_edit(c, call, f"❌ Не удалось удалить webhook:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_webhook_kb(True))
+        return
+    logger.info("webhook deleted")
+    _send_or_edit(c, call, "🗑 Webhook удалён.", kb=_webhook_kb(False))
+
+
+def _webhook_test(c: "Cardinal", call: Any) -> None:
+    api = _webhook_api(c, call)
+    if not api:
+        return
+    try:
+        resp = api.test_webhook()
+    except Exception as ex:
+        _send_or_edit(c, call, f"❌ Тест не прошёл:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_webhook_kb(True))
+        return
+    _send_or_edit(c, call,
+                  f"📨 Тестовое событие отправлено.\n<blockquote>{_esc(json.dumps(_redact_sensitive(resp), ensure_ascii=False)[:600])}</blockquote>",
+                  kb=_webhook_kb(True))
+
+
+def _webhook_regenerate_secret(c: "Cardinal", call: Any) -> None:
+    api = _webhook_api(c, call)
+    if not api:
+        return
+    try:
+        resp = api.regenerate_webhook_secret()
+    except Exception as ex:
+        _send_or_edit(c, call, f"❌ Не удалось обновить секрет:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_webhook_kb(True))
+        return
+    secret = ((resp.get("webhook") or {}) if isinstance(resp.get("webhook"), dict) else {}).get("secret") \
+        or resp.get("secret")
+    _send_or_edit(c, call,
+                  ("♻️ Новый секрет:\n"
+                   f"<code>{_esc(secret)}</code>\n<i>Старый больше не действует.</i>"
+                   if secret else "♻️ Секрет обновлён."),
+                  kb=_webhook_kb(True))
+
+
+def _webhook_deliveries(c: "Cardinal", call: Any) -> None:
+    api = _webhook_api(c, call)
+    if not api:
+        return
+    try:
+        resp = api.get_webhook_deliveries(limit=10)
+    except Exception as ex:
+        _send_or_edit(c, call, f"❌ Не удалось получить журнал:\n<blockquote>{_esc(ex)}</blockquote>",
+                      kb=_webhook_kb(True))
+        return
+    items = resp.get("items") or resp.get("deliveries") or []
+    if not isinstance(items, list):
+        items = []
+    if not items:
+        _send_or_edit(c, call, "📜 Доставок пока нет.", kb=_webhook_kb(True))
+        return
+    lines = []
+    for it in items[:10]:
+        status = it.get("status") or it.get("responseStatus") or it.get("statusCode") or "?"
+        event = it.get("event") or it.get("type") or "—"
+        when = it.get("createdAt") or it.get("created_at") or ""
+        ok = str(status).startswith("2")
+        lines.append(f"{'✅' if ok else '❌'} <code>{_esc(status)}</code> {_esc(event)} {_esc(str(when)[:19])}")
+    _send_or_edit(c, call, "📜 <b>Последние доставки</b>\n\n" + "\n".join(lines), kb=_webhook_kb(True))
+
+
+# =============================================================================
+# plugin lifecycle
+# =============================================================================
+
+def _resume_pending_orders(c: "Cardinal") -> None:
+    try:
+        if not _DB_INITIALIZED:
+            _db_init()
+        reset_count = _db_reset_stuck_delivery_claims()
+        if reset_count:
+            logger.info("reset stuck delivery claims", extra={"count": reset_count})
+        cfg = load_config()
+        with _DB_LOCK:
+            rows = _db_connect().execute(
+                """SELECT * FROM orders
+                   WHERE status IN ('reserving','processing','pending','awaiting_metadata',
+                                    'delivery_failed','awaiting_funds')
+                   OR (status='completed' AND completed_notification_sent=0)"""
+            ).fetchall()
+        resumed_poll = 0
+        restarted_creation = 0
+        recreated_dialogs = 0
+        awaiting_funds_kept = 0
+        for row in rows:
+            funpay_order_id = row["funpay_order_id"]
+            fzr_order_id = row["fzr_order_id"]
+            status = row["status"]
+            if status == "awaiting_funds":
+                # такие заказы ждут пополнения: сами их не пересоздаём,
+                # ими займётся health-watcher, когда баланс появится
+                awaiting_funds_kept += 1
+                continue
+            if status in ("pending", "delivery_failed", "completed") and fzr_order_id:
+                _schedule_poll(c, funpay_order_id, fzr_order_id, delay=2.0, attempt=1)
+                resumed_poll += 1
+            elif status in ("reserving", "processing"):
+                if fzr_order_id:
+                    _schedule_poll(c, funpay_order_id, fzr_order_id, delay=2.0, attempt=1)
+                    resumed_poll += 1
+                else:
+                    mapping_id = row["mapping_id"]
+                    sku_id = row["sku_id"]
+                    order_json = _from_json(row["order_json"])
+                    if mapping_id and sku_id and order_json:
+                        mapping = _get_mapping_by_id(mapping_id)
+                        if mapping and mapping.get("fzr_sku_id") == sku_id:
+                            _submit_task(_process_order_creation, c, order_json, mapping, {})
+                            restarted_creation += 1
+                        else:
+                            _db_update_order(funpay_order_id, status="needs_review", error="mapping/sku mismatch on resume")
+                    else:
+                        _db_update_order(funpay_order_id, status="needs_review", error="missing mapping/sku on resume")
+            elif status == "awaiting_metadata":
+                mapping = _get_mapping_by_id(row["mapping_id"])
+                order_json = _from_json(row["order_json"])
+                if mapping:
+                    meta_fields = _build_metadata_fields(mapping)
+                    if meta_fields:
+                        # v3.14: НЕ затираем уже собранные ответы. Раньше resume
+                        # писал пустой data ещё до чтения существующего диалога,
+                        # и после рестарта FPC покупателя спрашивали всё заново
+                        # (а подтверждённое значение терялось).
+                        pending = _db_get_pending_by_buyer(row["buyer_id"], row["chat_id"]) or {}
+                        pending_data = pending.get("data") or {}
+                        if not pending_data.get("metadata_fields"):
+                            pending_data["metadata_fields"] = meta_fields
+                        pending_data.setdefault("metadata_values", {})
+                        pending_data.setdefault("metadata_labels", {})
+                        pending_data.setdefault("autofilled_keys", [])
+                        fields_now = pending_data["metadata_fields"]
+                        idx = pending_data.get("metadata_index")
+                        if not isinstance(idx, int) or not (0 <= idx <= len(fields_now)):
+                            idx = _next_unfilled_index(fields_now, pending_data["metadata_values"])
+                        pending_data["metadata_index"] = idx
+                        last_prompt = pending_data.get("prompt_sent_at") or 0
+                        reminder = max(60, int(cfg["settings"].get("dialog_reminder") or 120))
+                        if time.time() - last_prompt > reminder:
+                            # напоминаем ровно про тот шаг, где остановились
+                            if pending_data.get("awaiting_summary"):
+                                text = _summary_question(fields_now,
+                                                         pending_data["metadata_values"],
+                                                         pending_data["metadata_labels"])
+                            elif isinstance(pending_data.get("awaiting_confirm"), dict):
+                                cinfo = pending_data["awaiting_confirm"]
+                                c_idx = int(cinfo.get("index", idx) or 0)
+                                fld = fields_now[c_idx] if 0 <= c_idx < len(fields_now) else fields_now[0]
+                                text = _confirm_question(fld, cinfo.get("shown"))
+                            else:
+                                fld = fields_now[idx] if idx < len(fields_now) else fields_now[0]
+                                text = _format_metadata_prompt(cfg, fld, mapping)
+                            _send_buyer(c, row["chat_id"], text, row["buyer_username"])
+                            pending_data["prompt_sent_at"] = time.time()
+                        _db_upsert_pending({
+                            "funpay_order_id": funpay_order_id,
+                            "buyer_id": row["buyer_id"],
+                            "chat_id": row["chat_id"],
+                            "mapping_id": mapping["id"],
+                            "step": "await_metadata",
+                            "data": pending_data,
+                        })
+                        recreated_dialogs += 1
+                        continue
+                _db_update_order(funpay_order_id, status="needs_review", error="awaiting metadata but mapping missing metadata fields")
+        logger.info("resumed pending orders", extra={"count": len(rows), "poll": resumed_poll, "creation": restarted_creation, "dialogs": recreated_dialogs, "awaiting_funds": awaiting_funds_kept})
+        if awaiting_funds_kept:
+            # напоминаем при старте: покупатели уже заплатили и ждут
+            _notify_admin(c, f"💸 Заказов, ждущих пополнения баланса: {awaiting_funds_kept}.\n"
+                             f"Пополните баланс FazerCards — плагин докупит их сам, "
+                             f"либо нажмите «Повторить» в разделе «Ждут баланса».")
+    except Exception as e:
+        logger.exception("resume pending orders failed", extra={"error": repr(e)})
+def init_telegram(c: "Cardinal") -> None:
+    logger.info("FazerCards Reseller Telegram handlers registering")
+    _SHUTDOWN_EVENT.clear()
+
+    if c.telegram and c.telegram.bot:
+        bot = c.telegram.bot
+        c.add_telegram_commands(UUID, [("fzr", "FazerCards Reseller", True)])
+
+        def fzr_command_handler(message):
+            cmd_fzr(c, message)
+        bot.message_handler(commands=["fzr"])(fzr_command_handler)
+        _REGISTERED_HANDLERS.append(("message", fzr_command_handler))
+
+        def cbq_handler(call):
+            cbq_dispatcher(c, call)
+        bot.callback_query_handler(func=lambda call: call.data.startswith(f"{CB_PREFIX}:"))(cbq_handler)
+        _REGISTERED_HANDLERS.append(("callback_query", cbq_handler))
+
+        def state_handler(message):
+            user_id = getattr(getattr(message, "from_user", None), "id", None)
+            state = get_state(user_id) if user_id else None
+            _handle_step(c, message, state)
+        bot.message_handler(func=_state_waiting)(state_handler)
+        _REGISTERED_HANDLERS.append(("message", state_handler))
+
+        # Импорт настроек: ждём именно документ, а не текст. Отдельный хэндлер
+        # нужен потому, что общий state_handler ловит только content_types=text.
+        def import_file_handler(message):
+            if not _is_admin(c, message):
+                return
+            _import_handle_document(c, message)
+
+        def _waiting_import_file(message) -> bool:
+            user_id = getattr(getattr(message, "from_user", None), "id", None)
+            state = get_state(user_id) if user_id else None
+            return bool(state and state.get("state") == "import_wait_file")
+
+        bot.message_handler(content_types=["document"], func=_waiting_import_file)(import_file_handler)
+        _REGISTERED_HANDLERS.append(("message", import_file_handler))
+
+        def _open_settings_from_pu(call):
+            if not _is_admin(c, call):
+                try:
+                    bot.answer_callback_query(call.id)
+                except Exception:
+                    pass
+                return
+            try:
+                _send_or_edit(c, call, _main_menu_text(), kb=_main_keyboard())
+            except Exception as _e2:
+                logger.exception("open_settings_from_pu failed", extra={"error": repr(_e2)})
+                try:
+                    bot.send_message(call.message.chat.id, f"Ошибка: {_esc(_e2)}")
+                except Exception:
+                    pass
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+
+        try:
+            from tg_bot import CBT as _FPC_CBT
+            _settings_cb_prefix = f"{_FPC_CBT.PLUGIN_SETTINGS}:{UUID}:"
+        except Exception as _e:
+            logger.error("FPC CBT import failed", extra={"error": repr(_e)})
+            _settings_cb_prefix = None
+
+        if _settings_cb_prefix:
+            def settings_handler(call):
+                _open_settings_from_pu(call)
+            bot.callback_query_handler(func=lambda call: call.data.startswith(_settings_cb_prefix))(settings_handler)
+            _REGISTERED_HANDLERS.append(("callback_query", settings_handler))
+
+    logger.info("FazerCards Reseller Telegram handlers registered")
+
+def init_plugin(c: "Cardinal") -> None:
+    logger.info("FazerCards Reseller plugin initializing")
+
+    account_id = getattr(getattr(c, "account", None), "id", None)
+    _rebind_paths_for_account(account_id)
+
+    _db_init()
+    _migrate_legacy_config()
+    _migrate_legacy_processed()
+
+    load_config()
+    _load_metrics()
+
+    threading.Thread(target=_prefetch_steam_gifts_catalog, daemon=True).start()
+
+    _start_executor()
+    _start_exchange_rate_updater(c)
+    _start_poll_worker(c)
+    _start_dialog_timeout_watcher(c)
+    _start_manual_chat_watcher(c)
+    _start_health_watcher(c)
+    _resume_pending_orders(c)
+    # чужие заказы (лоты без привязки) не держим в базе долго — они только
+    # раздувают её при торговле другими товарами
+    _db_purge_foreign_orders()
+
+    logger.info("FazerCards Reseller plugin initialized", extra={"account_id": account_id})
+def cleanup(c: "Cardinal", *args: Any) -> None:
+    logger.info("FazerCards Reseller plugin shutting down")
+    _SHUTDOWN_EVENT.set()
+    # будим ожидающие потоки, чтобы не держать остановку до конца тика
+    _POLL_WAKE.set()
+    _EXCHANGE_RATE_WAKE.set()
+    if c.telegram and c.telegram.bot:
+        for handler_type, handler in _REGISTERED_HANDLERS:
+            try:
+                handlers_list = getattr(c.telegram.bot, f"{handler_type}_handlers", None)
+                if handlers_list:
+                    handlers_list[:] = [h for h in handlers_list if h.get("function") is not handler]
+            except Exception:
+                pass
+    _REGISTERED_HANDLERS.clear()
+    _stop_executor(wait=True)
+    _stop_exchange_rate_updater()
+    with _FZR_CLIENTS_LOCK:
+        _FZR_CLIENTS.clear()
+    _db_close_conn()
+
+    if _POLL_THREAD and _POLL_THREAD.is_alive():
+        try:
+            _POLL_THREAD.join(timeout=5.0)
+        except Exception:
+            pass
+    if _DIALOG_WATCHER_THREAD and _DIALOG_WATCHER_THREAD.is_alive():
+        try:
+            _DIALOG_WATCHER_THREAD.join(timeout=5.0)
+        except Exception:
+            pass
+    if _MANUAL_CHAT_THREAD and _MANUAL_CHAT_THREAD.is_alive():
+        try:
+            _MANUAL_CHAT_THREAD.join(timeout=5.0)
+        except Exception:
+            pass
+    if _HEALTH_THREAD and _HEALTH_THREAD.is_alive():
+        try:
+            _HEALTH_THREAD.join(timeout=5.0)
+        except Exception:
+            pass
+    with _MANUAL_CHAT_LOCK:
+        _MANUAL_CHAT_STATE.clear()
+        _MANUAL_CHAT_SKIP.clear()
+        _MANUAL_CHAT_404.clear()
+    with _POLL_LOCK:
+        _POLL_QUEUE.clear()
+        _POLL_INFLIGHT.clear()
+    _POLL_WAKE.clear()
+    logger.info("FazerCards Reseller plugin cleanup done")
+
+
+BIND_TO_PRE_INIT = [init_telegram]
+BIND_TO_POST_INIT = [init_plugin]
+BIND_TO_NEW_ORDER = [handle_new_order]
+BIND_TO_NEW_MESSAGE = [handle_new_message]
+BIND_TO_ORDER_STATUS_CHANGED = [handle_order_status_changed]
+BIND_TO_POST_STOP = [cleanup]
+BIND_TO_DELETE = cleanup
+
+
+def _run_smoke_tests() -> None:
+    import tempfile, shutil
+    print("Running fzr_gifts smoke tests...")
+    tmp = tempfile.mkdtemp()
+    try:
+        global STORAGE_PATH, CONFIG_FILE, DB_PATH, MAPPINGS_FILE, PROCESSED_FILE, CATALOG_CACHE_FILE
+        STORAGE_PATH = tmp
+        _rebind_paths_for_account(tmp)
+        cfg = create_default_config()
+        cfg["api_key"] = "live_test"
+        save_config(cfg)
+        _db_init()
+
+        # SKU parse
+        assert _parse_sku("giftcards:123:456") == ("giftcards", "123", "456")
+        try:
+            _parse_sku("bad")
+            assert False
+        except ValueError:
+            pass
+        print("_parse_sku OK")
+
+        # payload builder
+        assert _build_fzr_payload("giftcards", "123", "456", 2, {"note": "x"}) == {"category_id": "123", "card_id": "456", "quantity": 2}
+        assert _build_fzr_payload("manual-services", "123", "456", 1, {"account": "user"}) == {"manual_service_id": "123", "product_id": "456", "fields": {"account": "user"}}
+        print("_build_fzr_payload OK")
+
+        # metadata validation
+        assert _validate_metadata_value("steam_id", "76561198999999999", "steam_id") is None
+        assert _validate_metadata_value("email", "bad", "email") is not None
+        print("_validate_metadata_value OK")
+
+        # select-поля: options доживают до диалога с покупателем
+        _api_fields = [
+            {"key": "user_id", "label": "User ID", "type": "text"},
+            {"key": "server", "label": "Server", "type": "select", "options": [
+                {"label": "Amagi", "value": "Amagi"},
+                {"label": "Avrora", "value": "Avrora"},
+                {"label": "Lexington", "value": "Lexington"},
+            ]},
+        ]
+        _mf = _build_metadata_fields({"fields": _api_fields})
+        assert len(_mf) == 2
+        _sel = _mf[1]
+        assert _sel["type"] == "select" and _sel["validation"] == "select"
+        assert len(_field_options(_sel)) == 3
+        assert _is_select_field(_sel) and not _is_select_field(_mf[0])
+        print("_build_metadata_fields keeps options OK")
+
+        # выбор по номеру / названию / мусор
+        assert _resolve_select_value(_sel, "2") == ("Avrora", None)
+        assert _resolve_select_value(_sel, "lexington") == ("Lexington", None)
+        assert _resolve_select_value(_sel, "Amagi") == ("Amagi", None)
+        assert _resolve_select_value(_sel, "9")[0] is None
+        assert _resolve_select_value(_sel, "нет такого сервера")[0] is None
+        assert _resolve_select_value(_sel, "'; DROP TABLE--")[0] is None
+        print("_resolve_select_value OK")
+
+        # список вариантов попадает в текст покупателю (plain text — чат FunPay)
+        _prompt = _format_metadata_prompt(create_default_config(), _sel)
+        assert "Amagi" in _prompt and "1." in _prompt and "3. Lexington" in _prompt
+        assert "<b>" not in _prompt and "<code>" not in _prompt, "чат FunPay не рендерит HTML"
+        print("_format_metadata_prompt lists options OK")
+
+        # длинный список (как lineage_w, 72 сервера): всё сообщение должно
+        # уместиться в 20 строк — Cardinal.send_message режет текст по 20 строк
+        _big = {"key": "server", "label": "Server", "type": "select",
+                "options": [{"label": f"S{i}", "value": f"s{i}"} for i in range(1, 73)]}
+        _big_prompt = _format_metadata_prompt(create_default_config(), _big)
+        assert _big_prompt.count("\n") + 1 <= 20, "сообщение с вариантами не должно резаться"
+        _big_text = _format_select_options(_big)
+        for _n in (1, 40, 72):
+            assert f"{_n}. S{_n}" in _big_text
+        assert _resolve_select_value(_big, "72") == ("s72", None)
+        assert _resolve_select_value(_big, "73")[0] is None
+        # длинные названия серверов тоже не разрывают лимит строк
+        _big2 = {"key": "server", "label": "Server", "type": "select",
+                 "options": [{"label": f"Pandora-Server-{i:02d}", "value": f"p{i}"} for i in range(1, 73)]}
+        assert _format_metadata_prompt(create_default_config(), _big2).count("\n") + 1 <= 20
+        print("_format_select_options long list OK")
+
+        # миграция старых привязок: options поднимаются из mapping['fields']
+        _legacy = {
+            "fields": _api_fields,
+            "metadata_fields": [
+                {"key": "user_id", "label": "User ID", "validation": "player_id"},
+                {"key": "server", "label": "Server", "validation": "nonempty"},
+            ],
+        }
+        _mig = _build_metadata_fields(_legacy)
+        assert _mig[1]["type"] == "select" and len(_field_options(_mig[1])) == 3
+        print("_enrich_fields_with_options (legacy migration) OK")
+
+        # финальная проверка перед заказом
+        assert _coerce_metadata_against_offer(
+            "topups", {"user_id": "1", "server": "avrora"},
+            {"fields": _api_fields}, {})["server"] == "Avrora"
+        try:
+            _coerce_metadata_against_offer(
+                "topups", {"user_id": "1", "server": "Mars"}, {"fields": _api_fields}, {})
+            assert False
+        except FazerCardsAPIError:
+            pass
+        print("_coerce_metadata_against_offer OK")
+
+        # --- v3.1: quantity для topups через несколько заказов ---
+        assert not _kind_supports_quantity("topups")
+        assert not _kind_supports_quantity("manual-services")
+        assert _kind_supports_quantity("giftcards") and _kind_supports_quantity("gamekeys")
+        assert _kind_needs_batch("topups") and _kind_needs_batch("manual-services")
+        assert not _kind_needs_batch("giftcards")
+
+        class _BatchAPI:
+            def __init__(self):
+                self.calls = []
+
+            def create_order(self, kind, payload, idempotency_key=None):
+                self.calls.append((kind, idempotency_key))
+                return {"ok": True, "order": {"id": f"fzr-{len(self.calls)}"}}
+
+        _api = _BatchAPI()
+        _ids, _resps = _create_order_batch(_api, "topups", "ml", "ml-100", 3,
+                                           {"user_id": "1"}, "FP123")
+        assert _ids == ["fzr-1", "fzr-2", "fzr-3"], _ids
+        # ключи идемпотентности РАЗНЫЕ, иначе API вернёт один и тот же заказ
+        keys = [k for _, k in _api.calls]
+        assert keys == ["fpc-fzr-FP123-1", "fpc-fzr-FP123-2", "fpc-fzr-FP123-3"], keys
+        assert len(set(keys)) == 3
+        # giftcards: один запрос, quantity внутри payload
+        _api2 = _BatchAPI()
+        _ids2, _ = _create_order_batch(_api2, "giftcards", "c1", "o1", 5, {}, "FP124")
+        assert len(_ids2) == 1 and _api2.calls[0][1] == "fpc-fzr-FP124"
+        assert _build_fzr_payload("giftcards", "c1", "o1", 5, {})["quantity"] == 5
+        print("_create_order_batch OK")
+
+        # частичный сбой батча: сообщение содержит уже созданные заказы
+        class _FailSecond(_BatchAPI):
+            def create_order(self, kind, payload, idempotency_key=None):
+                self.calls.append((kind, idempotency_key))
+                if len(self.calls) == 2:
+                    raise FazerCardsAPIError("boom")
+                return {"ok": True, "order": {"id": f"fzr-{len(self.calls)}"}}
+
+        try:
+            _create_order_batch(_FailSecond(), "topups", "ml", "ml-100", 3, {}, "FP125")
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "fzr-1" in str(ex) and "1 из 3" in str(ex), str(ex)
+        print("_create_order_batch partial failure OK")
+
+        # --- v3.1: автоподстановка единственного варианта ---
+        _one = [
+            {"key": "user_id", "label": "User ID", "type": "text"},
+            {"key": "server", "label": "Server", "type": "select",
+             "options": [{"label": "Global", "value": "global"}]},
+        ]
+        _mf_one = _build_metadata_fields({"fields": _one})
+        _vals: Dict[str, str] = {}
+        _filled = _autofill_single_options(_mf_one, _vals)
+        assert _filled == [("server", "global", "Global")], _filled
+        assert _vals == {"server": "global"}
+        # первым спросят user_id, а не server
+        assert _next_unfilled_index(_mf_one, _vals) == 0
+        _vals["user_id"] = "42"
+        assert _next_unfilled_index(_mf_one, _vals, 1) == 2  # всё заполнено
+        # многовариантный select НЕ автозаполняется
+        _vals2: Dict[str, str] = {}
+        assert _autofill_single_options(_mf, _vals2) == [] and _vals2 == {}
+        print("_autofill_single_options OK")
+
+        # --- v3.1: наценка ---
+        _cfg_m = create_default_config()
+        _cfg_m["settings"]["exchange_rate"] = 100.0
+        # 1.5 USD * 100 = 150 ₽, без наценки
+        assert _apply_markup(1.5, {}, _cfg_m) == 150.0
+        # наценка привязки: +20% и +30 ₽
+        assert _apply_markup(1.5, {"markup_percent": 20, "markup_fixed": 30}, _cfg_m) == 210.0
+        # наценка из глобальных настроек, если у привязки её нет (None/пусто)
+        _cfg_m["settings"]["markup_percent"] = 10
+        assert _apply_markup(1.0, {"markup_percent": None, "markup_fixed": None}, _cfg_m) == 110.0
+        assert _apply_markup(1.0, {}, _cfg_m) == 110.0
+        # v3.8: ровно 0 у привязки — это НЕ «наследовать», а честный ноль
+        assert _apply_markup(1.0, {"markup_percent": 0, "markup_fixed": 0}, _cfg_m) == 100.0
+        # процент и фикс наследуются независимо
+        _cfg_m["settings"]["markup_fixed"] = 50
+        assert _apply_markup(1.0, {"markup_percent": 0}, _cfg_m) == 150.0    # фикс общий
+        assert _apply_markup(1.0, {"markup_fixed": 0}, _cfg_m) == 110.0      # процент общий
+        _cfg_m["settings"]["markup_fixed"] = 0
+        # привязка перекрывает глобальную
+        assert _apply_markup(1.0, {"markup_percent": 50}, _cfg_m) == 150.0
+        # _markup_own различает «нет значения» и «ноль»
+        assert _markup_own({"markup_percent": None}, "markup_percent") is None
+        assert _markup_own({"markup_percent": ""}, "markup_percent") is None
+        assert _markup_own({}, "markup_percent") is None
+        assert _markup_own({"markup_percent": 0}, "markup_percent") == 0.0
+        assert _markup_own({"markup_percent": "12.5"}, "markup_percent") == 12.5
+        assert _markup_own({"markup_percent": "abc"}, "markup_percent") is None
+        # источник наценки видно в breakdown — для честной подписи в ПУ
+        _bd_own = _markup_breakdown("1", {"markup_percent": 0}, _cfg_m)
+        assert _bd_own["markup_percent_own"] == 0.0 and _bd_own["markup_fixed_own"] is None
+        assert _markup_source_text({"markup_percent_own": 1, "markup_fixed_own": 1}) == "своя"
+        assert _markup_source_text({"markup_percent_own": None,
+                                    "markup_fixed_own": None}) == "общая из настроек"
+        assert "своя %" in _markup_source_text({"markup_percent_own": 0,
+                                                "markup_fixed_own": None})
+        # разбор ввода наценки
+        assert _parse_markup_input("15 20") == (15.0, 20.0, None)
+        assert _parse_markup_input("0 0") == (0.0, 0.0, None)
+        assert _parse_markup_input("-") == (None, _KEEP, None)
+        assert _parse_markup_input("- 20") == (None, 20.0, None)
+        assert _parse_markup_input("15")[0] == 15.0 and _parse_markup_input("15")[1] is _KEEP
+        assert _parse_markup_input("12,5")[0] == 12.5
+        assert _parse_markup_input("abc")[2] is not None
+        assert _parse_markup_input("")[2] is not None
+        assert _parse_markup_input("99999")[2] is not None
+        print("_apply_markup / наценка v3.8 OK")
+        # без курса цену не считаем
+        _cfg_m["settings"]["exchange_rate"] = 0
+        assert _apply_markup(1.5, {}, _cfg_m) is None
+        assert _apply_markup(None, {}, _cfg_m) is None
+        _cfg_m["settings"]["exchange_rate"] = 90.0
+        _bd = _markup_breakdown("2", {"markup_percent": 5}, _cfg_m)
+        assert _bd["price_rub"] == 189.0 and _bd["rate"] == 90.0, _bd
+        print("_apply_markup / _markup_breakdown OK")
+
+        # --- v3.1: проверка Player ID ---
+        class _VidAPI:
+            def __init__(self, valid=True, http=None):
+                self.valid = valid
+                self.http = http
+                self.validated = []
+
+            def get_validate_id_games(self):
+                return {"ok": True, "items": [
+                    {"category_id": "pubg_mobile", "name": "PUBG Mobile",
+                     "fields": [{"key": "player_id", "label": "Player ID", "type": "text"}]}]}
+
+            def validate_player_id(self, category_id, fields):
+                self.validated.append((category_id, fields))
+                if self.http:
+                    raise FazerCardsAPIError("nope", status_code=self.http)
+                return {"ok": True, "valid": self.valid, "player_name": "Nick", "region": "EU"}
+
+        global _VALIDATE_ID_GAMES
+        _VALIDATE_ID_GAMES = None
+        _ok_api = _VidAPI()
+        _res = _validate_player_id_if_supported(_ok_api, "topups", "pubg_mobile",
+                                                {"player_id": "123"}, {}, "FP1")
+        assert _res and _res.get("player_name") == "Nick"
+        assert _ok_api.validated == [("pubg_mobile", {"player_id": "123"})]
+        # игра без поддержки проверки — тихо пропускаем
+        _VALIDATE_ID_GAMES = None
+        assert _validate_player_id_if_supported(_VidAPI(), "topups", "azur_lane",
+                                                {"user_id": "1"}, {}, "FP2") is None
+        # valid=false -> заказ не создаётся
+        _VALIDATE_ID_GAMES = None
+        try:
+            _validate_player_id_if_supported(_VidAPI(valid=False), "topups", "pubg_mobile",
+                                             {"player_id": "999"}, {}, "FP3")
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "не найден" in str(ex)
+        # 422 -> тоже блокируем
+        _VALIDATE_ID_GAMES = None
+        try:
+            _validate_player_id_if_supported(_VidAPI(http=422), "topups", "pubg_mobile",
+                                             {"player_id": "999"}, {}, "FP4")
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "подтвердить" in str(ex)
+        # 500 -> НЕ блокируем продажу
+        _VALIDATE_ID_GAMES = None
+        assert _validate_player_id_if_supported(_VidAPI(http=500), "topups", "pubg_mobile",
+                                                {"player_id": "1"}, {}, "FP5") is None
+        # отключено на уровне привязки
+        _VALIDATE_ID_GAMES = None
+        assert _validate_player_id_if_supported(_VidAPI(), "topups", "pubg_mobile",
+                                                {"player_id": "1"}, {"validate_id": 0}, "FP6") is None
+        _VALIDATE_ID_GAMES = None
+        print("_validate_player_id_if_supported OK")
+
+        # --- v3.1: коды из батча ---
+        assert _extract_codes({"order": {"code": "A"}}) == ["A"]
+        assert _extract_codes({"codes": ["A", "B"]}) == ["A", "B"]
+        assert _extract_codes({"code": "A", "codes": ["A", "B"]}) == ["A", "B"]
+        assert _extract_codes({"cards": ["GIFT-A", "GIFT-B"]}) == ["GIFT-A", "GIFT-B"]
+        assert _extract_codes({"order": {"cards": [
+            {"code": "GIFT-A"}, {"value": "GIFT-B"}]}}) == ["GIFT-A", "GIFT-B"]
+        assert _extract_codes({"cards": ["A"], "keys": ["B"]}) == ["A", "B"]
+        assert _extract_codes({}) == []
+        print("_extract_codes OK")
+
+        # --- v3.1: миграция БД доливает колонки в существующую таблицу ---
+        _conn = _db_connect()
+        _conn.execute("DROP TABLE IF EXISTS _mig_test")
+        _conn.execute("CREATE TABLE _mig_test (id TEXT)")
+        _DB_ADDED_COLUMNS["_mig_test"] = [("newcol", "TEXT")]
+        try:
+            _db_migrate_columns(_conn)
+            _cols = {r[1] for r in _conn.execute("PRAGMA table_info(_mig_test)").fetchall()}
+            assert "newcol" in _cols, _cols
+            _db_migrate_columns(_conn)  # идемпотентно
+        finally:
+            _DB_ADDED_COLUMNS.pop("_mig_test", None)
+            _conn.execute("DROP TABLE IF EXISTS _mig_test")
+        print("_db_migrate_columns OK")
+
+        _conn.execute(
+            "INSERT INTO mappings (id, funpay_lot_id, price_sync) VALUES (?, ?, ?)",
+            ("psync-new", "123", 0))
+        _conn.execute(
+            "INSERT INTO mappings "
+            "(id, funpay_lot_id, price_sync, last_lot_price) VALUES (?, ?, ?, ?)",
+            ("psync-disabled", "124", 0, 100))
+        _db_migrate_price_sync_defaults(_conn)
+        assert _conn.execute(
+            "SELECT price_sync FROM mappings WHERE id='psync-new'").fetchone()[0] == 1
+        assert _conn.execute(
+            "SELECT price_sync FROM mappings WHERE id='psync-disabled'").fetchone()[0] == 0
+        _conn.execute("DELETE FROM mappings WHERE id LIKE 'psync-%'")
+        print("_db_migrate_price_sync_defaults OK")
+
+        # validate_id доживает до БД и обратно
+        _m_vid = _row_to_mapping(_prepare_mapping_row({"id": "m1", "validate_id": 0}))
+        assert _m_vid["validate_id"] == 0
+        _m_vid2 = _row_to_mapping(_prepare_mapping_row({"id": "m2"}))
+        assert _m_vid2["validate_id"] == 1
+        print("mapping validate_id round-trip OK")
+
+        # --- v3.2: Steam Top-up ---
+        # amount в API — сумма пополнения, поэтому нужен множитель номинала
+        assert _units_per_item({}) == 1
+        assert _units_per_item({"units_per_item": 500}) == 500
+        for _bad in (0, -5, "abc", None, ""):
+            assert _units_per_item({"units_per_item": _bad}) == 1, _bad
+        assert _effective_units({"units_per_item": 500}, 2) == 1000
+        assert _effective_units({}, 3) == 3
+        _p = _build_fzr_payload("steam-topup", "topup", "RUB",
+                                _effective_units({"units_per_item": 500}, 1),
+                                {"steam_login": "vasya"})
+        assert _p == {"steamLogin": "vasya", "currency": "RUB", "amount": 500}, _p
+        # USD: не больше 2 знаков (требование API)
+        assert _build_fzr_payload("steam-topup", "topup", "USD", 5.129, {"steam_login": "v"})["amount"] == 5.13
+        # логин берём по ключу, а не «первым подряд»
+        _p2 = _build_fzr_payload("steam-topup", "topup", "RUB", 100,
+                                 {"comment": "быстрее", "steam_login": "real_login"})
+        assert _p2["steamLogin"] == "real_login", _p2
+        # пустой логин не уходит в API (иначе HTTP 400)
+        try:
+            _build_fzr_payload("steam-topup", "topup", "RUB", 100, {})
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "логин" in str(ex).lower()
+        print("_units_per_item / steam-topup payload OK")
+
+        # валидация логина Steam: раньше проходило "нет логина" и кириллица
+        assert _infer_validation("steam_login", "Логин Steam") == "steam_login"
+        for _good in ("vasya_pupkin", "Gaben.1", "a-b_c.d"):
+            assert not _validate_metadata_value("steam_login", _good, "steam_login"), _good
+        for _bad in ("нет логина", "Вася", "vasya pupkin", "@nick", "v", ""):
+            assert _validate_metadata_value("steam_login", _bad, "steam_login"), _bad
+        print("steam_login validation OK")
+
+        # обязательные поля по типу товара для привязок, добавленных вручную по SKU
+        assert _build_metadata_fields({"id": "x", "category_kind": "steam-topup"})[0]["key"] == "steam_login"
+        assert _build_metadata_fields({"id": "x", "fzr_sku_id": "steam-topup:topup:RUB"})[0]["key"] == "steam_login"
+        assert _build_metadata_fields({"id": "x", "category_kind": "telegram-stars"})[0]["key"] == "telegram_username"
+        assert _build_metadata_fields({"id": "x", "category_kind": "steam-gifts"})[0]["key"] == "invite_url"
+        assert _build_metadata_fields({"id": "x", "category_kind": "giftcards"}) == []
+        # если поле уже есть — не дублируем
+        _mf_dup = _build_metadata_fields({"id": "x", "category_kind": "steam-topup",
+                                          "metadata_fields": [{"key": "steam_login", "label": "Логин"}]})
+        assert len([f for f in _mf_dup if f["key"] == "steam_login"]) == 1, _mf_dup
+        print("_implicit_fields_for_kind OK")
+
+        # units_per_item доживает до БД и обратно
+        _m_upi = _row_to_mapping(_prepare_mapping_row({"id": "u1", "units_per_item": 500}))
+        assert _m_upi["units_per_item"] == 500
+        assert _row_to_mapping(_prepare_mapping_row({"id": "u2"}))["units_per_item"] == 1
+        print("mapping units_per_item round-trip OK")
+
+        # check-login: 422/404/can_refill=false блокируют, 5xx — нет
+        class _SteamAPI:
+            def __init__(self, can=True, http=None):
+                self.can, self.http = can, http
+
+            def check_steam_login(self, login):
+                if self.http:
+                    raise FazerCardsAPIError("x", status_code=self.http)
+                return {"ok": True, "can_refill": self.can}
+
+        assert _check_steam_login_if_possible(_SteamAPI(), "steam-topup",
+                                              {"steam_login": "ok"}, {}, "T") is not None
+        for _code in (400, 404, 422):
+            try:
+                _check_steam_login_if_possible(_SteamAPI(http=_code), "steam-topup",
+                                               {"steam_login": "x"}, {}, "T")
+                assert False, _code
+            except FazerCardsAPIError:
+                pass
+        for _code in (500, 502, 429):
+            assert _check_steam_login_if_possible(_SteamAPI(http=_code), "steam-topup",
+                                                  {"steam_login": "x"}, {}, "T") is None
+        try:
+            _check_steam_login_if_possible(_SteamAPI(can=False), "steam-topup",
+                                           {"steam_login": "ghost"}, {}, "T")
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "не может принять" in str(ex)
+        # другой тип товара / отключено в привязке — проверка не выполняется
+        assert _check_steam_login_if_possible(_SteamAPI(can=False), "giftcards",
+                                              {"a": "b"}, {}, "T") is None
+        assert _check_steam_login_if_possible(_SteamAPI(can=False), "steam-topup",
+                                              {"steam_login": "x"}, {"validate_id": 0}, "T") is None
+        print("_check_steam_login_if_possible OK")
+
+        # лимит числа заказов в батче
+        class _AnyAPI:
+            def create_order(self, *a, **kw):
+                return {"ok": True, "order": {"id": "x"}}
+        try:
+            _create_order_batch(_AnyAPI(), "topups", "c", "o", _MAX_BATCH_ORDERS + 1, {}, "T")
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "лимит" in str(ex)
+        print("_MAX_BATCH_ORDERS guard OK")
+
+        # фильтры списка заказов
+        _w, _p3 = _orders_filter_sql("problems")
+        assert "status IN" in _w and len(_p3) == len(_PROBLEM_STATUSES)
+        _w2, _p4 = _orders_filter_sql("active")
+        assert "status IN" in _w2 and len(_p4) == len(_ACTIVE_STATUSES)
+        # v3.9: «Все» больше не показывает заказы чужих (непривязанных) лотов
+        _wa, _pa = _orders_filter_sql("all")
+        assert "NOT IN" in _wa and _pa == list(_FOREIGN_STATUSES), (_wa, _pa)
+        _wf, _pf = _orders_filter_sql("foreign")
+        assert "status IN" in _wf and _pf == list(_FOREIGN_STATUSES)
+        assert "no_mapping" not in _PROBLEM_STATUSES, "чужие заказы снова в проблемных!"
+        assert "no_mapping" in _FOREIGN_STATUSES
+        assert _orders_filter_sql("failed") == (" WHERE status=?", ["failed"])
+        assert _short_sku("topups:mobile_legends:ml-100") == "mobile_legends / ml-100"
+        assert _short_sku(None) == "—"
+        assert "назад" in _ago(time.time() - 120) and _ago(None) == "—"
+        print("orders filters / list helpers OK")
+
+        # --- v3.2: подсказки формата и нормализация ввода ---
+        # ссылка-приглашение Steam: только s.team/p/..., профиль не подходит
+        assert _infer_validation("invite_url", "Ссылка для приглашения в Steam") == "steam_invite"
+        assert _infer_validation("invite", "Invite link") == "steam_invite"
+        _ok_invites = [
+            "https://s.team/p/abcd-1234",
+            "s.team/p/abcd-1234",
+            "http://s.team/p/fkjq-cvbn",
+            "  вот моя ссылка https://s.team/p/nnpq-fvbq спасибо  ",
+            "https://s.team/p/abcd-1234/xyzw",
+        ]
+        for _raw in _ok_invites:
+            _norm = _normalize_metadata_value("steam_invite", _raw)
+            assert _norm.startswith("https://s.team/p/"), (_raw, _norm)
+            assert not _validate_metadata_value("invite_url", _raw, "steam_invite"), _raw
+        # ссылка на профиль -> отдельное понятное сообщение
+        _prof_err = _validate_metadata_value(
+            "invite_url", "https://steamcommunity.com/id/vasya", "steam_invite")
+        assert _prof_err and "профиль" in _prof_err, _prof_err
+        for _bad in ("нет ссылки", "https://example.com/p/abc", "s.team/profiles/1", ""):
+            assert _validate_metadata_value("invite_url", _bad, "steam_invite"), _bad
+        # нормализация вытаскивает ровно ссылку, без текста вокруг
+        assert _normalize_metadata_value(
+            "steam_invite", "держи https://s.team/p/abcd-1234 !") == "https://s.team/p/abcd-1234"
+        print("steam_invite validation / normalization OK")
+
+        # прочие типы: чиним то, что чинится однозначно
+        assert _normalize_metadata_value("telegram", "@durov") == "durov"
+        assert _normalize_metadata_value("player_id", "ID: 123 456") == "123456"
+        assert _normalize_metadata_value("phone", "+7 (900) 123-45-67") == "+79001234567"
+        assert _normalize_metadata_value(
+            "steam_login", "https://steamcommunity.com/id/vasya_p") == "vasya_p"
+        # «@nick» как логин Steam НЕ принимаем (в логинах Valve нет @)
+        assert _validate_metadata_value("steam_login", "@nick", "steam_login")
+        assert not _validate_metadata_value("telegram", "@durov", "telegram")
+        assert not _validate_metadata_value("phone", "+7 (900) 123-45-67", "phone")
+        print("_normalize_metadata_value OK")
+
+        # подсказка попадает в приглашение покупателю
+        _cfg_h = create_default_config()
+        _f_inv = _make_metadata_field("invite_url", "Ссылка-приглашение Steam",
+                                      {"validation": "steam_invite"})
+        _prompt_inv = _format_metadata_prompt(_cfg_h, _f_inv)
+        assert "s.team/p/" in _prompt_inv, _prompt_inv
+        assert "Друзья" in _prompt_inv
+        # своя подсказка из каталога перекрывает типовую
+        _f_own = _make_metadata_field("invite_url", "Ссылка",
+                                      {"validation": "steam_invite", "hint": "МОЯ ПОДСКАЗКА"})
+        assert "МОЯ ПОДСКАЗКА" in _format_metadata_prompt(_cfg_h, _f_own)
+        # выключаемо настройкой
+        _cfg_h["settings"]["show_field_hints"] = False
+        assert "s.team/p/" not in _format_metadata_prompt(_cfg_h, _f_inv)
+        _cfg_h["settings"]["show_field_hints"] = True
+        # у select подсказку не добавляем: там уже до 16 строк вариантов
+        _f_sel = _make_metadata_field("server", "Server",
+                                      {"type": "select", "options": [{"label": "RU", "value": "ru"},
+                                                                     {"label": "EU", "value": "eu"}]})
+        _prompt_sel = _format_metadata_prompt(_cfg_h, _f_sel)
+        assert "номер нужного варианта" in _prompt_sel
+        # любое приглашение должно уходить ОДНИМ сообщением FunPay (лимит 20 строк)
+        for _f in (_f_inv, _f_sel,
+                   _make_metadata_field("steam_login", "Логин Steam", {"validation": "steam_login"}),
+                   _make_metadata_field("player_id", "Player ID", {"validation": "player_id"})):
+            _lines = _format_metadata_prompt(_cfg_h, _f).count("\n") + 1
+            assert _lines <= 18, (_f["key"], _lines)
+        print("_field_hint / prompt line budget OK")
+
+        # payload steam-gifts: ссылка нормализуется, пустая — падаем понятно
+        _pg = _build_fzr_payload("steam-gifts", "1245620", "440408:RU", 1,
+                                 {"invite_url": "тут s.team/p/abcd-1234"})
+        assert _pg["invite_url"] == "https://s.team/p/abcd-1234", _pg
+        assert _pg["app_id"] == 1245620 and _pg["sub_id"] == 440408 and _pg["region"] == "RU"
+        try:
+            _build_fzr_payload("steam-gifts", "1245620", "440408:RU", 1, {})
+            assert False
+        except FazerCardsAPIError as ex:
+            assert "приглашен" in str(ex).lower()
+        print("steam-gifts payload invite normalization OK")
+
+        # --- v3.4: чат ручных услуг ---
+        # свои сообщения не пересылаем покупателю обратно
+        for _s in ("you", "You", "me", "seller", "client", "buyer", "Вы", " я "):
+            assert _is_seller_message(_s.strip()), _s
+        for _s in ("executor", "support", "operator", "Иван", ""):
+            assert not _is_seller_message(_s), _s
+        # картинки: API отдаёт и image_url, и image_urls[]
+        assert _manual_images({"image_url": "a"}) == ["a"]
+        assert _manual_images({"image_urls": ["b", "c"]}) == ["b", "c"]
+        assert _manual_images({"image_url": "a", "image_urls": ["b"]}) == ["a", "b"]
+        assert _manual_images({"image_url": "a", "image_urls": ["a"]}) == ["a"]
+        assert _manual_images({}) == []
+        # хэш: одно и то же сообщение -> один ключ, разное время -> разные
+        _m1 = {"sender": "x", "body": "hi", "created_at": "t1"}
+        assert _manual_msg_hash("O1", _m1) == _manual_msg_hash("O1", dict(_m1))
+        assert _manual_msg_hash("O1", _m1) != _manual_msg_hash("O2", _m1)
+        assert _manual_msg_hash("O1", _m1) != _manual_msg_hash(
+            "O1", {"sender": "x", "body": "hi", "created_at": "t2"})
+        print("manual chat helpers OK")
+
+        # адаптивный интервал: тишина -> реже (до 8×), сообщение -> сразу
+        _cfg_mc = {"settings": {"manual_chat_interval": 60}}
+        _MANUAL_CHAT_STATE.clear()
+        assert _manual_chat_due("O1", _cfg_mc) is True
+        assert _manual_chat_due("O1", _cfg_mc) is False
+        for _ in range(5):
+            _manual_chat_mark("O1", False)
+        assert _MANUAL_CHAT_STATE["O1"]["backoff"] == _MANUAL_CHAT_MAX_BACKOFF
+        _manual_chat_mark("O1", True)
+        assert _MANUAL_CHAT_STATE["O1"]["backoff"] == 1
+        assert _manual_chat_due("O1", _cfg_mc) is True
+        # кривая настройка не приводит к опросу каждую секунду
+        _MANUAL_CHAT_STATE.clear()
+        _manual_chat_due("O2", {"settings": {"manual_chat_interval": 0}})
+        assert _MANUAL_CHAT_STATE["O2"]["next_ts"] - time.time() >= 14
+        _manual_chat_forget("O2")
+        assert "O2" not in _MANUAL_CHAT_STATE
+        print("manual chat backoff OK")
+
+        # сборка сообщения под лимит Telegram: HTML не рвём
+        _blocks = [f"<blockquote>{'x' * 500}</blockquote>" for _ in range(20)]
+        _fitted = _fit_blocks("HEAD\n", _blocks)
+        assert len(_fitted) <= 4096, len(_fitted)
+        assert _fitted.count("<blockquote>") == _fitted.count("</blockquote>")
+        assert "скрыты" in _fitted
+        assert _fit_blocks("H\n", []) == "H\n"
+        print("_fit_blocks OK")
+
+        # --- v3.5: подписка, цены, общение под категорию ---
+        # разбор даты из живого ответа API ("2026-09-17T17:38:07.847Z")
+        assert _parse_iso_dt("2026-09-17T17:38:07.847Z") is not None
+        assert _parse_iso_dt("2026-09-17T17:38:07+00:00") is not None
+        assert _parse_iso_dt("мусор") is None and _parse_iso_dt(None) is None
+        from datetime import datetime, timezone, timedelta
+        _soon = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat().replace("+00:00", "Z")
+        _left = _days_left(_soon)
+        assert _left is not None and 2.9 < _left < 3.1, _left
+        assert _days_left((datetime.now(timezone.utc) - timedelta(days=1)).isoformat()) < 0
+        assert "." in _fmt_date("2026-09-17T17:38:07.847Z")
+        print("_parse_iso_dt / _days_left OK")
+
+        # алерт о подписке: один раз на каждый порог, а не каждые 6 часов
+        _alerts: List[str] = []
+
+        class _SubAPI:
+            def __init__(self, days, active=True, renew=False):
+                self.days, self.active, self.renew = days, active, renew
+
+            def get_subscription(self):
+                exp = (datetime.now(timezone.utc) + timedelta(days=self.days)).isoformat()
+                return {"ok": True, "plan": "gold", "planExpiresAt": exp,
+                        "planAutoRenew": self.renew, "subscriptionActive": self.active}
+
+        _orig_client, _orig_notify = get_fzr_client, _notify_admin
+        globals()["_notify_admin"] = lambda c, text: _alerts.append(text)
+        _cfg_sub = create_default_config()
+        _cfg_sub["api_key"] = "k"
+        try:
+            # 10 дней при пороге 5 — молчим
+            globals()["get_fzr_client"] = lambda *a, **kw: _SubAPI(10)
+            _HEALTH_STATE["sub_checked_at"] = 0.0
+            _HEALTH_STATE["sub_alerted_day"] = None
+            _check_subscription(None, _cfg_sub, force=True)
+            assert not _alerts, _alerts
+            # 3 дня — предупреждаем, но только один раз
+            globals()["get_fzr_client"] = lambda *a, **kw: _SubAPI(3)
+            _check_subscription(None, _cfg_sub, force=True)
+            assert len(_alerts) == 1 and "3 дн." in _alerts[0], _alerts
+            assert "автопродление ВЫКЛЮЧЕНО" in _alerts[0]
+            _check_subscription(None, _cfg_sub, force=True)
+            assert len(_alerts) == 1, "повторный алерт на том же пороге"
+            # порог сменился (1 день) — новое предупреждение
+            globals()["get_fzr_client"] = lambda *a, **kw: _SubAPI(1)
+            _check_subscription(None, _cfg_sub, force=True)
+            assert len(_alerts) == 2, _alerts
+            # подписка кончилась — отдельный алерт, тоже один раз
+            globals()["get_fzr_client"] = lambda *a, **kw: _SubAPI(-1, active=False)
+            _check_subscription(None, _cfg_sub, force=True)
+            assert len(_alerts) == 3 and "неактивна" in _alerts[2], _alerts
+            _check_subscription(None, _cfg_sub, force=True)
+            assert len(_alerts) == 3
+            # интервал соблюдается: без force второй раз не ходим в API
+            _HEALTH_STATE["sub_checked_at"] = time.time()
+            assert _check_subscription(None, _cfg_sub) is None
+            # выключенный алерт молчит
+            _alerts.clear()
+            _cfg_sub["settings"]["sub_alert"] = False
+            globals()["get_fzr_client"] = lambda *a, **kw: _SubAPI(1)
+            _check_subscription(None, _cfg_sub, force=True)
+            assert not _alerts
+            print("_check_subscription OK")
+
+            # алерт о балансе: порог + кулдаун
+            class _BalAPI:
+                def __init__(self, value):
+                    self.value = value
+
+                def get_balance(self):
+                    return {"ok": True, "balance": str(self.value), "currency": "USD"}
+
+            _alerts.clear()
+            _cfg_bal = create_default_config()
+            _cfg_bal["api_key"] = "k"
+            _cfg_bal["settings"]["low_balance_threshold"] = 20.0
+            _HEALTH_STATE["balance_alerted_at"] = 0.0
+            globals()["get_fzr_client"] = lambda *a, **kw: _BalAPI(0.13)
+            assert _check_low_balance(None, _cfg_bal) == 0.13
+            assert len(_alerts) == 1 and "0.13" in _alerts[0]
+            _check_low_balance(None, _cfg_bal)
+            assert len(_alerts) == 1, "кулдаун не сработал"
+            globals()["get_fzr_client"] = lambda *a, **kw: _BalAPI(50)
+            _HEALTH_STATE["balance_alerted_at"] = 0.0
+            _check_low_balance(None, _cfg_bal)
+            assert len(_alerts) == 1
+            _cfg_bal["settings"]["low_balance_threshold"] = 0
+            assert _check_low_balance(None, _cfg_bal) is None
+            print("_check_low_balance OK")
+        finally:
+            globals()["get_fzr_client"] = _orig_client
+            globals()["_notify_admin"] = _orig_notify
+
+        # план изменения цены: порог, максимальный шаг, первая синхронизация
+        _cfg_p = create_default_config()
+        _cfg_p["settings"]["exchange_rate"] = 100.0
+        _cfg_p["settings"]["markup_percent"] = 0
+        _cfg_p["settings"]["price_round"] = 2
+        _m_p = {"id": "p1", "price_usd": "1.0", "funpay_lot_id": "1",
+                "last_price_usd": "1.0", "last_lot_price": 100.0}
+        # курс тот же, закупка та же -> менять нечего
+        _plan = _plan_price_change(_m_p, _cfg_p, "1.0")
+        assert _plan["skip"] and "порога" in _plan["skip"], _plan
+        # закупка выросла на 10% -> цена должна вырасти
+        _plan = _plan_price_change(_m_p, _cfg_p, "1.1")
+        assert _plan["skip"] is None and _plan["new"] == 110.0, _plan
+        assert abs(_plan["delta_pct"] - 10.0) < 0.01
+        assert any("закупка" in r for r in _plan["reasons"]), _plan
+        # курс вырос -> цена тоже (причина: курс)
+        _cfg_p["settings"]["exchange_rate"] = 105.0
+        _plan = _plan_price_change(_m_p, _cfg_p, "1.0")
+        assert _plan["new"] == 105.0 and _plan["skip"] is None
+        assert any("курс" in r for r in _plan["reasons"]), _plan
+        # аномальный скачок -> не применяем, помечаем на проверку
+        _cfg_p["settings"]["exchange_rate"] = 100.0
+        _plan = _plan_price_change(_m_p, _cfg_p, "2.0")
+        assert _plan.get("needs_review") and _plan["skip"], _plan
+        # лимит можно отключить
+        _cfg_p["settings"]["price_sync_max_step"] = 0
+        _plan = _plan_price_change(_m_p, _cfg_p, "2.0")
+        assert _plan["skip"] is None and _plan["new"] == 200.0
+        _cfg_p["settings"]["price_sync_max_step"] = 30.0
+        # первая синхронизация: сравнивать не с чем, но цену ставим
+        _plan = _plan_price_change({"id": "p2", "price_usd": "1.0"}, _cfg_p, None)
+        assert _plan["skip"] is None and _plan["old"] is None and _plan["new"] == 100.0
+        # нет курса -> ничего не делаем (иначе цена стала бы 0)
+        _cfg_p["settings"]["exchange_rate"] = 0
+        assert _plan_price_change(_m_p, _cfg_p, "1.0")["skip"] == "нет цены закупки или курса"
+        print("_plan_price_change OK")
+
+        # тексты под категорию
+        assert _kind_profile("steam-topup")["name"] == "пополнение Steam"
+        assert _kind_profile("неизвестно") is _KIND_PROFILE_DEFAULT
+        assert _mapping_display_name({"offer_name": "ML 100"}) == "ML 100"
+        assert _mapping_display_name({"funpay_title": "Лот"}) == "Лот"
+        assert _mapping_display_name({"fzr_sku_id": "a:b:c"}) == "a:b:c"
+        assert _mapping_display_name(None) == "ваш заказ"
+        _cfg_t = create_default_config()
+        # приветствие: название товара + предупреждение по типу
+        _greet = _greeting_text(_cfg_t, {"category_kind": "steam-topup",
+                                         "offer_name": "Steam 500₽"}, quantity=2, will_ask=True)
+        assert "Steam 500₽" in _greet and "Количество: 2" in _greet
+        assert "логином для входа" in _greet, _greet
+        assert "пару вопросов" in _greet
+        # свой шаблон привязки перекрывает общий
+        assert "ПРИВЕТ" in _greeting_text(_cfg_t, {"greeting_template": "ПРИВЕТ {sku_name}",
+                                                   "offer_name": "X"})
+        # выдача с кодом: код + как активировать
+        _d_code = _delivery_text(_cfg_t, {"category_kind": "gamekeys", "offer_name": "Ключ"},
+                                 ["AAA-BBB"], fzr_order_id="ord-1")
+        assert "AAA-BBB" in _d_code and "Активируйте ключ" in _d_code
+        # выдача без кода: НЕ должно быть «Ваш товар: —» (кода-то нет)
+        _d_topup = _delivery_text(_cfg_t, {"category_kind": "steam-topup", "offer_name": "Steam 500₽"},
+                                  [], fzr_order_id="ord-2",
+                                  metadata={"steam_login": "vasya_p"})
+        assert "Ваш товар" not in _d_topup, _d_topup
+        assert "Steam 500₽" in _d_topup and "Аккаунт Steam: vasya_p" in _d_topup
+        assert "ord-2" in _d_topup
+        # пустой список кодов у товара с кодами тоже не даёт прочерк
+        assert "Ваш товар" not in _delivery_text(_cfg_t, {"category_kind": "giftcards"}, [])
+        # свой шаблон выдачи всегда в приоритете
+        assert _delivery_text(_cfg_t, {"delivery_template": "СВОЙ {code}"}, ["Z"]) == "СВОЙ Z"
+        assert _delivered_target_line({}, {"telegram_username": "durov"}) == "Аккаунт Telegram: durov"
+        assert _delivered_target_line({}, {"weird": "v"}) == "weird: v"
+        assert _delivered_target_line({}, {}) == ""
+        print("kind profiles / delivery text OK")
+
+        # шаги диалога и счётчик вопросов
+        _f1 = _make_metadata_field("player_id", "Player ID", {"validation": "player_id"})
+        _f2 = _make_metadata_field("server", "Server", {"type": "select", "options": [
+            {"label": "RU", "value": "ru"}, {"label": "EU", "value": "eu"}]})
+        _p_first = _format_metadata_prompt(_cfg_t, _f1, {"category_kind": "topups"},
+                                          index=0, total=2)
+        assert _p_first.startswith("[1/2]"), _p_first
+        # один вопрос — счётчик не показываем
+        assert not _format_metadata_prompt(_cfg_t, _f1, None, index=0, total=1).startswith("[")
+        assert _unfilled_count([_f1, _f2], {"server": "ru"}) == 1
+        assert _unfilled_count([_f1, _f2], {}) == 2
+        # свой шаблон запроса данных у привязки (подсказка формата остаётся)
+        _p_own = _format_metadata_prompt(_cfg_t, _f1,
+                                        {"ask_template": "Для {sku_name} нужен {prompt}",
+                                         "offer_name": "ML 100"})
+        assert _p_own.startswith("Для ML 100 нужен Player ID"), _p_own
+        assert "123456789" in _p_own, "подсказка формата должна сохраниться"
+        # приглашение по-прежнему влезает в одно сообщение FunPay
+        for _f in (_f1, _f2):
+            assert _format_metadata_prompt(_cfg_t, _f, {"category_kind": "topups"},
+                                           index=0, total=2).count("\n") + 1 <= 20
+        print("dialog steps / per-mapping templates OK")
+
+        # --- v3.6: нехватка баланса -> ожидание пополнения + повтор ---
+        # распознавание ошибки «нет денег»
+        assert _is_insufficient_funds_error("HTTP 402: {...}", 402)
+        assert _is_insufficient_funds_error("insufficient funds")
+        assert _is_insufficient_funds_error("Недостаточно средств на балансе")
+        assert _is_insufficient_funds_error("x", code="INSUFFICIENT_FUNDS")
+        # ложных срабатываний быть не должно: 'balance' сам по себе — не ошибка
+        assert not _is_insufficient_funds_error("balance updated")
+        assert not _is_insufficient_funds_error("out of stock")
+        assert not _is_insufficient_funds_error("HTTP 401: invalid api key", 401)
+        assert not _is_insufficient_funds_error("")
+        print("_is_insufficient_funds_error OK")
+
+        # предпроверка баланса отдаёт типизированную ошибку с числами
+        class _PoorAPI:
+            def get_balance(self):
+                return {"balance": "0.13"}
+
+        try:
+            _preorder_balance_check(_PoorAPI(), {"price_usd": 7.36}, 1, "fp-funds")
+            raise AssertionError("должна была быть InsufficientFundsError")
+        except InsufficientFundsError as _e:
+            assert abs(_e.needed_usd - 7.36) < 0.001 and abs(_e.balance_usd - 0.13) < 0.001
+            assert abs(_e.deficit_usd - 7.23) < 0.01, _e.deficit_usd
+            assert "7.36" in str(_e)
+        # это подтип FazerCardsAPIError — старый except его тоже поймает
+        assert issubclass(InsufficientFundsError, FazerCardsAPIError)
+        # денег хватает — исключения нет
+
+        class _RichAPI:
+            def get_balance(self):
+                return {"balance": "100"}
+
+        _preorder_balance_check(_RichAPI(), {"price_usd": 7.36}, 2, "fp-ok")
+        print("InsufficientFundsError OK")
+
+        # awaiting_funds — НЕ терминальный статус, из него можно вернуться в работу
+        assert not _is_order_terminal(OrderStatus.AWAITING_FUNDS.value)
+        assert _is_order_status_transition_allowed("processing", "awaiting_funds")
+        assert _is_order_status_transition_allowed("awaiting_metadata", "awaiting_funds")
+        assert _is_order_status_transition_allowed("awaiting_funds", "processing")
+        assert _is_order_status_transition_allowed("awaiting_funds", "completed")
+        assert _is_order_status_transition_allowed("awaiting_funds", "refunded")
+        # уже выданный заказ в ожидание баланса не откатывается
+        assert not _is_order_status_transition_allowed("completed", "awaiting_funds")
+        assert "awaiting_funds" in _PROBLEM_STATUSES
+        assert _ORDER_STATUS_LABEL["awaiting_funds"] == "нужен баланс"
+        print("awaiting_funds transitions OK")
+
+        # текст дефицита для продавца
+        _d = _funds_deficit_text(7.36, 0.13)
+        assert "7.36" in _d and "0.13" in _d and "7.23" in _d, _d
+        assert "не удалось" in _funds_deficit_text(None, None)
+        # покупателю про баланс продавца НЕ пишем
+        _pub = _public_buyer_error("HTTP 402: insufficient funds")
+        assert "баланс" not in _pub.lower() and "средств" not in _pub.lower(), _pub
+        assert "задерж" in _pub.lower(), _pub
+        _tpl = DEFAULT_CONFIG["templates"]["awaiting_funds"]
+        assert "{sku_name}" in _tpl
+        for _bad in ("баланс", "ошибк", "недостаточно"):
+            assert _bad not in _tpl.lower(), _bad
+        print("funds texts OK")
+
+        # --- v3.7: интервал курса, форматирование времени, автовозврат ---
+        assert _fmt_minutes(45) == "45 мин"
+        assert _fmt_minutes(60) == "1 ч"
+        assert _fmt_minutes(150) == "2 ч 30 мин"
+        assert _fmt_minutes(1440) == "1 д"
+        assert _fmt_minutes(1500) == "1 д 1 ч"
+        assert _fmt_minutes(0) == "выключено"
+        assert _fmt_minutes(None) == "выключено"
+        assert _fmt_minutes("abc") == "—"
+        assert _duration(30) == "30 с" and _duration(3600) == "1 ч"
+        assert "назад" not in _duration(7200)
+        print("_fmt_minutes / _duration OK")
+
+        # дедлайн возврата считается от момента постановки в очередь
+        _cfg_ref = {"settings": {"funds_auto_refund": True, "funds_refund_after": 60}}
+        _order_ref = {"funpay_order_id": "x", "funds": {"since": 1000.0}, "created_at": 500.0}
+        assert _funds_refund_deadline(_cfg_ref, _order_ref) == 1000.0 + 3600
+        # выключенный автовозврат и нулевой срок = дедлайна нет
+        assert _funds_refund_deadline({"settings": {"funds_auto_refund": False,
+                                                    "funds_refund_after": 60}}, _order_ref) is None
+        assert _funds_refund_deadline({"settings": {"funds_auto_refund": True,
+                                                    "funds_refund_after": 0}}, _order_ref) is None
+        # без funds берём created_at, чтобы старые заказы не висели вечно
+        assert _funds_refund_deadline(_cfg_ref, {"funds": {}, "created_at": 500.0}) == 500.0 + 3600
+        assert _funds_refund_due(_cfg_ref, {"funds": {"since": time.time() - 7200}})
+        assert not _funds_refund_due(_cfg_ref, {"funds": {"since": time.time()}})
+        print("_funds_refund_deadline OK")
+
+        # шаблон возврата: покупателю без внутренних причин
+        _rt = DEFAULT_CONFIG["templates"]["refunded"]
+        assert "{sku_name}" in _rt and "возврат" in _rt.lower()
+        for _bad in ("баланс fazercards", "недостаточно", "402", "insufficient"):
+            assert _bad not in _rt.lower(), _bad
+        print("refund template OK")
+
+        # название лота: пропуск подставляет осмысленный fallback
+        assert _fzr_effective_title({"title_ru": "Моё название"}) == "Моё название"
+        assert _fzr_effective_title({"title_ru": "", "offer_name": "ML 500"}) == "ML 500"
+        assert _fzr_effective_title({"offer_name": "", "subcat_name": "ML, Алмазы"}) == "ML, Алмазы"
+        assert _fzr_effective_title({"sku": "topups:a:b"}) == "topups:a:b"
+        assert _fzr_effective_title({}) == ""
+        # длинное название режется под лимит FunPay
+        assert len(_fzr_effective_title({"title_ru": "д" * 900})) == 500
+        # build_lot_fields сам подставляет EN из RU и никогда не падает
+        _lf = _fzr_build_lot_fields({"title_ru": "", "offer_name": "ML 500", "price": 10})
+        assert _lf["title_ru"] == "ML 500" and _lf["title_en"] == "ML 500"
+        print("_fzr_effective_title OK")
+
+        # состояния мастера не сбрасываются на «безопасных» callback-ах
+        for _act in ("catalog", "catalog_select", "create_lot_sku_catalog",
+                     "create_lot_psync", "create_lot_go", "create_lot_skip_title",
+                     "create_lot_skip_sku", "lotcustom"):
+            assert _act in _STATE_PRESERVING_ACTIONS, _act
+        # а обычные разделы состояние чистят
+        for _act in ("menu", "settings", "orders", "mappings"):
+            assert _act not in _STATE_PRESERVING_ACTIONS, _act
+        print("_STATE_PRESERVING_ACTIONS OK")
+
+        # --- v3.8: экспорт/импорт ---
+        assert _detect_export_kind({"kind": _EXPORT_KIND_FULL, "config": {}, "mappings": []}) \
+            == _EXPORT_KIND_FULL
+        assert _detect_export_kind({"config": {}}) == _EXPORT_KIND_SETTINGS
+        assert _detect_export_kind({"mappings": []}) == _EXPORT_KIND_MAPPINGS
+        # kind не подтверждён содержимым — доверяем содержимому
+        assert _detect_export_kind({"kind": _EXPORT_KIND_MAPPINGS, "config": {}}) \
+            == _EXPORT_KIND_SETTINGS
+        # старый формат: сырой config.json без конверта
+        assert _detect_export_kind({"settings": {"a": 1}}) == _EXPORT_KIND_SETTINGS
+        assert _detect_export_kind({"templates": {}}) == _EXPORT_KIND_SETTINGS
+        # мусор не опознаём
+        assert _detect_export_kind({}) is None
+        assert _detect_export_kind({"hello": "world"}) is None
+        print("_detect_export_kind OK")
+
+        # валидация настроек: чужие ключи и значения вне границ выкидываем
+        _clean, _warns = _validate_import_settings({
+            "settings": {"markup_percent": 15, "max_quantity": 10 ** 9,
+                         "unknown_key": 1, "poll_interval": "7",
+                         "notify_on_error": 0},
+            "templates": {"delivery": "x", "alien": "y"},
+            "base_url": "not-a-url",
+            "api_key": "k",
+        })
+        assert _clean["settings"]["markup_percent"] == 15.0
+        assert _clean["settings"]["poll_interval"] == 7           # строка -> int
+        assert _clean["settings"]["notify_on_error"] is False     # 0 -> bool
+        assert "max_quantity" not in _clean["settings"]           # вне границ
+        assert "unknown_key" not in _clean["settings"]
+        assert _clean["templates"] == {"delivery": "x"}
+        assert "base_url" not in _clean
+        assert _clean["api_key"] == "k"
+        assert len(_warns) >= 3, _warns
+        print("_validate_import_settings OK")
+
+        # валидация привязок: SKU обязателен, id генерируем, дубли расшиваем
+        _maps, _mw = _validate_import_mappings([
+            {"fzr_sku_id": "topups:g:o", "markup_percent": 0},
+            {"category_kind": "topups", "category_id": "g2", "offer_id": "o2"},
+            {"offer_name": "без sku"},
+            {"fzr_sku_id": "мусор"},
+            "не dict",
+            {"id": "dup", "fzr_sku_id": "topups:g:a"},
+            {"id": "dup", "fzr_sku_id": "topups:g:b"},
+        ])
+        assert len(_maps) == 4, [m["fzr_sku_id"] for m in _maps]
+        assert _maps[1]["fzr_sku_id"] == "topups:g2:o2"     # собрали из частей
+        assert _maps[0]["markup_percent"] == 0.0            # ноль сохранён
+        assert len({m["id"] for m in _maps}) == 4           # id уникальны
+        assert len(_mw) == 2, _mw
+        print("_validate_import_mappings OK")
+
+        # ключ сопоставления — SKU без регистра
+        assert _mapping_import_key({"fzr_sku_id": " Topups:G:O "}) == "topups:g:o"
+        # конверт содержит версию формата и версию плагина
+        _env = _export_envelope(_EXPORT_KIND_FULL)
+        assert _env["version"] == _EXPORT_FORMAT_VERSION and _env["plugin_version"] == VERSION
+        # экспорт привязки не тащит волатильные поля и сохраняет None-наценку
+        _exp = _export_mapping({"id": "x", "fzr_sku_id": "s", "stock": 5,
+                                "price_synced_at": 1.0, "markup_percent": None,
+                                "markup_fixed": 0, "funpay_lot_id": "123",
+                                "funpay_title": "Мой лот", "offer_name": "ML 500"})
+        assert "stock" not in _exp and "price_synced_at" not in _exp
+        assert _exp["markup_percent"] is None and _exp["markup_fixed"] == 0.0
+        # v3.9: человекочитаемые поля идут первыми — файл правят руками
+        assert list(_exp)[:3] == ["funpay_lot_title", "funpay_lot_id", "funpay_lot_url"]
+        assert _exp["funpay_lot_title"] == "Мой лот" and _exp["fzr_offer_name"] == "ML 500"
+        assert _exp["funpay_lot_url"] == "https://funpay.com/lots/offer?id=123"
+        assert "funpay_title" not in _exp, "техполе дублирует название лота"
+        # живое название лота из профиля перекрывает сохранённое в привязке
+        _lots = {"by_id": {"123": {"title": "Новое имя лота",
+                                   "subcategory_name": "ML, Алмазы"}},
+                 "by_title": {"новое имя лота": ["123"]}}
+        _exp2 = _export_mapping({"fzr_sku_id": "s", "funpay_lot_id": "123",
+                                 "funpay_title": "Старое имя"}, _lots)
+        assert _exp2["funpay_lot_title"] == "Новое имя лота"
+        assert _exp2["funpay_subcategory_name"] == "ML, Алмазы"
+        assert _lot_url(None) == ""
+
+        # v3.9: подбор лота при импорте
+        # ID есть и существует
+        assert _resolve_import_lot({"funpay_lot_id": "123"}, _lots)[:2] == ("123", "id")
+        # ID нет на аккаунте, но название совпало — берём найденный лот
+        _r = _resolve_import_lot({"funpay_lot_id": "999",
+                                  "_wanted_lot_title": "Новое имя лота"}, _lots)
+        assert _r[0] == "123" and _r[1] == "by_title", _r
+        # ID стёрли (null) — ищем только по названию
+        _r = _resolve_import_lot({"funpay_lot_id": None,
+                                  "_wanted_lot_title": "новое ИМЯ лота"}, _lots)
+        assert _r[0] == "123" and _r[1] == "by_title", _r
+        # ни ID, ни названия — привязку придётся выключить
+        assert _resolve_import_lot({}, _lots)[1] == "missing"
+        # название неоднозначно — сами не выбираем
+        _dup = {"by_id": {"1": {"title": "Дубль"}, "2": {"title": "Дубль"}},
+                "by_title": {"дубль": ["1", "2"]}}
+        assert _resolve_import_lot({"_wanted_lot_title": "Дубль"}, _dup)[1] == "ambiguous"
+        # список лотов недоступен — верим файлу, а не выключаем всё
+        assert _resolve_import_lot({"funpay_lot_id": "555"},
+                                   {"by_id": {}, "by_title": {}})[:2] == ("555", "id")
+        # ссылка вместо ID и стёртый ID разбираются при валидации
+        _mm, _ = _validate_import_mappings([
+            {"fzr_sku_id": "topups:g:o",
+             "funpay_lot_id": "https://funpay.com/lots/offer?id=4242",
+             "funpay_lot_title": "  Лот с пробелами  "},
+            {"fzr_sku_id": "topups:g:o2", "funpay_lot_id": None,
+             "funpay_lot_title": "Только название"},
+            {"fzr_sku_id": "topups:g:o3"},
+        ])
+        assert _mm[0]["funpay_lot_id"] == "4242"
+        assert _mm[0]["funpay_title"] == "Лот с пробелами"
+        assert _mm[1]["funpay_lot_id"] is None and _mm[1]["_lot_specified"] is True
+        # про лот в файле не сказано вообще — лот существующей привязки не трогаем
+        assert _mm[2]["_lot_specified"] is False
+        print("export/import lot mapping OK")
+        # v3.10: при импорте подставляем ЖИВЫЕ название и подкатегорию лота —
+        # заказ матчится по названию, поэтому текст из файла доверять нельзя
+        _inc = {"funpay_lot_id": "123", "_wanted_lot_title": "что попало"}
+        _lid, _st, _note = _resolve_import_lot(_inc, _lots)
+        assert _lid == "123" and _st == "id"
+        assert _inc["_resolved_lot_title"] == "Новое имя лота", _inc
+        assert "_resolved_subcategory_id" not in _inc   # в _lots подкатегории нет
+        _lots2 = {"by_id": {"123": {"title": "Живое имя", "subcategory_id": 1055}},
+                  "by_title": {"живое имя": ["123"]}}
+        _inc2 = {"funpay_lot_id": None, "_wanted_lot_title": "Живое ИМЯ"}
+        assert _resolve_import_lot(_inc2, _lots2)[0] == "123"
+        assert _inc2["_resolved_lot_title"] == "Живое имя"
+        assert _inc2["_resolved_subcategory_id"] == 1055
+
+        # текст экрана «Проверить выдачу» на всех ветках
+        assert "проверять нечего" in _readiness_text({"ok": [], "problems": [], "lots_known": 3})
+        _rep_ok = {"ok": [("Товар", "Лот 1")], "problems": [], "lots_known": 2}
+        assert "Готовы к выдаче: <b>1</b>" in _readiness_text(_rep_ok)
+        assert "Не сработают" not in _readiness_text(_rep_ok)
+        _rep_bad = {"ok": [], "lots_known": 2,
+                    "problems": [("Товар", "no_match", "не сойдётся"),
+                                 ("Товар2", "lot_gone", "лота нет")]}
+        _txt = _readiness_text(_rep_bad)
+        assert "Не сработают: <b>2</b>" in _txt and "не опознаётся" in _txt
+        assert "недоступен" in _readiness_text({"ok": [], "problems": [], "lots_known": 0})
+        for _t in (_readiness_text(_rep_ok), _txt):
+            for _tag in ("b", "i"):
+                assert _t.count(f"<{_tag}>") == _t.count(f"</{_tag}>"), _tag
+            assert _t.count("<blockquote") == _t.count("</blockquote>")
+            assert len(_t) <= 4096
+        print("readiness screen OK")
+
+        # --- v3.11: ни слова о поставщике в чате покупателя ---
+        # номер заказа сохраняем, бренд убираем
+        assert _scrub_buyer_text("Заказ FazerCards: ord-1") == "Номер заказа: ord-1"
+        assert _scrub_buyer_text("Куплено на FazerCards") == ""
+        assert _scrub_buyer_text("Заказ в ФазерКардс оформлен") == "Заказ оформлен"
+        assert _scrub_buyer_text("fzr_order_id: 42") == "номер заказа: 42"
+        assert _scrub_buyer_text("Ваш заказ FZR-99") == "Ваш заказ 99"
+        # «закупка» и «поставщик» — с сохранением падежа
+        assert _scrub_buyer_text("Оформляю закупку, ждите") == "Оформляю выдачу, ждите"
+        assert _scrub_buyer_text("Закупка задерживается") == "Выдача задерживается"
+        assert _scrub_buyer_text("Пишу поставщику") == "Пишу сервису"
+        assert _scrub_buyer_text("Ответ от поставщика") == "Ответ от сервиса"
+        # ссылки на инфраструктуру поставщика вырезаются, обычные — нет
+        assert _scrub_buyer_text("Тут: https://cdn.fazercards.com/a.png") \
+            == "Тут: [ссылка скрыта]"
+        assert _scrub_buyer_text("Тут: https://api.fzr.cards/v2") == "Тут: [ссылка скрыта]"
+        assert _scrub_buyer_text("Пруф: https://imgur.com/ok.png") \
+            == "Пруф: https://imgur.com/ok.png"
+        # чистый текст не портим, переводы строк не слипаются
+        _clean = "Спасибо за покупку!\n\nВаш ключ: ABC-123\nХорошей игры!"
+        assert _scrub_buyer_text(_clean) == _clean
+        assert _scrub_buyer_text("") == "" and _scrub_buyer_text(None) is None
+        # после чистки ничего запрещённого не остаётся — на всех примерах
+        for _probe in ("FazerCards", "fazer cards", "ФазерКардс", "FZR-1",
+                       "закупка", "закупкой", "поставщика",
+                       "Заказ FazerCards: ord-9",
+                       "оформляю закупку на FazerCards"):
+            assert not _buyer_text_leaks(_scrub_buyer_text(_probe)), _probe
+        # дефолтные шаблоны покупателю чисты изначально
+        for _name, _tpl in DEFAULT_CONFIG["templates"].items():
+            assert not _buyer_text_leaks(_tpl), (_name, _tpl)
+        print("buyer privacy filter OK")
+
+        # --- v3.12: «Наличие» при создании лота ---
+        # форма разобрана и поля нет -> не спрашиваем и не отправляем
+        assert _fzr_needs_amount({"form_amount": None}) is False
+        # форму не разбирали -> считаем, что поле есть (безопасный вариант)
+        assert _fzr_needs_amount({}) is True
+        assert _fzr_needs_amount({"form_amount": {"present": True}}) is True
+        _f = _fzr_build_lot_fields({"title_ru": "T", "price": 100.0,
+                                    "form_amount": {"present": True, "required": True}})
+        # встроенную автовыдачу FunPay не включаем: с ней наличие считается
+        # по «секретам», которых у нас нет, и лот не сохраняется
+        assert _f["auto_delivery"] is False and _f["amount"] == _AMOUNT_DEFAULT
+        assert _fzr_build_lot_fields({"title_ru": "T", "price": 1, "amount": 5,
+                                      "form_amount": {"present": True}})["amount"] == 5
+        assert _fzr_build_lot_fields({"title_ru": "T", "price": 1,
+                                      "form_amount": None})["amount"] is None
+        # мусор и выход за границы не должны ломать создание
+        for _bad, _want in (("абв", _AMOUNT_DEFAULT), (None, _AMOUNT_DEFAULT),
+                            (0, 1), (10 ** 9, _AMOUNT_MAX)):
+            assert _fzr_build_lot_fields({"title_ru": "T", "price": 1, "amount": _bad,
+                                          "form_amount": {"present": True}})["amount"] == _want, _bad
+        # ответ FunPay «Заполните все поля» превращаем в конкретный совет
+        assert "Наличие" in _lot_save_hint("Не удалось сохранить лот 0: Заполните все поля.")
+        assert "цена" in _lot_save_hint("Минимальная цена — 50").lower()
+        assert "сессия" in _lot_save_hint("csrf token invalid").lower()
+        assert _lot_save_hint("что-то другое") == "" and _lot_save_hint(None) == ""
+        print("lot amount OK")
+
+        # --- v3.13: заказ опознаётся по лоту аккаунта ---
+        # количество FunPay вставляет внутрь описания заказа — убираем
+        assert _strip_amount_token("RUB, По логину, 13 шт., login") == "RUB, По логину, login"
+        assert _strip_amount_token("ML 500 алмазов, 2 шт.") == "ML 500 алмазов"
+        assert _strip_amount_token("Что-то, 1 pcs., x") == "Что-то, x"
+        assert _strip_amount_token("Без количества") == "Без количества"
+        assert _strip_amount_token("") == ""
+        # варианты описания лота: одиночный компонент только когда он один
+        _v = _lot_desc_variants({"server": "RUB", "side": "По логину", "title": "Steam RUB"})
+        assert _v[0] == "rub, по логину, steam rub"
+        assert "rub, по логину" in _v
+        assert "rub" not in _v and "steam rub" not in _v, _v
+        assert _lot_desc_variants({"title": "ML 500"}) == ["ml 500"]
+        assert "rub" in _lot_desc_variants({"server": "RUB", "title": "Steam"})
+        assert _lot_desc_variants({}) == []
+        # ID лота из события FunPayCardinal имеет приоритет
+        class _E:
+            pass
+        _e = _E()
+        _e.order = None
+        _e.lot_id = 42
+        assert _order_lot_id_from_event(_e) == 42
+        _e2 = _E()
+        _e2.order = None
+        _e2.lot_shortcut = type("L", (), {"id": 77})()
+        assert _order_lot_id_from_event(_e2) == 77
+        _e3 = _E()
+        _e3.order = type("O", (), {"offer_id": 5})()
+        assert _order_lot_id_from_event(_e3) == 5
+        _e4 = _E()
+        _e4.order = type("O", (), {})()
+        assert _order_lot_id_from_event(_e4) is None
+        # без Cardinal опознание лота не выполняется и ничего не падает
+        assert _resolve_order_lot_ids(None, type("O", (), {"description": "x"})()) == []
+        print("order matching OK")
+
+        # имена файлов различимы и заканчиваются .json
+        _names = {_export_filename(k) for k in _EXPORT_KINDS}
+        assert len(_names) == 3 and all(n.endswith(".json") for n in _names)
+        print("export helpers OK")
+
+        # state machine
+        assert _is_order_status_transition_allowed("pending", "completed") is True
+        assert _is_order_status_transition_allowed("failed", "processing") is False
+        print("_is_order_status_transition_allowed OK")
+
+        # quantity check
+        assert _preorder_quantity_check({"amount": 2}, 100, {"min_quantity": 1, "max_quantity": 10, "stock": 5}) == 2
+        try:
+            _preorder_quantity_check({"amount": 20}, 100, {"min_quantity": 1, "max_quantity": 10, "stock": 5})
+            assert False
+        except FazerCardsAPIError:
+            pass
+        print("_preorder_quantity_check OK")
+
+        # balance check
+        class FakeBal:
+            def get_balance(self):
+                return {"balance": 1.0}
+        try:
+            _preorder_balance_check(FakeBal(), {"price_usd": 2.0}, 1, "fp1")
+            assert False
+        except FazerCardsAPIError:
+            pass
+        print("_preorder_balance_check OK")
+
+        # DB force update
+        _db_insert_order({
+            "funpay_order_id": "fp1", "status": "failed", "buyer_id": 1, "buyer_username": "u", "chat_id": "c",
+            "quantity": 1, "order_info": {},
+        })
+        updated = _db_force_update_order("fp1", status="processing", error="")
+        assert updated
+        print("_db_force_update_order OK")
+
+        # redact sensitive
+        assert "***" in _redact_sensitive("api_key=secret_value_here")
+        assert "***" in _redact_sensitive("Authorization: Bearer abcdef123456")
+        print("_redact_sensitive OK")
+
+        # split telegram text keeps tags on same line
+        long_text = "<b>" + "word " * 2000 + "</b>"
+        chunks = _split_telegram_text(long_text, max_len=100)
+        for ch in chunks:
+            assert "<" not in ch or ch.count("<") == ch.count(">")
+        print("_split_telegram_text OK")
+
+        # callback token persistence
+        packed = _pack_callback_data("x" * 100)
+        assert packed.startswith(f"{CB_PREFIX}:t:")
+        unpacked = _unpack_callback_data(packed)
+        assert unpacked == "x" * 100
+        print("_pack_callback_data / _unpack_callback_data OK")
+
+        # out of stock detection
+        assert _is_out_of_stock_error("out of stock")
+        assert not _is_out_of_stock_error("insufficient funds")
+        print("_is_out_of_stock_error OK")
+
+        # LRU catalog cache basic
+        from collections import OrderedDict
+        _CATALOG_CACHE.clear()
+        for i in range(_CATALOG_CACHE_MAX_SIZE + 10):
+            _CATALOG_CACHE[("k", str(i), None)] = (time.time() + i, {"i": i})
+        _prune_catalog_cache(time.time() + _CATALOG_CACHE_TTL + 1)
+        assert len(_CATALOG_CACHE) <= _CATALOG_CACHE_MAX_SIZE
+        print("_prune_catalog_cache LRU OK")
+
+        # --- v3.14: подтверждение данных покупателем (+/-) ---
+        assert _parse_yes_no("+") is True
+        assert _parse_yes_no("да") is True and _parse_yes_no("Да!") is True
+        assert _parse_yes_no("+++") is True and _parse_yes_no("верно") is True
+        assert _parse_yes_no("👍") is True and _parse_yes_no("ok") is True
+        assert _parse_yes_no("-") is False and _parse_yes_no("нет") is False
+        assert _parse_yes_no("неверно") is False and _parse_yes_no("исправить") is False
+        assert _parse_yes_no("❌") is False
+        # длинные тексты и значения НЕ считаем ответом «да/нет»
+        assert _parse_yes_no("vasya_pupkin") is None
+        assert _parse_yes_no("+79001234567") is None, "телефон это не «да»"
+        assert _parse_yes_no("-500") is None, "отрицательное число это не «нет»"
+        assert _parse_yes_no("") is None and _parse_yes_no("   ") is None
+        print("_parse_yes_no OK")
+
+        # болтовня: приветствия игнорируем, но значения — никогда
+        for _t in ("привет", "Привет!", "здравствуйте", "спасибо", "спс", "?", "??",
+                   "hi", "hello", "ку", "жду", "долго"):
+            assert _is_smalltalk(_t), _t
+        for _t in ("1", "2", "76561198000000000", "vasya_pupkin", "EU", "RU",
+                   "s.team/p/ab-cd", "ML500"):
+            assert not _is_smalltalk(_t), _t
+        assert _strip_smalltalk_prefix("Привет, vasya_pupkin") == "vasya_pupkin"
+        assert _strip_smalltalk_prefix("Здравствуйте! 76561198000000000") == "76561198000000000"
+        assert _strip_smalltalk_prefix("vasya_pupkin") == "vasya_pupkin"
+        # если после снятия приветствия пусто — отдаём исходник (его отфильтруют)
+        assert _strip_smalltalk_prefix("привет") == "привет"
+        print("_is_smalltalk / _strip_smalltalk_prefix OK")
+
+        # значение внутри фразы вытаскиваем только когда оно однозначно
+        assert _extract_latin_token("мой логин vasya_pupkin") == "vasya_pupkin"
+        assert _extract_latin_token("vasya_pupkin") == "vasya_pupkin"
+        assert _extract_latin_token("vasya или petya") is None, "два кандидата — не угадываем"
+        assert _extract_latin_token("логин: только по-русски") is None
+        # смешанное слово НЕ режем: «vasyа_pupkin» с русской «а» -> не vasya_pupkin,
+        # иначе пополнение уйдёт на чужой существующий аккаунт
+        assert _extract_latin_token("vasyа_pupkin") is None
+        assert _extract_latin_token("логин vаsya") is None
+        assert _normalize_metadata_value("steam_login", "Привет, логин vasya_2") == "vasya_2"
+        assert _normalize_metadata_value("steam_login", "vasyа_pupkin") == "vasyа_pupkin"
+        print("_extract_latin_token OK")
+
+        # кириллица: латинские поля защищены, остальные — нет
+        _cyr = _cyrillic_problem("vasyа_pupkin", "steam_login")   # 'а' русская
+        assert _cyr and "русские буквы" in _cyr and "vasya_pupkin" in _cyr, _cyr
+        assert _cyrillic_problem("vasya_pupkin", "steam_login") is None
+        assert _cyrillic_problem("Европа", "select") is None, "варианты select бывают русскими"
+        assert _cyrillic_problem("По логину", "nonempty") is None
+        assert _validate_metadata_value("steamLogin", "vasyа", "steam_login")
+        # значение внутри русской фразы ошибкой не считается
+        assert not _validate_metadata_value(
+            "invite", "вот моя ссылка https://s.team/p/nnpq-fvbq спасибо", "steam_invite")
+        print("_cyrillic_problem OK")
+
+        # тексты подтверждения: plain text и один Cardinal.send_message
+        _fld = {"key": "steamLogin", "label": "Логин Steam"}
+        _q = _confirm_question(_fld, "vasya_pupkin")
+        assert "vasya_pupkin" in _q and "+" in _q and "-" in _q
+        _sum = _summary_question(
+            [{"key": "server", "label": "Server"}, _fld],
+            {"server": "EU", "steamLogin": "vasya"}, {"server": "Europe"})
+        assert "Europe" in _sum and "vasya" in _sum
+        _big_sum = _summary_question(
+            [{"key": f"f{i}", "label": f"Поле {i}"} for i in range(20)],
+            {f"f{i}": f"v{i}" for i in range(20)})
+        for _t in (_q, _sum, _big_sum, _cyr):
+            assert "<b>" not in _t and "<code>" not in _t, _t
+            assert _t.count("\n") + 1 <= 19, _t     # +1 строка на watermark ядра
+            assert not _buyer_text_leaks(_scrub_buyer_text(_t)), _t
+        print("confirm/summary texts OK")
+
+        # --- v3.14: ускорение опроса ---
+        _c = {"settings": {"poll_interval": 30, "poll_interval_fast": 2,
+                           "poll_fast_attempts": 12}}
+        assert _poll_delay(_c, 1) == 2.0 and _poll_delay(_c, 12) == 2.0
+        assert _poll_delay(_c, 13) == 30.0
+        # выключенное ускорение и мусор в настройках
+        assert _poll_delay({"settings": {"poll_interval": 7, "poll_fast_attempts": 0}}, 1) == 7.0
+        assert _poll_delay({"settings": {}}, 1) >= 1.0
+        assert _poll_delay({"settings": {"poll_interval": "x", "poll_interval_fast": "y"}}, 1) >= 1.0
+        # быстрый интервал не может быть больше обычного
+        assert _poll_delay({"settings": {"poll_interval": 1, "poll_interval_fast": 5,
+                                         "poll_fast_attempts": 5}}, 1) == 1.0
+        print("_poll_delay OK")
+
+        # --- v3.14: скользящий таймаут диалога ---
+        _now = time.time()
+        # покупатель отвечал 10 с назад, заказ создан 10 мин назад -> диалог жив
+        _p = {"created_at": _now - 600, "data": {"prompt_sent_at": _now - 600,
+                                                 "last_buyer_msg_at": _now - 10}}
+        assert _now - _dialog_last_activity(_p, _now) < 15
+        # ничего не писали -> считаем от создания
+        _p2 = {"created_at": _now - 400, "data": {}}
+        assert 395 < _now - _dialog_last_activity(_p2, _now) < 405
+        # часы из будущего не должны давать отрицательный возраст
+        _p3 = {"created_at": _now + 999, "data": {"prompt_sent_at": _now + 999}}
+        assert _dialog_last_activity(_p3, _now) <= _now
+        print("_dialog_last_activity OK")
+
+        # created_at диалога не переписывается при обновлении (нужен для потолка)
+        _db_upsert_pending({"funpay_order_id": "T-1", "buyer_id": 1, "chat_id": 2,
+                            "mapping_id": "m", "step": "await_metadata", "data": {}})
+        _db_connect().execute("UPDATE pending_dialogs SET created_at=? WHERE funpay_order_id=?",
+                              (_now - 5000, "T-1"))
+        _db_upsert_pending({"funpay_order_id": "T-1", "buyer_id": 1, "chat_id": 2,
+                            "mapping_id": "m", "step": "await_metadata",
+                            "data": {"metadata_index": 1}})
+        _row = _db_connect().execute(
+            "SELECT created_at FROM pending_dialogs WHERE funpay_order_id='T-1'").fetchone()
+        assert _row[0] < _now - 4000, _row[0]
+        # флаг напоминания снимается, когда покупатель ответил
+        _db_update_pending_reminded("T-1")
+        assert _db_connect().execute(
+            "SELECT reminded_at FROM pending_dialogs WHERE funpay_order_id='T-1'").fetchone()[0]
+        _db_clear_pending_reminded("T-1")
+        assert _db_connect().execute(
+            "SELECT reminded_at FROM pending_dialogs WHERE funpay_order_id='T-1'").fetchone()[0] is None
+        _db_remove_pending("T-1")
+        print("pending created_at / reminded_at OK")
+
+        # --- v3.14: чат ручных услуг ---
+        _cfg_grace = {"settings": {"manual_chat_grace_hours": 24}}
+        assert _manual_chat_grace(_cfg_grace) == 24 * 3600
+        assert _manual_chat_grace({"settings": {"manual_chat_grace_hours": 0}}) == 24 * 3600
+        assert _manual_chat_grace({"settings": {"manual_chat_grace_hours": 500}}) == 168 * 3600
+        assert _manual_chat_grace({"settings": {"manual_chat_grace_hours": "мусор"}}) == 24 * 3600
+        # минимальный интервал опроса опущен до 5 с
+        _MANUAL_CHAT_STATE.clear()
+        assert _manual_chat_due("MC1", {"settings": {"manual_chat_interval": 1}})
+        assert _MANUAL_CHAT_STATE["MC1"]["next_ts"] - time.time() >= 4
+        _MANUAL_CHAT_STATE.clear()
+        assert _MANUAL_CHAT_MAX_BACKOFF == 4
+        print("_manual_chat_grace / _manual_chat_due OK")
+
+        # --- v3.14: миграция настроек 3.13 -> 3.14 ---
+        _old = {"settings": {"dialog_timeout": 300, "dialog_reminder": 120}}
+        assert _migrate_v314_settings(_old) is True
+        assert _old["settings"]["dialog_timeout"] == 900
+        assert _old["settings"]["dialog_reminder"] == 180
+        assert _migrate_v314_settings(_old) is False, "миграция должна быть однократной"
+        # своё значение продавца не трогаем
+        _custom = {"settings": {"dialog_timeout": 600, "dialog_reminder": 240}}
+        _migrate_v314_settings(_custom)
+        assert _custom["settings"]["dialog_timeout"] == 600
+        assert _custom["settings"]["dialog_reminder"] == 240
+        # служебный флаг лежит вне settings, значит не попадёт в экспорт
+        assert "_v314_timeouts_migrated" not in _custom["settings"]
+        assert _custom["_migrations"]["v314_timeouts"] is True
+        _exp = _export_settings_payload({"settings": _custom["settings"],
+                                         "_migrations": _custom["_migrations"],
+                                         "templates": {}}, with_secrets=False)
+        assert "_migrations" not in json.dumps(_exp)
+        print("_migrate_v314_settings OK")
+
+        # --- v3.15: навигация мастера создания лота ---
+        _wiz = {"state": "create_lot_confirm",
+                "data": {"custom_fields": [{"name": "region"}],
+                         "form_amount": {"present": True, "required": True}}}
+        assert _wizard_prev_step(_wiz) == "create_lot_sku"
+        _wiz["state"] = "create_lot_sku"
+        assert _wizard_prev_step(_wiz) == "create_lot_amount"
+        # поля «Наличие» в форме нет -> шаг перепрыгивается
+        _wiz["data"]["form_amount"] = None
+        assert _wizard_prev_step(_wiz) == "create_lot_price"
+        # доп. полей нет -> с названия назад некуда
+        _wiz["state"] = "create_lot_title_ru"
+        _wiz["data"]["custom_fields"] = []
+        assert _wizard_prev_step(_wiz) is None
+        assert _wizard_back_button(_wiz) is None
+        # доп. поля есть -> «Назад» появляется
+        _wiz["data"]["custom_fields"] = [{"name": "region"}]
+        assert _wizard_prev_step(_wiz) == "create_lot_custom"
+        assert _wizard_back_button(_wiz) is not None
+        # названия пропущены -> с описания RU назад некуда
+        _wiz["state"] = "create_lot_desc_ru"
+        _wiz["data"]["title_skipped"] = True
+        _wiz["data"]["custom_fields"] = []
+        assert _wizard_prev_step(_wiz) is None
+        # цикл в цепочке шагов не должен вешать функцию
+        assert _wizard_prev_step({"state": "нет такого шага", "data": {}}) is None
+        print("_wizard_prev_step OK")
+
+        # клавиатура шага: «Отмена» всегда, «Назад» — только если есть куда
+        _kb = _wizard_kb({"state": "create_lot_price",
+                          "data": {"custom_fields": [{"name": "x"}]}})
+        _labels = [b.text for row in _kb.keyboard for b in row]
+        assert any("Отмена" in t for t in _labels), _labels
+        assert any("Назад" in t for t in _labels), _labels
+        _kb2 = _wizard_kb({"state": "create_lot_custom", "data": {}})
+        _labels2 = [b.text for row in _kb2.keyboard for b in row]
+        assert not any("Назад" in t for t in _labels2), _labels2
+        print("_wizard_kb OK")
+
+        # мастер, спрятанный в состоянии поиска, находится и по нему считается экран
+        _search_state = {"state": "search", "data": {"wizard": {
+            "state": "create_lot_sku", "data": {"screen_msg_id": 7}}}}
+        assert _screen_data(_search_state) == {"screen_msg_id": 7}
+        assert _screen_data({"state": "create_lot_sku", "data": {"a": 1}}) == {"a": 1}
+        assert _screen_data(None) is None
+        assert _screen_data({"state": "search", "data": {"wizard": None}}) == {"wizard": None}
+        print("_screen_data OK")
+
+        # --- v3.15: автообновление курса ---
+        _ev_a, _ev_b = threading.Event(), threading.Event()
+        assert _wait_any([_ev_a, _ev_b], 0.05) is None
+        _ev_b.set()
+        assert _wait_any([_ev_a, _ev_b], 1.0) is _ev_b
+        _ev_b.clear()
+        _t0 = time.time()
+        threading.Timer(0.3, _ev_a.set).start()
+        assert _wait_any([_ev_a, _ev_b], 5.0) is _ev_a
+        assert time.time() - _t0 < 1.5, "пробуждение должно замечаться сразу"
+        _ev_a.clear()
+        print("_wait_any OK")
+
+        # статус курса для ПУ
+        _EXCHANGE_RATE_STATUS.update({"last_ok_ts": 0.0, "last_error": "", "source": ""})
+        _cfg_r = {"settings": {"auto_update_exchange_rate": False}}
+        assert "выкл" in _exchange_rate_health(_cfg_r)
+        _cfg_r = {"settings": {"auto_update_exchange_rate": True}}
+        _h = _exchange_rate_health(_cfg_r)
+        assert "ещё не было" in _h, _h
+        _EXCHANGE_RATE_STATUS.update({"last_ok_ts": time.time() - 60,
+                                      "source": "ЦБ РФ", "last_error": ""})
+        _h = _exchange_rate_health(_cfg_r)
+        assert "ЦБ РФ" in _h and "назад" in _h, _h
+        _EXCHANGE_RATE_STATUS["last_error"] = "open.er-api: Timeout"
+        assert "Timeout" in _exchange_rate_health(_cfg_r)
+        for _t in (_exchange_rate_health(_cfg_r),):
+            assert _t.count("<b>") == _t.count("</b>") and _t.count("<i>") == _t.count("</i>")
+        _EXCHANGE_RATE_STATUS.update({"last_ok_ts": 0.0, "last_error": "", "source": ""})
+        print("_exchange_rate_health OK")
+
+        # --- v3.16: поля-радиокнопки в форме лота (Подарки Steam) ---
+        try:
+            from bs4 import BeautifulSoup as _BS
+        except ImportError:
+            _BS = None
+        if _BS is not None:
+            _html = ('<div class="form-group required">'
+                     '<label class="control-label">Регион активации</label>'
+                     '<div class="radio"><label><input type="radio" name="fields[region]" '
+                     'value="ru"> Россия</label></div>'
+                     '<div class="radio"><label><input type="radio" name="fields[region]" '
+                     'value="cis" checked> СНГ</label></div></div>')
+            _soup = _BS(_html, "html.parser")
+            _group = _soup.find(class_="form-group")
+            # заголовок поля, а не текст первого варианта
+            assert _fzr_group_label(_group, "x") == "Регион активации", _fzr_group_label(_group, "x")
+            _inp = _soup.find("input")
+            assert _fzr_option_label(_inp, "?") == "Россия", _fzr_option_label(_inp, "?")
+            # <input id><label for> тоже понимаем
+            _soup2 = _BS('<form><input type="radio" id="r1" name="f" value="v">'
+                         '<label for="r1">Вариант</label></form>', "html.parser")
+            assert _fzr_option_label(_soup2.find("input"), "?") == "Вариант"
+            print("_fzr_group_label / _fzr_option_label OK")
+
+        # обязательные поля: пустой мультивыбор считается незаполненным
+        _d = {"custom_fields": [
+                  {"name": "fields[region]", "label": "Регион", "required": True,
+                   "options": [{"value": "ru", "text": "Россия"}]},
+                  {"name": "fields[platform][]", "label": "Платформа", "required": True,
+                   "multi": True, "options": [{"value": "steam", "text": "Steam"}]},
+                  {"name": "fields[note]", "label": "Заметка", "required": False, "options": []}],
+              "custom_values": {}}
+        assert len(_fzr_missing_required_fields(_d)) == 2
+        _d["custom_values"]["fields[region]"] = "ru"
+        assert [f["name"] for f in _fzr_missing_required_fields(_d)] == ["fields[platform][]"]
+        _d["custom_values"]["fields[platform][]"] = []          # пустой список != заполнено
+        assert len(_fzr_missing_required_fields(_d)) == 1
+        _d["custom_values"]["fields[platform][]"] = ["steam"]
+        assert _fzr_missing_required_fields(_d) == []
+        # необязательное поле не мешает
+        _d["custom_values"].pop("fields[note]", None)
+        assert _fzr_missing_required_fields(_d) == []
+        print("_fzr_missing_required_fields OK")
+
+        # сводка для экрана подтверждения: показываем подписи, а не value
+        _sum2 = _fzr_custom_values_summary(_d)
+        assert "Россия" in _sum2 and "Steam" in _sum2, _sum2
+        assert "ru" not in _sum2.replace("Регион", ""), _sum2
+        assert _sum2.count("<b>") == _sum2.count("</b>")
+        print("_fzr_custom_values_summary OK")
+
+        # разбор ошибки FunPay: читаем .errors (в API нет errors_dict)
+        class _FakeErr(Exception):
+            error_message = "Заполните все поля"
+            errors = {"amount": "Обязательное поле", "fields[region]": "Выберите регион"}
+
+        _txt = _lot_saving_error_text(_FakeErr())
+        assert "Заполните все поля" in _txt and "Наличие" in _txt and "Выберите регион" in _txt, _txt
+
+        class _FakeErr2(Exception):
+            error_message = None
+            errors = {}
+
+            def short_str(self):
+                return "Не удалось сохранить лот 0."
+
+        assert "Не удалось сохранить лот" in _lot_saving_error_text(_FakeErr2())
+        print("_lot_saving_error_text OK")
+
+        # --- v3.16.1: имена полей FunPay -> человеческие подписи ---
+        assert _humanize_field_name("fields[region]") == "Регион"
+        assert _humanize_field_name("fields[platform][]") == "Платформа"
+        assert _humanize_field_name("amount") == "Наличие"
+        assert _humanize_field_name("fields[summary][ru]") == "Название (RU)"
+        # незнакомый ключ читается лучше, чем сырое имя
+        assert _humanize_field_name("fields[boost_type]") == "boost type"
+        assert _humanize_field_name("") == ""
+        assert _humanize_field_name("strange_name") == "strange_name"
+        print("_humanize_field_name OK")
+
+        # поля из ответа FunPay об ошибке
+        assert _funpay_error_field_names(
+            "Заполните все поля.\nfields[region]: Заполните это поле.") == ["fields[region]"]
+        assert _funpay_error_field_names("fields[a]: x\namount: y\nбез двоеточия") == \
+            ["fields[a]", "amount"]
+        assert _funpay_error_field_names("fields[a]: x\nfields[a]: снова") == ["fields[a]"]
+        assert _funpay_error_field_names(None) == []
+        assert _funpay_error_field_names("Просто текст") == []
+        print("_funpay_error_field_names OK")
+
+        # черновик отказавшего лота: живёт, потом истекает
+        _FAILED_LOT_DRAFTS.clear()
+        _failed_draft_put(1, {"title_ru": "Лот", "price": 100}, ["fields[region]"])
+        _got = _failed_draft_get(1)
+        assert _got and _got["data"]["title_ru"] == "Лот" and _got["missing"] == ["fields[region]"]
+        # копия, а не ссылка: правка мастера не портит черновик
+        _got["data"]["title_ru"] = "Изменено"
+        assert _failed_draft_get(1)["data"]["title_ru"] in ("Лот", "Изменено")
+        with _FAILED_LOT_LOCK:
+            _FAILED_LOT_DRAFTS[1]["ts"] -= _FAILED_LOT_TTL + 10
+        assert _failed_draft_get(1) is None
+        assert _failed_draft_get(None) is None
+        _failed_draft_put(None, {}, [])          # не падаем без user_id
+        _FAILED_LOT_DRAFTS.clear()
+        print("_failed_draft_put / _failed_draft_get OK")
+
+        # --- v3.16.2: реальная форма FunPay (node=1763, «Ключи RDR») ---
+        # Поля подкатегории приходят как `form-group lot-field hidden` БЕЗ
+        # пометки required: показывает и требует их JS. Раньше их выбрасывали.
+        try:
+            from bs4 import BeautifulSoup as _BS2
+        except ImportError:
+            _BS2 = None
+        if _BS2 is not None:
+            _real = ('<form class="form-offer-editor">'
+                     '<div class="form-group"><label class="control-label">Сервер</label>'
+                     '<select name="server_id"><option value=""></option>'
+                     '<option value="10915">PC</option></select></div>'
+                     '<div class="form-group lot-field hidden">'
+                     '<label class="control-label">Регион</label>'
+                     '<select name="fields[region]"><option value=""></option>'
+                     '<option value="Россия">Россия</option>'
+                     '<option value="СНГ">СНГ</option></select></div>'
+                     '<div class="form-group lot-field hidden">'
+                     '<label class="control-label">Регион</label>'
+                     '<select name="fields[region2]"><option value=""></option>'
+                     '<option value="Global">Global</option></select></div>'
+                     '<div class="form-group lot-field bg-light-color hidden">'
+                     '<label class="control-label">Short description</label>'
+                     '<input type="text" name="fields[summary][en]"></div>'
+                     '</form>')
+            _soup3 = _BS2(_real, "html.parser")
+            _form3 = _soup3.find("form")
+
+            class _Resp3:
+                status_code = 200
+                content = _real.encode()
+
+            class _Acc3:
+                def method(self, m, url, headers, payload, raise_not_200=False):
+                    return _Resp3()
+
+            class _C3:
+                account = _Acc3()
+
+            _parsed = _fzr_fetch_lot_form(_C3(), 1763)
+            _names3 = [f["name"] for f in _parsed["custom"]]
+            assert "fields[region]" in _names3, _names3
+            assert "fields[region2]" in _names3, _names3
+            assert "server_id" in _names3, _names3
+            # скрытая EN-версия описания — служебное поле, спрашивать нельзя
+            assert "fields[summary][en]" not in _names3, _names3
+            # оба региона помечены «мягко обязательными»
+            _regs = [f for f in _parsed["custom"] if f["name"].startswith("fields[region")]
+            assert all(f.get("soft_required") for f in _regs), _regs
+            assert all(not f.get("required") for f in _regs), _regs
+            # одинаковые подписи различимы
+            assert _regs[0]["label"] != _regs[1]["label"], _regs
+            print("_fzr_fetch_lot_form (lot-field hidden) OK")
+
+        # мягко обязательные поля: предупреждаем, но не блокируем
+        _d2 = {"custom_fields": [
+                   {"name": "fields[region]", "label": "Регион", "required": False,
+                    "soft_required": True, "options": []},
+                   {"name": "server_id", "label": "Сервер", "required": False,
+                    "soft_required": False, "options": []}],
+               "custom_values": {}}
+        assert [f["name"] for f in _fzr_unfilled_soft_fields(_d2)] == ["fields[region]"]
+        assert _fzr_missing_required_fields(_d2) == []      # создание не блокируется
+        _d2["custom_values"]["fields[region]"] = "Россия"
+        assert _fzr_unfilled_soft_fields(_d2) == []
+        print("_fzr_unfilled_soft_fields OK")
+
+        # server_id -> «Сервер» (поле без обёртки fields[...])
+        assert _humanize_field_name("server_id") == "Сервер"
+        assert _humanize_field_name("fields[region2]") == "region2"
+        print("_humanize_field_name (server_id) OK")
+
+        # --- v3.17: просьба подтвердить заказ и оставить отзыв ---
+        assert _funpay_order_url("123456789") == "https://funpay.com/orders/123456789/"
+        assert _funpay_order_url("#42") == "https://funpay.com/orders/42/"
+        assert _funpay_order_url(" 42 ") == "https://funpay.com/orders/42/"
+        assert _funpay_order_url("") == "" and _funpay_order_url(None) == ""
+        _cfg_r = create_default_config()
+        _rev = _review_request_text(_cfg_r, None, funpay_order_id="777")
+        assert "https://funpay.com/orders/777/" in _rev, _rev
+        assert "подтвердите" in _rev.lower() and "отзыв" in _rev.lower(), _rev
+        # v3.17.1: в сообщении о выдаче не должно быть «если что-то не так»
+        _d_tail = _delivery_text(create_default_config(),
+                                 {"category_kind": "gamekeys", "offer_name": "Ключ"},
+                                 ["CODE-1"], fzr_order_id="ord-1")
+        assert "если что-то не так" not in _d_tail.lower(), _d_tail
+        assert "CODE-1" in _d_tail
+        _d_tail2 = _delivery_text(create_default_config(),
+                                  {"category_kind": "steam-topup", "offer_name": "Steam"},
+                                  [], fzr_order_id="ord-1")
+        assert "если что-то не так" not in _d_tail2.lower(), _d_tail2
+        assert "спасибо" in _d_tail2.lower(), _d_tail2   # благодарность осталась
+        # бюджет сообщения FunPay — 19 строк (watermark добавляет ядро)
+        assert len(_rev.splitlines()) <= 19, len(_rev.splitlines())
+        assert not _buyer_text_leaks(_scrub_buyer_text(_rev)), _rev
+        # свой шаблон без {order_link} — ссылку дописываем сами
+        _cfg_r["templates"]["review_request"] = "Оставьте отзыв!"
+        _rev2 = _review_request_text(_cfg_r, None, funpay_order_id="777")
+        assert _rev2.startswith("Оставьте отзыв!") and "orders/777" in _rev2, _rev2
+        # шаблон привязки важнее общего
+        _rev3 = _review_request_text(_cfg_r, {"review_template": "СВОЙ {order_link}"},
+                                     funpay_order_id="777")
+        assert _rev3.startswith("СВОЙ https://funpay.com/orders/777/"), _rev3
+        # пустой шаблон = сообщение выключено
+        _cfg_r["templates"]["review_request"] = ""
+        assert _review_request_text(_cfg_r, None, funpay_order_id="777") == ""
+        # без номера заказа ссылки нет, но и падать нельзя
+        _cfg_r["templates"]["review_request"] = DEFAULT_CONFIG["templates"]["review_request"]
+        assert "funpay.com/orders" not in _review_request_text(_cfg_r, None, funpay_order_id="")
+        print("_review_request_text OK")
+
+        # --- v3.17.1: миграция текста просьбы об отзыве ---
+        _cfg_m = create_default_config()
+        _cfg_m["templates"]["review_request"] = _V3170_REVIEW_TEMPLATE
+        assert _migrate_v3171_templates(_cfg_m) is True
+        assert _cfg_m["templates"]["review_request"] == \
+            DEFAULT_CONFIG["templates"]["review_request"], _cfg_m["templates"]["review_request"]
+        assert "если что-то не так" not in _cfg_m["templates"]["review_request"].lower()
+        # повторно не выполняется
+        assert _migrate_v3171_templates(_cfg_m) is False
+        # свой текст продавца не трогаем
+        _cfg_m2 = create_default_config()
+        _cfg_m2["templates"]["review_request"] = "МОЙ текст {order_link}"
+        _migrate_v3171_templates(_cfg_m2)
+        assert _cfg_m2["templates"]["review_request"] == "МОЙ текст {order_link}"
+        # отключённое сообщение остаётся отключённым
+        _cfg_m3 = create_default_config()
+        _cfg_m3["templates"]["review_request"] = ""
+        _migrate_v3171_templates(_cfg_m3)
+        assert _cfg_m3["templates"]["review_request"] == ""
+        print("_migrate_v3171_templates OK")
+
+        # --- v3.18: отчёт о прибыли (комиссия вывода FunPay) ---
+        _cfg_p = create_default_config()
+        assert _cfg_p["settings"]["withdraw_fee_percent"] == 3.0
+        assert _cfg_p["settings"]["profit_report"] is True
+        _cfg_p["settings"]["exchange_rate"] = 86.0
+        _ord_p = {"order_json": _to_json({"id": "1", "price": 1200.0}), "quantity": 1}
+        _bd = _profit_breakdown(_cfg_p, _ord_p, {"price_usd": "5.00"}, cost_usd=5.0)
+        assert _bd["price_rub"] == 1200.0, _bd
+        assert _bd["fee_rub"] == 36.0, _bd          # 3% удерживает FunPay при выводе
+        assert _bd["net_rub"] == 1164.0, _bd
+        assert _bd["cost_rub"] == 430.0, _bd        # 5 $ × 86
+        assert _bd["profit_rub"] == 734.0, _bd
+        assert _bd["margin_percent"] == 170.7, _bd
+        # закупку берём из привязки, если её не передали
+        _bd2 = _profit_breakdown(_cfg_p, _ord_p, {"price_usd": "5.00"})
+        assert _bd2["cost_usd"] == 5.0 and _bd2["profit_rub"] == 734.0, _bd2
+        # нет курса -> прибыль не считаем, но цену показываем
+        _cfg_p0 = create_default_config()
+        _cfg_p0["settings"]["exchange_rate"] = 0
+        _bd3 = _profit_breakdown(_cfg_p0, _ord_p, {"price_usd": "5.00"}, cost_usd=5.0)
+        assert _bd3["profit_rub"] is None and _bd3["price_rub"] == 1200.0, _bd3
+        # мусор в настройках не должен ломать расчёт
+        _cfg_bad = create_default_config()
+        _cfg_bad["settings"]["withdraw_fee_percent"] = "abc"
+        _cfg_bad["settings"]["exchange_rate"] = "xyz"
+        _bd4 = _profit_breakdown(_cfg_bad, _ord_p, None, cost_usd=None)
+        assert _bd4["fee_percent"] == 0.0 and _bd4["profit_rub"] is None, _bd4
+        # заказ без цены (FunPay не передал) — не падаем
+        _bd5 = _profit_breakdown(_cfg_p, {"order_json": _to_json({"id": "1"})},
+                                 {"price_usd": "5.00"}, cost_usd=5.0)
+        assert _bd5["price_rub"] is None and _bd5["profit_rub"] is None, _bd5
+        # 0% комиссии
+        _cfg_p["settings"]["withdraw_fee_percent"] = 0
+        _bd6 = _profit_breakdown(_cfg_p, _ord_p, None, cost_usd=5.0)
+        assert _bd6["fee_rub"] == 0.0 and _bd6["net_rub"] == 1200.0, _bd6
+        print("_profit_breakdown OK")
+
+        _txt_p = _profit_report_text("777", "RDR2 Key", _bd, fzr_order_id="F-1",
+                                     buyer="vasya")
+        assert "Заказ создан" in _txt_p and "1 200,00 ₽" in _txt_p, _txt_p
+        assert "36,00 ₽" in _txt_p and "734,00 ₽" in _txt_p, _txt_p
+        assert "Комиссия вывода 3%" in _txt_p, _txt_p
+        assert len(_txt_p) <= 4096
+        # убыток помечается
+        _bd_loss = dict(_bd, profit_rub=-100.0, margin_percent=-20.0)
+        assert "📉" in _profit_report_text("1", "x", _bd_loss)
+        assert "убыточный" in _profit_report_text("1", "x", _bd_loss)
+        # без прибыли — честная причина
+        assert "нет курса" in _profit_report_text("1", "x", _bd3).lower()
+        print("_profit_report_text OK")
+
+        # --- v3.17: перенос лотов на другой аккаунт ---
+        # «мягкий» ключ названия: регистр, пробелы, эмодзи и знаки не важны
+        assert _title_loose_key("Hades 2  GIFT!!!") == _title_loose_key("hades 2 gift")
+        assert _title_loose_key("RUB🔥 Пополнение") == _title_loose_key("rub пополнение")
+        assert _title_loose_key("") == ""
+        assert _title_loose_key(None) == ""
+        assert _title_loose_key("!!!") == ""
+        print("_title_loose_key OK")
+
+        _lots = {"by_id": {"900": {"title": "RDR2 key RU", "subcategory_id": 1763},
+                           "901": {"title": "Hades 2 gift", "subcategory_id": 211}},
+                 "by_title": {_normalize_title("RDR2 key RU"): ["900"],
+                              _normalize_title("Hades 2 gift"): ["901"]},
+                 "by_title_loose": {_title_loose_key("RDR2 key RU"): ["900"],
+                                    _title_loose_key("Hades 2 gift"): ["901"]}}
+        # точное название (регистр и лишние пробелы не важны)
+        _inc = {"funpay_lot_id": None, "_wanted_lot_title": "rdr2   KEY ru"}
+        _lid, _st, _note = _resolve_import_lot(_inc, _lots)
+        assert (_lid, _st) == ("900", "by_title"), (_lid, _st, _note)
+        assert _inc["_resolved_lot_title"] == "RDR2 key RU"
+        assert _inc["_resolved_subcategory_id"] == 1763
+        # название со «мусорными» знаками
+        _inc2 = {"funpay_lot_id": None, "_wanted_lot_title": "Hades 2 GIFT!!!"}
+        _lid2, _st2, _ = _resolve_import_lot(_inc2, _lots)
+        assert (_lid2, _st2) == ("901", "by_title"), (_lid2, _st2)
+        assert _inc2["_resolved_lot_title"] == "Hades 2 gift"
+        # ID имеет приоритет над названием
+        _inc3 = {"funpay_lot_id": "901", "_wanted_lot_title": "RDR2 key RU"}
+        assert _resolve_import_lot(_inc3, _lots)[:2] == ("901", "id")
+        # лота нет — привязку выключим, а не будем выдавать в пустоту
+        _inc4 = {"funpay_lot_id": None, "_wanted_lot_title": "Такого лота нет"}
+        assert _resolve_import_lot(_inc4, _lots)[1] == "missing"
+        # список лотов недоступен — верим файлу
+        assert _resolve_import_lot({"funpay_lot_id": "555", "_wanted_lot_title": ""},
+                                   {"by_id": {}, "by_title": {}})[:2] == ("555", "id")
+        print("_resolve_import_lot OK")
+
+        # ссылка на лот и ID из вставленной ссылки
+        _mm, _ = _validate_import_mappings([{
+            "fzr_sku_id": "gamekeys:1:2",
+            "funpay_lot_title": "  RDR2 key RU  ",
+            "funpay_lot_id": "https://funpay.com/lots/offer?id=900",
+        }])
+        assert _mm and _mm[0]["funpay_lot_id"] == "900", _mm
+        assert _mm[0]["_wanted_lot_title"] == "RDR2 key RU"
+        assert _mm[0]["_lot_specified"] is True
+        assert _mm[0]["price_sync"] is True
+        _mm_off, _ = _validate_import_mappings([{
+            "fzr_sku_id": "gamekeys:1:2",
+            "funpay_lot_id": "900",
+            "price_sync": False,
+        }])
+        assert _mm_off[0]["price_sync"] is False
+        # null = «найди по названию»
+        _mm2, _ = _validate_import_mappings([{"fzr_sku_id": "gamekeys:1:2",
+                                              "funpay_lot_title": "X",
+                                              "funpay_lot_id": None}])
+        assert _mm2[0]["funpay_lot_id"] is None
+        # поля про лот вообще нет — существующий лот не трогаем
+        _mm3, _ = _validate_import_mappings([{"fzr_sku_id": "gamekeys:1:2"}])
+        assert _mm3[0]["_lot_specified"] is False
+        print("import lot fields OK")
+
+        # --- v3.19: локальный баланс при общем API-ключе ---
+        assert DEFAULT_CONFIG["settings"]["local_balance"] is True
+        assert DEFAULT_CONFIG["settings"]["local_balance_low"] == 10.0
+        assert DEFAULT_CONFIG["settings"]["balance_alert_cooldown"] == 60
+        # таблица книги операций создана
+        _db_connect().execute("SELECT op_key, kind, amount_usd, balance_after, "
+                              "funpay_order_id, fzr_order_id, comment FROM balance_ledger LIMIT 0")
+        # формат сумм: минус виден сразу, плюс — по запросу
+        assert _fmt_usd(0) == "0,00 $"
+        assert _fmt_usd(-8.5) == "−8,50 $"
+        assert _fmt_usd(12.5, sign=True) == "+12,50 $"
+        assert _fmt_usd(1234.5) == "1 234,50 $"
+        assert _fmt_usd(None) == "—" and _fmt_usd("мусор") == "—"
+        print("_fmt_usd OK")
+
+        # книга: баланс = сумма строк, идемпотентность по op_key
+        _db_connect().execute("DELETE FROM balance_ledger")
+        assert _db_local_balance() == 0.0
+        assert _db_ledger_add("topup", 50.0, comment="старт") == 50.0
+        assert _db_ledger_add("order", -12.5, op_key="order:A-1",
+                              funpay_order_id="A-1") == 37.5
+        # повтор того же op_key не списывает второй раз
+        assert _db_ledger_add("order", -12.5, op_key="order:A-1",
+                              funpay_order_id="A-1") is None
+        assert _db_local_balance() == 37.5
+        # мусор вместо суммы не ломает книгу
+        assert _db_ledger_add("order", "abc") is None
+        assert _db_local_balance() == 37.5
+        # баланс уходит в минус — это норма, а не ошибка
+        assert _db_ledger_add("order", -50.0, op_key="order:A-2") == -12.5
+        assert _db_local_balance() == -12.5
+        _ops = _db_ledger_list(limit=10)
+        assert [o["balance_after"] for o in _ops] == [-12.5, 37.5, 50.0], _ops
+        assert _db_ledger_count() == 3
+        _tot = _db_ledger_totals()
+        assert _tot["topup"] == 50.0 and _tot["order"] == -62.5, _tot
+        print("_db_ledger_add / _db_local_balance OK")
+
+        # разбор ввода суммы: «25,5», «=100», «+30 коммент», мусор
+        assert _parse_balance_amount("25,5")[:2] == (25.5, "delta")
+        assert _parse_balance_amount("=100")[:2] == (100.0, "set")
+        _amt, _mode, _cm = _parse_balance_amount("+30 перевод с карты")
+        assert (_amt, _mode, _cm) == (30.0, "delta", "перевод с карты")
+        assert _parse_balance_amount("-12.5")[0] == -12.5
+        assert _parse_balance_amount("abc")[0] is None
+        assert _parse_balance_amount("")[0] is None
+        assert _parse_balance_amount("inf")[0] is None      # не число для книги
+        assert _parse_balance_amount("50$")[0] == 50.0
+        print("_parse_balance_amount OK")
+
+        # подписи операций для истории
+        assert _ledger_icon({"kind": "topup"}) == "➕"
+        assert _ledger_icon({"kind": "order"}) == "🛒"
+        assert _ledger_icon({"kind": "refund"}) == "↩️"
+        assert "заказ A-1" in _ledger_title({"kind": "order", "funpay_order_id": "A-1"})
+        assert "Пополнение" in _ledger_title({"kind": "topup", "comment": "с карты"})
+        print("_ledger_icon / _ledger_title OK")
+
+        # кнопка баланса в главном меню отражает состояние
+        _cfg_b = create_default_config()
+        _db_connect().execute("DELETE FROM balance_ledger")
+        _db_ledger_add("topup", 100.0)
+        assert "💼" in _balance_button_label(_cfg_b)
+        _db_ledger_add("order", -95.0)                      # осталось 5 < порога 10
+        assert "🟡" in _balance_button_label(_cfg_b), _balance_button_label(_cfg_b)
+        _db_ledger_add("order", -20.0)                      # минус
+        assert "🔴" in _balance_button_label(_cfg_b), _balance_button_label(_cfg_b)
+        # выключенный локальный баланс не мешает прежней кнопке
+        _cfg_off = create_default_config()
+        _cfg_off["settings"]["local_balance"] = False
+        assert _balance_button_label(_cfg_off) == "💰 Баланс"
+        print("_balance_button_label OK")
+
+        # отчёт о прибыли добавляет строку локального баланса
+        _txt_bal = _profit_report_text("777", "RDR2 Key", _bd, buyer="vasya",
+                                       local_balance=-15.0)
+        assert "Локальный баланс" in _txt_bal and "−15,00 $" in _txt_bal, _txt_bal
+        assert "в минусе" in _txt_bal, _txt_bal
+        _txt_bal2 = _profit_report_text("777", "RDR2 Key", _bd, local_balance=42.0)
+        assert "42,00 $" in _txt_bal2 and "в минусе" not in _txt_bal2
+        # без баланса (выключен) строки нет
+        assert "Локальный баланс" not in _profit_report_text("777", "x", _bd)
+        print("_profit_report_text (balance) OK")
+
+        # --- v3.20: возврат от поставщика ---
+        assert DEFAULT_CONFIG["settings"]["refund_on_fzr_refund"] is True
+        assert DEFAULT_CONFIG["templates"]["refund_notice"]
+        assert "refund_template" in _MAPPING_COLUMNS
+        _cfg_rf = create_default_config()
+        _rf = _fzr_refund_text(_cfg_rf, {"offer_name": "RDR2 Key"},
+                               order_id="777", fzr_order_id="F-1", buyer="vasya",
+                               reason="out of stock at supplier")
+        assert "RDR2 Key" in _rf, _rf
+        assert "возвращены" in _rf.lower() or "возврат" in _rf.lower(), _rf
+        # причину поставщика покупателю не показываем
+        assert "out of stock" not in _rf.lower(), _rf
+        assert not _buyer_text_leaks(_scrub_buyer_text(_rf)), _rf
+        assert len(_rf.splitlines()) <= 19, len(_rf.splitlines())
+        # шаблон привязки важнее общего
+        _rf2 = _fzr_refund_text(_cfg_rf, {"offer_name": "X",
+                                          "refund_template": "СВОЙ {sku_name}"},
+                                order_id="777")
+        assert _rf2 == "СВОЙ X", _rf2
+        # пустой общий шаблон = сообщение выключено
+        _cfg_rf["templates"]["refund_notice"] = ""
+        assert _fzr_refund_text(_cfg_rf, None, order_id="777") == ""
+        # сломанный шаблон не должен ломать возврат
+        _cfg_rf["templates"]["refund_notice"] = "{неизвестная_переменная}"
+        assert _fzr_refund_text(_cfg_rf, {"offer_name": "Y"}, order_id="777")
+        print("_fzr_refund_text OK")
+
+        # --- v3.20: выбор привязок для экспорта ---
+        _EXPORT_PICK.clear()
+        assert _export_pick_get(1) == set()
+        assert _export_pick_get(None) == set()
+        assert _export_pick_toggle(1, "a") == {"a"}
+        assert _export_pick_toggle(1, "b") == {"a", "b"}
+        assert _export_pick_toggle(1, "a") == {"b"}
+        _export_pick_set(1, {"x", "y"})
+        assert _export_pick_get(1) == {"x", "y"}
+        # набор истекает вместе с TTL, а не живёт вечно
+        with _EXPORT_PICK_LOCK:
+            _EXPORT_PICK[1]["at"] -= _EXPORT_PICK_TTL + 10
+        assert _export_pick_get(1) == set()
+        # статус привязок в файле переключается по кругу
+        _export_pick_set(2, {"z"})
+        assert _export_enabled_mode(2) == "as_is"
+        assert _export_enabled_override("as_is") is None
+        assert _export_enabled_override("on") is True
+        assert _export_enabled_override("off") is False
+        _export_enabled_set(2, "off")
+        assert _export_enabled_mode(2) == "off"
+        _export_enabled_set(2, "мусор")
+        assert _export_enabled_mode(2) == "as_is"
+        _EXPORT_PICK.clear()
+        print("_export_pick_* OK")
+
+        # --- v3.20: массовое удаление привязок ---
+        for _i in range(3):
+            _db_save_mapping({"id": f"wipe{_i}", "fzr_sku_id": f"gamekeys:9:{_i}",
+                              "category_kind": "gamekeys", "category_id": "9",
+                              "offer_id": str(_i), "funpay_lot_id": str(700 + _i),
+                              "enabled": True})
+        assert len(_db_get_mappings()) >= 3
+        _removed = _db_delete_all_mappings()
+        assert _removed >= 3, _removed
+        assert _db_get_mappings() == []
+        assert _db_delete_all_mappings() == 0      # повтор безопасен
+        print("_db_delete_all_mappings OK")
+
+        # --- v3.21: возврат только при включённом автовозврате ---
+        # по умолчанию автовозврат ВЫКЛЮЧЕН — значит плагин сам деньги не вернёт
+        assert DEFAULT_CONFIG["settings"]["funds_auto_refund"] is False
+        _cfg_ar = create_default_config()
+        _ok_ar, _why = _fzr_refund_allowed(_cfg_ar)
+        assert _ok_ar is False and "автовозврат" in _why.lower(), (_ok_ar, _why)
+        _cfg_ar["settings"]["funds_auto_refund"] = True
+        assert _fzr_refund_allowed(_cfg_ar) == (True, "")
+        _cfg_ar["settings"]["refund_on_fzr_refund"] = False
+        _ok_ar2, _why2 = _fzr_refund_allowed(_cfg_ar)
+        assert _ok_ar2 is False and "поставщик" in _why2.lower(), (_ok_ar2, _why2)
+        # пустой/битый конфиг не должен разрешать возврат
+        assert _fzr_refund_allowed({})[0] is False
+        assert _fzr_refund_allowed({"settings": {}})[0] is False
+        print("_fzr_refund_allowed OK")
+
+        # --- v3.21: поиск лота по названию ---
+        _lots_r = {
+            "by_id": {"900": {"title": "RDR2 key RU", "subcategory_id": 1763},
+                      "901": {"title": "Hades 2 gift", "subcategory_id": 211},
+                      "902": {"title": "Дубль", "subcategory_id": 1763},
+                      "903": {"title": "Дубль", "subcategory_id": 211}},
+            "by_title": {_normalize_title("RDR2 key RU"): ["900"],
+                         _normalize_title("Hades 2 gift"): ["901"],
+                         _normalize_title("Дубль"): ["902", "903"]},
+            "by_title_loose": {_title_loose_key("RDR2 key RU"): ["900"],
+                               _title_loose_key("Hades 2 gift"): ["901"],
+                               _title_loose_key("Дубль"): ["902", "903"]},
+        }
+        assert _find_lot_by_title(_lots_r, "RDR2 key RU")[0] == ["900"]
+        # регистр и лишние пробелы
+        assert _find_lot_by_title(_lots_r, "  rdr2   KEY ru ")[0] == ["900"]
+        # эмодзи и знаки — через loose-ключ
+        _ids, _how = _find_lot_by_title(_lots_r, "HADES 2 GIFT!!! 🔥")
+        assert _ids == ["901"], (_ids, _how)
+        assert "знак" in _how, _how
+        # два лота с одним названием — подкатегория разводит
+        assert _find_lot_by_title(_lots_r, "Дубль", 1763)[0] == ["902"]
+        assert _find_lot_by_title(_lots_r, "Дубль", 211)[0] == ["903"]
+        # без подкатегории остаётся неоднозначность (решает продавец)
+        assert len(_find_lot_by_title(_lots_r, "Дубль")[0]) == 2
+        # подкатегория, которой ни у кого нет, не должна «терять» лоты
+        assert len(_find_lot_by_title(_lots_r, "Дубль", 9999)[0]) == 2
+        assert _find_lot_by_title(_lots_r, "Нет такого")[0] == []
+        assert _find_lot_by_title(_lots_r, "")[0] == []
+        assert _find_lot_by_title({"by_id": {}}, "RDR2 key RU")[0] == []
+        print("_find_lot_by_title OK")
+
+        # по каким названиям ищем: сначала название лота, потом товара
+        assert _mapping_search_titles({"funpay_title": "A", "offer_name": "B"}) == ["A", "B"]
+        assert _mapping_search_titles({"funpay_title": "", "offer_name": "B"}) == ["B"]
+        assert _mapping_search_titles({"funpay_title": "  A  ", "offer_name": "A"}) == ["A"]
+        assert _mapping_search_titles({}) == []
+        print("_mapping_search_titles OK")
+
+        # план relink и его TTL
+        _RELINK_PLANS.clear()
+        assert _relink_plan_get(1) is None
+        _relink_plan_put(1, {"linked": [], "ok": [], "ambiguous": [], "not_found": [],
+                             "no_title": [], "taken": [], "lots_known": True,
+                             "lots_total": 0})
+        assert _relink_plan_get(1) is not None
+        with _RELINK_LOCK:
+            _RELINK_PLANS[1]["at"] -= _RELINK_TTL + 10
+        assert _relink_plan_get(1) is None
+        _relink_plan_put(None, {})          # без user_id не падаем
+        # текст отчёта переживает пустой план и недоступный профиль
+        _empty_plan = {"linked": [], "ok": [], "ambiguous": [], "not_found": [],
+                       "no_title": [], "taken": [], "lots_known": False,
+                       "lots_total": 0}
+        assert "недоступен" in _relink_text(_empty_plan)
+        assert len(_relink_text(_empty_plan)) <= 4096
+        _RELINK_PLANS.clear()
+        print("_relink_plan_* OK")
+
+        # --- v3.21: массовые кнопки (без лота / включить все) ---
+        _db_connect().execute("DELETE FROM mappings")
+        for _mid, _lot, _en in (("bl1", None, True), ("bl2", "", False),
+                                ("bl3", "555", True), ("bl4", "777", False)):
+            _db_save_mapping({"id": _mid, "fzr_sku_id": f"gamekeys:5:{_mid}",
+                              "category_kind": "gamekeys", "category_id": "5",
+                              "offer_id": _mid, "funpay_lot_id": _lot,
+                              "funpay_title": f"Лот {_mid}", "enabled": _en})
+        # индекс лотов известен: 555 существует, 777 — нет
+        _lots_known = {"by_id": {"555": {"title": "Лот bl3", "subcategory_id": 1}},
+                       "by_title": {}, "by_title_loose": {}}
+        _missing = _mappings_missing_lot(lots=_lots_known)
+        assert sorted(_missing) == ["bl1", "bl2", "bl4"], _missing
+        # индекс пуст (FunPay недоступен) — только заведомо пустые поля
+        _missing_blind = _mappings_missing_lot(lots={"by_id": {}})
+        assert sorted(_missing_blind) == ["bl1", "bl2"], _missing_blind
+        print("_mappings_missing_lot OK")
+
+        # отмена массового включения: помним ровно свои привязки
+        _ENABLE_UNDO.clear()
+        assert _enable_undo_take(1) == []
+        _enable_undo_put(1, ["a", "b"])
+        assert _enable_undo_take(1) == ["a", "b"]
+        assert _enable_undo_take(1) == []          # одноразовая
+        _enable_undo_put(1, [])                    # пустой список не пишем
+        assert _enable_undo_take(1) == []
+        _enable_undo_put(None, ["x"])              # без user_id не падаем
+        _enable_undo_put(2, ["c"])
+        with _ENABLE_UNDO_LOCK:
+            _ENABLE_UNDO[2]["at"] -= _ENABLE_UNDO_TTL + 10
+        assert _enable_undo_take(2) == []          # истекает
+        _ENABLE_UNDO.clear()
+        _db_connect().execute("DELETE FROM mappings")
+        print("_enable_undo_* OK")
+
+        # --- v3.22: сопоставление лотов по живой разметке FunPay ---
+        # FunPay отдаёт в кратком описании лота название И доп. поля через
+        # запятую. В привязке лежит только название — значит первый сегмент
+        # обязан индексироваться отдельно.
+        _live_desc = ("💙9288 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙, "
+                      "Global, Пополнение по ID, 7500+ алмазов")
+        _keys = _lot_search_keys({"title": _live_desc})
+        assert _live_desc in _keys, _keys
+        assert "💙9288 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙" in _keys, _keys
+        # название лота может лежать в «сервере» или «стороне»
+        assert _lot_search_keys({"title": "", "server": "СЕРВЕР"}) == ["СЕРВЕР"]
+        assert "A, B" in _lot_search_keys({"title": "B", "server": "A"})
+        assert _lot_search_keys({}) == []
+        print("_lot_search_keys OK")
+
+        # числа названия — страховка от путаницы номиналов
+        assert _digits_key("💙5 АЛМАЗОВ💙 24/7") == ("5", "24", "7")
+        assert _digits_key("💙95 АЛМАЗОВ💙 24/7") == ("95", "24", "7")
+        assert _digits_key("") == () and _digits_key(None) == ()
+        print("_digits_key OK")
+
+        # полный проход поиска на «живой» разметке
+        _live_rows = {
+            "76459585": {"title": _live_desc, "subcategory_id": 948},
+            "76459529": {"title": "💙5 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙, "
+                                  "Global, Пополнение по ID", "subcategory_id": 948},
+            "76459530": {"title": "💙95 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙, "
+                                  "Global, Пополнение по ID", "subcategory_id": 948},
+        }
+        _lots_live: Dict[str, Any] = {"by_id": _live_rows, "by_title": {},
+                                     "by_title_loose": {}}
+        for _lid, _info in _live_rows.items():
+            for _k in _lot_search_keys(_info):
+                _lots_live["by_title"].setdefault(_normalize_title(_k), []).append(_lid)
+                _lk = _title_loose_key(_k)
+                if _lk:
+                    _lots_live["by_title_loose"].setdefault(_lk, []).append(_lid)
+        # чистое название — точное совпадение
+        _ids, _how = _find_lot_by_title(_lots_live,
+                                        "💙9288 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙")
+        assert _ids == ["76459585"] and _how == "точное название", (_ids, _how)
+        # усечённое название (как показывает панель) — по началу
+        _ids2, _how2 = _find_lot_by_title(_lots_live, "💙9288 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙")
+        assert _ids2 == ["76459585"], (_ids2, _how2)
+        assert "обрезан" in _how2, _how2
+        # 5 и 95 алмазов не путаются
+        assert _find_lot_by_title(_lots_live, "💙5 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙")[0] == \
+            ["76459529"]
+        assert _find_lot_by_title(_lots_live, "💙95 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙")[0] == \
+            ["76459530"]
+        # похожее название с правкой руками
+        _ids3, _how3 = _find_lot_by_title(_lots_live, "💙9288 АЛМАЗОВ💙АВТО 24/7💙ГЛОБАЛ(БЕЗ СНГ)💙")
+        assert _ids3 == ["76459585"], (_ids3, _how3)
+        # чужой номинал не находим
+        assert _find_lot_by_title(_lots_live, "💙123 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙")[0] == []
+        print("_find_lot_by_title (live) OK")
+
+        print("ALL SMOKE TESTS PASSED")
+    finally:
+        _db_close_conn()
+        try:
+            shutil.rmtree(tmp)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    _run_smoke_tests()
