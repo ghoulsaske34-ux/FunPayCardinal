@@ -20,11 +20,12 @@ import html
 import secrets
 import string
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from types import SimpleNamespace as _SimpleNamespace
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING, TypedDict
 
 import requests
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -38,8 +39,11 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.22.2"
+VERSION = "3.23.0"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.23.0: типизированное ядро, отдельные SQLite-подключения "
+               "для потоков, ограниченный планировщик, кэш каталога и "
+               "декларативная маршрутизация Telegram.\n"
                "v3.22.2: синхронизация сравнивает расчёт с живой ценой FunPay, "
                "ручная проверка обходит пороги, а отчёт показывает причины "
                "пропуска и источник наценки. Старые импортированные нулевые "
@@ -56,6 +60,376 @@ UUID = "550ee630-3f0e-41c1-9811-29b83b981083"
 SETTINGS_PAGE = True
 
 CB_PREFIX = "fzr"
+
+
+class PluginSettings(TypedDict, total=False):
+    auto_delivery: bool
+    poll_interval: float
+    poll_timeout: float
+    exchange_rate: float
+    markup_percent: float
+    markup_fixed: float
+    price_round: int
+    price_sync: bool
+    price_sync_interval: float
+    price_sync_threshold: float
+    price_sync_max_step: float
+    price_sync_dry_run: bool
+
+
+class PluginConfig(TypedDict, total=False):
+    api_key: str
+    base_url: str
+    settings: PluginSettings
+    templates: Dict[str, str]
+    mappings: List[Dict[str, object]]
+
+
+class MappingRecord(TypedDict, total=False):
+    id: str
+    fzr_sku_id: str
+    category_kind: str
+    category_id: str
+    offer_id: str
+    offer_name: str
+    price_usd: str
+    stock: int
+    min_quantity: int
+    max_quantity: int
+    fields_json: str
+    funpay_lot_id: str
+    funpay_subcategory_id: int
+    funpay_title: str
+    markup_percent: float
+    markup_fixed: float
+    markup_percent_custom: int
+    markup_fixed_custom: int
+    metadata_key: str
+    metadata_prompt: str
+    metadata_validation: str
+    metadata_fields_json: str
+    delivery_template: str
+    enabled: bool
+    validate_id: bool
+    units_per_item: float
+    price_sync: bool
+    last_price_usd: str
+    last_lot_price: float
+    price_synced_at: float
+    greeting_template: str
+    ask_template: str
+    review_template: str
+    refund_template: str
+    created_at: float
+    updated_at: float
+
+
+class PriceSyncPlan(TypedDict, total=False):
+    old: Optional[float]
+    cached_old: Optional[float]
+    new: Optional[float]
+    delta_pct: Optional[float]
+    skip: Optional[str]
+    needs_review: bool
+    reasons: List[str]
+    markup_source: str
+
+
+@dataclass(frozen=True)
+class PluginPaths:
+    root: str
+    config: str
+    mappings: str
+    processed: str
+    catalog_cache: str
+    database: str
+    backups: str
+
+    @classmethod
+    def for_account(cls, account_id: int) -> "PluginPaths":
+        root = os.path.join("storage", "cache", "fzr_gifts", str(account_id))
+        return cls(
+            root=root,
+            config=os.path.join(root, "config.json"),
+            mappings=os.path.join(root, "mappings.json"),
+            processed=os.path.join(root, "processed.json"),
+            catalog_cache=os.path.join(root, "catalog_cache.json"),
+            database=os.path.join(root, "fzr_gifts.db"),
+            backups=os.path.join(root, "backups"),
+        )
+
+
+@dataclass
+class PluginRuntime:
+    shutdown_event: threading.Event = field(default_factory=threading.Event)
+    started_at: float = field(default_factory=time.time)
+    generation: int = 0
+    config_revision: int = 0
+    mapping_revision: int = 0
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def restart(self) -> None:
+        with self.lock:
+            self.shutdown_event.clear()
+            self.started_at = time.time()
+            self.generation += 1
+
+    def stop(self) -> None:
+        self.shutdown_event.set()
+
+    def mark_config_changed(self) -> None:
+        with self.lock:
+            self.config_revision += 1
+
+    def mark_mappings_changed(self) -> None:
+        with self.lock:
+            self.mapping_revision += 1
+
+    def snapshot(self) -> Dict[str, object]:
+        with self.lock:
+            return {
+                "generation": self.generation,
+                "started_at": self.started_at,
+                "config_revision": self.config_revision,
+                "mapping_revision": self.mapping_revision,
+                "shutting_down": self.shutdown_event.is_set(),
+            }
+
+
+class SQLiteThreadState(threading.local):
+    def __init__(self) -> None:
+        self.connection: Optional[sqlite3.Connection] = None
+        self.path: Optional[str] = None
+        self.generation = -1
+
+
+class SQLiteRuntime:
+    def __init__(self) -> None:
+        self._local = SQLiteThreadState()
+        self._lock = threading.RLock()
+        self._connections: Dict[int, sqlite3.Connection] = {}
+        self._generation = 0
+
+    def connect(self, path: str) -> sqlite3.Connection:
+        connection = self._local.connection
+        local_path = self._local.path
+        local_generation = self._local.generation
+        if (
+            connection is not None
+            and local_path == path
+            and local_generation == self._generation
+        ):
+            return connection
+        self.close_current()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        connection = sqlite3.connect(
+            path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA temp_store = MEMORY")
+        with self._lock:
+            self._connections[id(connection)] = connection
+            generation = self._generation
+        self._local.connection = connection
+        self._local.path = path
+        self._local.generation = generation
+        return connection
+
+    def close_current(self) -> None:
+        connection = self._local.connection
+        if connection is None:
+            return
+        with self._lock:
+            self._connections.pop(id(connection), None)
+        try:
+            connection.close()
+        except Exception:
+            pass
+        self._local.connection = None
+        self._local.path = None
+        self._local.generation = -1
+
+    def close_all(self) -> None:
+        with self._lock:
+            connections = list(self._connections.values())
+            self._connections.clear()
+            self._generation += 1
+        for connection in connections:
+            try:
+                connection.execute("PRAGMA optimize")
+            except Exception:
+                pass
+            try:
+                connection.close()
+            except Exception:
+                pass
+        self._local.connection = None
+        self._local.path = None
+        self._local.generation = -1
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "connections": len(self._connections),
+                "generation": self._generation,
+            }
+
+
+class BoundedExecutor:
+    def __init__(self, max_workers: int, max_pending: int, prefix: str) -> None:
+        self._max_workers = max_workers
+        self._max_pending = max(max_workers, max_pending)
+        self._prefix = prefix
+        self._lock = threading.RLock()
+        self._slots = threading.BoundedSemaphore(self._max_pending)
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._active: Dict[str, Future] = {}
+        self._submitted = 0
+        self._completed = 0
+        self._reused = 0
+
+    def start(self) -> None:
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix=self._prefix,
+                )
+
+    def submit(
+        self,
+        fn: Callable[..., object],
+        *args: object,
+        task_key: Optional[str] = None,
+        **kwargs: object,
+    ) -> Future:
+        if _SHUTDOWN_EVENT.is_set():
+            raise RuntimeError("plugin shutting down")
+        while not self._slots.acquire(timeout=0.25):
+            if _SHUTDOWN_EVENT.is_set():
+                raise RuntimeError("plugin shutting down")
+        try:
+            with self._lock:
+                if task_key:
+                    active = self._active.get(task_key)
+                    if active is not None and not active.done():
+                        self._reused += 1
+                        self._slots.release()
+                        return active
+                self.start()
+                executor = self._executor
+                if executor is None:
+                    raise RuntimeError("background executor is unavailable")
+                future = executor.submit(fn, *args, **kwargs)
+                self._submitted += 1
+                if task_key:
+                    self._active[task_key] = future
+        except Exception:
+            self._slots.release()
+            raise
+
+        def _done(completed: Future) -> None:
+            with self._lock:
+                self._completed += 1
+                if task_key and self._active.get(task_key) is completed:
+                    self._active.pop(task_key, None)
+            self._slots.release()
+
+        future.add_done_callback(_done)
+        return future
+
+    def stop(self, wait: bool = True) -> None:
+        with self._lock:
+            executor = self._executor
+            self._executor = None
+            self._active.clear()
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=wait)
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "submitted": self._submitted,
+                "completed": self._completed,
+                "active": sum(1 for future in self._active.values() if not future.done()),
+                "reused": self._reused,
+                "max_workers": self._max_workers,
+                "max_pending": self._max_pending,
+            }
+
+
+class BackgroundTaskScheduler:
+    def __init__(self) -> None:
+        self.work = BoundedExecutor(8, 128, "fzr_worker")
+        self.io = BoundedExecutor(8, 128, "fzr_io")
+
+    def start(self) -> None:
+        self.work.start()
+        self.io.start()
+
+    def stop(self, wait: bool = True) -> None:
+        self.work.stop(wait=wait)
+        self.io.stop(wait=wait)
+
+    def snapshot(self) -> Dict[str, Dict[str, int]]:
+        return {
+            "work": self.work.snapshot(),
+            "io": self.io.snapshot(),
+        }
+
+
+class TimedValueCache:
+    def __init__(self, ttl: float, max_entries: int) -> None:
+        self._ttl = max(1.0, ttl)
+        self._max_entries = max(1, max_entries)
+        self._lock = threading.RLock()
+        self._values: Dict[str, Tuple[float, object]] = {}
+
+    def get(self, key: str) -> Optional[object]:
+        now = time.monotonic()
+        with self._lock:
+            item = self._values.get(key)
+            if item is None:
+                return None
+            expires_at, value = item
+            if expires_at <= now:
+                self._values.pop(key, None)
+                return None
+            return value
+
+    def put(self, key: str, value: object) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if len(self._values) >= self._max_entries:
+                oldest = min(self._values, key=lambda item: self._values[item][0])
+                self._values.pop(oldest, None)
+            self._values[key] = (now + self._ttl, value)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._values.clear()
+
+    def snapshot(self) -> Dict[str, int]:
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                key for key, (expires_at, _value) in self._values.items()
+                if expires_at <= now
+            ]
+            for key in expired:
+                self._values.pop(key, None)
+            return {"entries": len(self._values)}
 
 BASE_CACHE_DIR = os.path.join("storage", "cache", "fzr_gifts")
 LOG_DIR = os.path.join("storage", "logs")
@@ -271,7 +645,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _FILES_LOCK = threading.RLock()
 _DB_LOCK = threading.RLock()
 _CONFIG_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "cfg": None}
-_SHUTDOWN_EVENT = threading.Event()
+_RUNTIME = PluginRuntime()
+_SHUTDOWN_EVENT = _RUNTIME.shutdown_event
 
 _HTTP_SESSION_TLS = threading.local()
 
@@ -313,8 +688,7 @@ _MANUAL_CHAT_SKIP: Set[str] = set()
 _MANUAL_CHAT_404: Dict[str, int] = {}   # order_id -> сколько раз ответили 404
 _MANUAL_CHAT_404_MAX = 20               # после этого считаем, что чата нет
 
-_DB_CONN: Optional[sqlite3.Connection] = None
-_DB_CONN_PATH: Optional[str] = None
+_SQLITE_RUNTIME = SQLiteRuntime()
 _DB_INITIALIZED = False
 
 _CB_TOKENS: Dict[str, Tuple[float, str]] = {}
@@ -337,9 +711,8 @@ _MAX_QUANTITY = 100
 _MAX_BATCH_ORDERS = 50
 _MAPPINGS_PER_PAGE = 10
 _ORDERS_PER_PAGE = 8
-_EXECUTOR: Optional[ThreadPoolExecutor] = None
-_EXECUTOR_LOCK = threading.RLock()
-_EXECUTOR_MAX_WORKERS = 10
+_TASK_SCHEDULER = BackgroundTaskScheduler()
+_PRICE_CATALOG_CACHE = TimedValueCache(ttl=45.0, max_entries=128)
 
 _EXCHANGE_RATE_THREAD: Optional[threading.Thread] = None
 _EXCHANGE_RATE_LOCK = threading.Lock()
@@ -538,42 +911,55 @@ def _is_order_terminal(status: Optional[str]) -> bool:
 
 
 def _start_executor() -> None:
-    global _EXECUTOR
-    with _EXECUTOR_LOCK:
-        if _EXECUTOR is None:
-            _EXECUTOR = ThreadPoolExecutor(
-                max_workers=_EXECUTOR_MAX_WORKERS,
-                thread_name_prefix="fzr_worker",
-            )
+    _TASK_SCHEDULER.start()
 
 
 def _log_future_exception(future: Any) -> None:
     try:
         exc = future.exception()
         if exc:
-            logger.exception("worker task failed", exc_info=exc)
+            logger.error(
+                "worker task failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
     except Exception:
         pass
 
 
-def _submit_task(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    with _EXECUTOR_LOCK:
-        if _EXECUTOR is None:
-            _start_executor()
-        future = _EXECUTOR.submit(fn, *args, **kwargs)
-        future.add_done_callback(_log_future_exception)
-        return future
+def _submit_task(
+    fn: Callable[..., object],
+    *args: object,
+    task_key: Optional[str] = None,
+    **kwargs: object,
+) -> Future:
+    future = _TASK_SCHEDULER.work.submit(
+        fn,
+        *args,
+        task_key=task_key,
+        **kwargs,
+    )
+    future.add_done_callback(_log_future_exception)
+    return future
+
+
+def _submit_io_task(
+    fn: Callable[..., object],
+    *args: object,
+    task_key: Optional[str] = None,
+    **kwargs: object,
+) -> Future:
+    future = _TASK_SCHEDULER.io.submit(
+        fn,
+        *args,
+        task_key=task_key,
+        **kwargs,
+    )
+    future.add_done_callback(_log_future_exception)
+    return future
 
 
 def _stop_executor(wait: bool = True) -> None:
-    global _EXECUTOR
-    with _EXECUTOR_LOCK:
-        if _EXECUTOR is not None:
-            try:
-                _EXECUTOR.shutdown(wait=wait, cancel_futures=True)
-            except TypeError:
-                _EXECUTOR.shutdown(wait=wait)
-            _EXECUTOR = None
+    _TASK_SCHEDULER.stop(wait=wait)
 
 
 # =============================================================================
@@ -584,17 +970,16 @@ def _rebind_paths_for_account(account_id: Optional[int]) -> None:
     global CONFIG_FILE, MAPPINGS_FILE, PROCESSED_FILE, CATALOG_CACHE_FILE, DB_PATH
     if not account_id:
         return
-    base = os.path.join("storage", "cache", "fzr_gifts", str(account_id))
-    os.makedirs(base, exist_ok=True)
+    paths = PluginPaths.for_account(account_id)
+    os.makedirs(paths.root, exist_ok=True)
     new_paths = {
-        "CONFIG_FILE": os.path.join(base, "config.json"),
-        "MAPPINGS_FILE": os.path.join(base, "mappings.json"),
-        "PROCESSED_FILE": os.path.join(base, "processed.json"),
-        "CATALOG_CACHE_FILE": os.path.join(base, "catalog_cache.json"),
-        "DB_PATH": os.path.join(base, "fzr_gifts.db"),
+        "CONFIG_FILE": paths.config,
+        "MAPPINGS_FILE": paths.mappings,
+        "PROCESSED_FILE": paths.processed,
+        "CATALOG_CACHE_FILE": paths.catalog_cache,
+        "DB_PATH": paths.database,
     }
-    backup_dir = os.path.join(base, "backups")
-    os.makedirs(backup_dir, exist_ok=True)
+    os.makedirs(paths.backups, exist_ok=True)
     marker = os.path.join(BASE_CACHE_DIR, ".fzr_migrated")
     migrated_account = None
     if os.path.exists(marker):
@@ -635,36 +1020,22 @@ def _rebind_paths_for_account(account_id: Optional[int]) -> None:
     CATALOG_CACHE_FILE = new_paths["CATALOG_CACHE_FILE"]
     DB_PATH = new_paths["DB_PATH"]
     _config_cache_invalidate()
-    logger.info("_rebind_paths_for_account done", extra={"account_id": account_id, "migrated": migrated, "base": base})
+    logger.info("_rebind_paths_for_account done", extra={
+        "account_id": account_id,
+        "migrated": migrated,
+        "base": paths.root,
+    })
 # =============================================================================
 # database
 # =============================================================================
 
 def _db_connect() -> sqlite3.Connection:
-    global _DB_CONN, _DB_CONN_PATH
-    if _DB_CONN is not None and _DB_CONN_PATH == DB_PATH:
-        return _DB_CONN
-    _db_close_conn()
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA foreign_keys = ON")
-    _DB_CONN = conn
-    _DB_CONN_PATH = DB_PATH
-    return conn
+    return _SQLITE_RUNTIME.connect(DB_PATH)
 
 
 def _db_close_conn() -> None:
-    global _DB_CONN, _DB_CONN_PATH, _DB_INITIALIZED
-    if _DB_CONN is not None:
-        try:
-            _DB_CONN.close()
-        except Exception:
-            pass
-        _DB_CONN = None
-        _DB_CONN_PATH = None
+    global _DB_INITIALIZED
+    _SQLITE_RUNTIME.close_all()
     _DB_INITIALIZED = False
 def _db_init() -> None:
     global _DB_INITIALIZED
@@ -2730,7 +3101,7 @@ def _wizard_prev_step(state: Dict[str, Any]) -> Optional[str]:
 
 def _fzr_wizard_back(c: "Cardinal", call: Any) -> None:
     """Кнопка «⬅️ Назад» внутри мастера создания лота."""
-    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    user_id = call.from_user.id
     state = get_state(user_id) if user_id else None
     if not state or state.get("state") not in _WIZARD_STATES:
         _send_or_edit(c, call, "⚠️ <b>Мастер создания лота не активен.</b>\n\n"
@@ -4703,7 +5074,15 @@ def _fzr_confirm_create_lot(c: "Cardinal", call: Any) -> None:
     message_id = getattr(getattr(call, "message", None), "message_id", None)
     clear_state(user_id)
     _send_or_edit(c, call, "⏳ <b>Создаю лот на FunPay...</b>", kb=None)
-    _submit_task(_fzr_do_create_lot, c, data, chat_id, message_id, user_id)
+    _submit_task(
+        _fzr_do_create_lot,
+        c,
+        data,
+        chat_id,
+        message_id,
+        user_id,
+        task_key=f"create-lot:{user_id}",
+    )
 
 
 def _step_create_lot_confirm(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
@@ -5321,6 +5700,7 @@ def _db_save_mapping(mapping: Dict[str, Any]) -> None:
     sql = f"INSERT INTO mappings ({cols}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}"
     with _DB_LOCK:
         _db_connect().execute(sql, [row[c] for c in _MAPPING_COLUMNS])
+    _RUNTIME.mark_mappings_changed()
 
 
 def _db_delete_mapping(mapping_id: str) -> None:
@@ -5328,6 +5708,7 @@ def _db_delete_mapping(mapping_id: str) -> None:
         _db_init()
     with _DB_LOCK:
         _db_connect().execute("DELETE FROM mappings WHERE id=?", (str(mapping_id),))
+    _RUNTIME.mark_mappings_changed()
 
 
 def _db_delete_all_mappings() -> int:
@@ -5342,6 +5723,8 @@ def _db_delete_all_mappings() -> int:
     with _DB_LOCK:
         cur = _db_connect().execute("DELETE FROM mappings")
         removed = cur.rowcount
+    if removed:
+        _RUNTIME.mark_mappings_changed()
     logger.warning("all mappings deleted", extra={"count": removed})
     return max(0, removed)
 
@@ -5624,6 +6007,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
         os.replace(tmp, CONFIG_FILE)
         _set_private_file(CONFIG_FILE)
         _config_cache_put(cfg)
+    _RUNTIME.mark_config_changed()
     logger.info("config saved", extra={"path": CONFIG_FILE})
 
 
@@ -8820,7 +9204,14 @@ def _retry_awaiting_funds_order(c: "Cardinal", order_id: str,
     logger.info("funds retry started", extra={
         "funpay_order_id": order_id, "manual": manual, "attempt": funds["attempts"]})
     # метаданные берём из БД — покупателя ни о чём не спрашиваем повторно
-    _submit_task(_process_order_creation, c, order_info, mapping, order.get("metadata") or {})
+    _submit_task(
+        _process_order_creation,
+        c,
+        order_info,
+        mapping,
+        order.get("metadata") or {},
+        task_key=f"order-create:{order_id}",
+    )
     return True, "Повторная обработка запущена."
 
 
@@ -9372,7 +9763,14 @@ def _deliver_order(c: "Cardinal", order_id: Any, fzr_order_id: str, status_data:
             if _delay > 0:
                 # пауза не должна занимать воркер опроса: при пачке заказов это
                 # добавляло бы delay к каждому
-                _submit_task(_send_review_request, c, fresh, mapping, fzr_order_id)
+                _submit_task(
+                    _send_review_request,
+                    c,
+                    fresh,
+                    mapping,
+                    fzr_order_id,
+                    task_key=f"review-request:{fzr_order_id}",
+                )
             else:
                 _send_review_request(c, fresh, mapping, fzr_order_id)
         except Exception as e:
@@ -9544,7 +9942,12 @@ def _poll_worker_loop(c: "Cardinal") -> None:
             for _, job in due:
                 if _SHUTDOWN_EVENT.is_set():
                     break
-                _submit_task(_run_poll_job, c, job)
+                _submit_task(
+                    _run_poll_job,
+                    c,
+                    job,
+                    task_key=f"poll:{job.get('funpay_order_id')}",
+                )
         else:
             for _, job in due:
                 if _SHUTDOWN_EVENT.is_set():
@@ -9620,9 +10023,15 @@ def _check_batch_order_status(c: "Cardinal", job: Dict[str, Any], batch: Dict[st
     use_parallel = len(ids) > 1 and bool(cfg["settings"].get("poll_parallel", True))
     if use_parallel:
         try:
-            with ThreadPoolExecutor(max_workers=min(8, len(ids)),
-                                    thread_name_prefix="fzr_batch") as pool:
-                results = list(pool.map(_fetch, ids))
+            futures = [
+                _submit_io_task(
+                    _fetch,
+                    fzr_id,
+                    task_key=f"batch-status:{funpay_order_id}:{fzr_id}",
+                )
+                for fzr_id in ids
+            ]
+            results = [future.result() for future in futures]
         except Exception as ex:
             logger.warning("batch parallel poll failed, falling back",
                            extra={"funpay_order_id": funpay_order_id, "error": repr(ex)})
@@ -9994,9 +10403,15 @@ def _manual_chat_poll_once(c: "Cardinal", cfg: Dict[str, Any]) -> None:
     results: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[BaseException]]] = []
     if len(due) > 1:
         try:
-            with ThreadPoolExecutor(max_workers=min(6, len(due)),
-                                    thread_name_prefix="fzr_mchat") as pool:
-                results = list(pool.map(_fetch, due))
+            futures = [
+                _submit_io_task(
+                    _fetch,
+                    order,
+                    task_key=f"manual-chat:{order.get('funpay_order_id')}",
+                )
+                for order in due
+            ]
+            results = [future.result() for future in futures]
         except Exception as ex:
             logger.warning("manual chat parallel poll failed, falling back",
                            extra={"error": repr(ex)})
@@ -10278,7 +10693,11 @@ def _check_low_balance(c: "Cardinal", cfg: Dict[str, Any]) -> Optional[float]:
 # ошибочной цены в каталоге), dry-run (сначала посмотреть, потом включить).
 # -----------------------------------------------------------------------------
 
-def _fetch_current_price_usd(api: "FazerCardsAPI", mapping: Dict[str, Any]) -> Optional[str]:
+def _fetch_current_price_usd(
+    api: "FazerCardsAPI",
+    mapping: Dict[str, Any],
+    raw_catalog: Optional[object] = None,
+) -> Optional[str]:
     """
     Актуальная закупка из каталога FazerCards для привязки.
 
@@ -10295,12 +10714,14 @@ def _fetch_current_price_usd(api: "FazerCardsAPI", mapping: Dict[str, Any]) -> O
     if not kind or not category_id or not offer_id:
         return None
     edition_id = offer_id.split(":")[0] if kind == "steam-gifts" else None
-    try:
-        raw = api.get_offers(kind, category_id)
-    except Exception as ex:
-        logger.warning("price sync: offers fetch failed", extra={
-            "mapping_id": mapping.get("id"), "error": _redact_sensitive(str(ex))})
-        return None
+    raw = raw_catalog
+    if raw is None:
+        try:
+            raw = api.get_offers(kind, category_id)
+        except Exception as ex:
+            logger.warning("price sync: offers fetch failed", extra={
+                "mapping_id": mapping.get("id"), "error": _redact_sensitive(str(ex))})
+            return None
     page = _normalize_catalog_page(kind, raw, is_categories=False, edition_id=edition_id)
     for item in page.get("items") or []:
         if str(item.get("id")) == offer_id:
@@ -10311,14 +10732,91 @@ def _fetch_current_price_usd(api: "FazerCardsAPI", mapping: Dict[str, Any]) -> O
     return None
 
 
-def _price_sync_candidates() -> List[Dict[str, Any]]:
+def _price_mapping_key(mapping: Mapping[str, object]) -> str:
+    mapping_id = mapping.get("id")
+    if mapping_id not in (None, ""):
+        return str(mapping_id)
+    return "|".join(str(mapping.get(key) or "") for key in (
+        "category_kind", "category_id", "offer_id", "funpay_lot_id"))
+
+
+def _price_catalog_key(api: "FazerCardsAPI", kind: str, category_id: str) -> str:
+    api_identity = hashlib.sha256(api.api_key.encode("utf-8")).hexdigest()[:12]
+    return f"{api_identity}:{api.base_url}:{kind}:{category_id}"
+
+
+def _fetch_current_prices_usd(
+    api: "FazerCardsAPI",
+    mappings: List[Dict[str, Any]],
+) -> Dict[str, Optional[str]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    prices = {_price_mapping_key(mapping): None for mapping in mappings}
+    for mapping in mappings:
+        kind = str(mapping.get("category_kind") or "")
+        category_id = str(mapping.get("category_id") or "")
+        offer_id = str(mapping.get("offer_id") or "")
+        if kind and category_id and offer_id:
+            grouped.setdefault((kind, category_id), []).append(mapping)
+
+    raw_by_source: Dict[Tuple[str, str], object] = {}
+    pending: Dict[Tuple[str, str], Future] = {}
+    for source in grouped:
+        kind, category_id = source
+        cache_key = _price_catalog_key(api, kind, category_id)
+        cached = _PRICE_CATALOG_CACHE.get(cache_key)
+        if cached is not None:
+            raw_by_source[source] = cached
+            continue
+        pending[source] = _submit_io_task(
+            api.get_offers,
+            kind,
+            category_id,
+            task_key=f"price-catalog:{cache_key}",
+        )
+
+    for source, future in pending.items():
+        kind, category_id = source
+        try:
+            raw = future.result()
+        except Exception as ex:
+            logger.warning("price sync: offers fetch failed", extra={
+                "kind": kind,
+                "category_id": category_id,
+                "error": _redact_sensitive(str(ex)),
+            })
+            continue
+        raw_by_source[source] = raw
+        _PRICE_CATALOG_CACHE.put(
+            _price_catalog_key(api, kind, category_id),
+            raw,
+        )
+
+    for source, source_mappings in grouped.items():
+        raw = raw_by_source.get(source)
+        if raw is None:
+            continue
+        for mapping in source_mappings:
+            prices[_price_mapping_key(mapping)] = _fetch_current_price_usd(
+                api,
+                mapping,
+                raw_catalog=raw,
+            )
+    return prices
+
+
+def _price_sync_candidates(
+    mappings: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Привязки, у которых включена синхронизация и есть лот."""
-    return [m for m in _db_get_mappings()
+    source = mappings if mappings is not None else _db_get_mappings()
+    return [m for m in source
             if m.get("price_sync") and m.get("funpay_lot_id")]
 
 
-def _price_sync_inventory() -> Dict[str, int]:
-    mappings = _db_get_mappings()
+def _price_sync_inventory(
+    mappings: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    mappings = mappings if mappings is not None else _db_get_mappings()
     linked = [m for m in mappings if m.get("funpay_lot_id")]
     ready = [m for m in linked if m.get("price_sync")]
     return {
@@ -10493,10 +10991,11 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
     force=True — подтверждённый ручной запуск, игнорирует порог и лимит скачка.
     only_mapping_id — пересчитать одну привязку (кнопка в её карточке).
     """
+    all_mappings = _db_get_mappings()
     report: Dict[str, Any] = {
         "checked": 0, "changed": [], "skipped": [],
         "failed": [], "review": [], "dry_run": False,
-        "inventory": _price_sync_inventory(),
+        "inventory": _price_sync_inventory(all_mappings),
         "global_enabled": bool(cfg["settings"].get("price_sync")),
         "forced": force,
     }
@@ -10504,20 +11003,37 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
         report["error"] = "API-ключ не задан"
         return report
 
-    mappings = _price_sync_candidates()
+    mappings = _price_sync_candidates(all_mappings)
     if only_mapping_id:
-        mappings = [m for m in _db_get_mappings() if m.get("id") == only_mapping_id]
+        mappings = [m for m in all_mappings if m.get("id") == only_mapping_id]
     if not mappings:
         return report
 
     dry_run = bool(cfg["settings"].get("price_sync_dry_run"))
     report["dry_run"] = dry_run
     api = get_fzr_client(cfg["api_key"], cfg["base_url"])
+    fresh_prices = _fetch_current_prices_usd(api, mappings)
+    seen_lots: Dict[str, str] = {}
 
     for mapping in mappings:
         report["checked"] += 1
         name = _mapping_display_name(mapping)
-        fresh_usd = _fetch_current_price_usd(api, mapping)
+        lot_id = str(mapping.get("funpay_lot_id") or "")
+        previous_mapping = seen_lots.get(lot_id)
+        if lot_id and previous_mapping:
+            report["failed"].append({
+                "name": name,
+                "id": mapping.get("id"),
+                "error": (
+                    f"лот {lot_id} уже связан с маппингом {previous_mapping}; "
+                    "дубликат не обновлён"
+                ),
+                "new": None,
+            })
+            continue
+        if lot_id:
+            seen_lots[lot_id] = str(mapping.get("id") or "?")
+        fresh_usd = fresh_prices.get(_price_mapping_key(mapping))
         lot_fields, current_price, lot_error = _load_lot_fields(c, mapping)
         if lot_error:
             report["failed"].append({
@@ -10910,7 +11426,14 @@ def _handle_new_order_inner(c: "Cardinal", e: NewOrderEvent) -> None:
                 # все поля закрылись автоподстановкой — спрашивать нечего
                 _greet_buyer(c, cfg, order, mapping, quantity, will_ask=False)
                 _db_update_order(order_id, status="processing", metadata_json=_to_json(values))
-                _submit_task(_process_order_creation, c, order_info, mapping, values)
+                _submit_task(
+                    _process_order_creation,
+                    c,
+                    order_info,
+                    mapping,
+                    values,
+                    task_key=f"order-create:{order_id}",
+                )
                 return
 
             # сначала приветствие («заказ принят, сейчас спрошу»), потом вопрос
@@ -10938,7 +11461,14 @@ def _handle_new_order_inner(c: "Cardinal", e: NewOrderEvent) -> None:
 
     _greet_buyer(c, cfg, order, mapping, quantity, will_ask=False)
     _db_update_order(order_id, status="processing")
-    _submit_task(_process_order_creation, c, order_info, mapping, {})
+    _submit_task(
+        _process_order_creation,
+        c,
+        order_info,
+        mapping,
+        {},
+        task_key=f"order-create:{order_id}",
+    )
 def handle_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
     try:
         _handle_new_order_inner(c, e)
@@ -10975,7 +11505,14 @@ def _finish_metadata_dialog(c: "Cardinal", cfg: Dict[str, Any], mapping: Dict[st
     parts = [p for p in (prefix, progress) if p]
     if parts:
         _send_buyer(c, chat_id, "\n\n".join(parts), buyer)
-    _submit_task(_process_order_creation, c, order_info, mapping, metadata_values)
+    _submit_task(
+        _process_order_creation,
+        c,
+        order_info,
+        mapping,
+        metadata_values,
+        task_key=f"order-create:{order_id}",
+    )
 
 
 def _save_pending(funpay_order_id: Any, buyer_id: Any, chat_id: Any,
@@ -11087,7 +11624,14 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
     if not meta_fields:
         _db_remove_pending(funpay_order_id)
         _db_update_order(funpay_order_id, status="processing")
-        _submit_task(_process_order_creation, c, order_info, mapping, {})
+        _submit_task(
+            _process_order_creation,
+            c,
+            order_info,
+            mapping,
+            {},
+            task_key=f"order-create:{funpay_order_id}",
+        )
         return
 
     if text.lower() == "/cancel":
@@ -11915,7 +12459,14 @@ def _retry_order(c: "Cardinal", call: Any, order_id: str) -> None:
     metadata = order.get("metadata") or {}
     _db_force_update_order(order_id, status=OrderStatus.PROCESSING.value, error="")
     _db_log_event(order_id, "admin_retry", {"previous_status": order.get("status"), "mode": "create"})
-    _submit_task(_process_order_creation, c, order_info, mapping, metadata)
+    _submit_task(
+        _process_order_creation,
+        c,
+        order_info,
+        mapping,
+        metadata,
+        task_key=f"order-create:{order_id}",
+    )
     _send_or_edit(c, call, f"🔄 <b>Повторная обработка заказа <code>{_esc(order_id)}</code> запущена.</b>")
 
 
@@ -12510,7 +13061,7 @@ def _state_waiting(message: Any) -> bool:
     if user_id is None:
         return False
     return get_state(user_id) is not None
-def cbq_dispatcher(c: "Cardinal", call: Any) -> None:
+def _cbq_dispatcher_legacy(c: "Cardinal", call: Any) -> None:
     if not _is_admin(c, call):
         try:
             c.telegram.bot.answer_callback_query(call.id)
@@ -12832,6 +13383,304 @@ def cbq_dispatcher(c: "Cardinal", call: Any) -> None:
             bot.send_message(call.message.chat.id, f"❌ Ошибка: {_esc(e)}")
         except Exception:
             pass
+
+def _build_callback_arg_handlers() -> Dict[str, Callable[..., object]]:
+    return {
+    "catalog": _show_catalog,
+    "mapping_open": _mapping_open,
+    "mapping_del": _delete_mapping,
+    "relink": _show_relink,
+    "mapping_toggle": _toggle_mapping,
+    "mapping_markup": _mapping_markup_prompt,
+    "mapping_units": _mapping_units_prompt,
+    "mapping_refresh": _mapping_refresh_fields,
+    "mapping_vid": _mapping_toggle_validate_id,
+    "mchat": _show_manual_chat,
+    "mchat_reply": _manual_chat_reply_prompt,
+    "mchat_relay": _manual_chat_relay_now,
+    "bal_history": _show_balance_history,
+    "funds_retry": _funds_retry_button,
+    "funds_refund": _funds_refund_button,
+    "mapping_psync": _mapping_toggle_price_sync,
+    "mapping_psync_now": _mapping_price_sync_now,
+    "mapping_greet": _mapping_greeting_prompt,
+    "mapping_ask": _mapping_ask_prompt,
+    "mapping_review": _mapping_review_prompt,
+    "mapping_refund": _mapping_refund_prompt,
+    "tpl_edit": _tpl_edit_prompt,
+    "mapping_texts": _mapping_preview_texts,
+    "settings_sec": _show_settings,
+    "settings_edit": _start_settings_edit,
+    "settings_toggle": _toggle_setting,
+    "catalog_select": _catalog_select,
+    "lotcustom": _fzr_handle_custom_select,
+    "lotcustom_page": _fzr_handle_custom_page,
+    "lotcustom_back": _fzr_handle_custom_back,
+    "lotcustom_goto": _fzr_goto_custom_field,
+    "create_lot_amount": _fzr_set_amount,
+    "order_view": _show_order_details,
+    "order_retry": _retry_order,
+    "cancel_refund": _cancel_refund_retry,
+    "order_cancel": _cancel_order,
+    "export": _do_export,
+    "exp_sel": _show_export_pick,
+    "exp_go": _export_selected,
+    "import_undo": _import_undo,
+    }
+
+
+def _build_callback_noarg_handlers() -> Dict[str, Callable[..., object]]:
+    return {
+    "mappings": _show_mappings,
+    "relink_all": _relink_all,
+    "mappings_enable_all": _mappings_enable_all,
+    "mappings_enable_undo": _mappings_enable_undo,
+    "mchat_list": _show_manual_chat_list,
+    "balance": _show_balance,
+    "bal_topup": _balance_topup_prompt,
+    "bal_correct": _balance_correct_prompt,
+    "account": _show_account,
+    "funds_list": _show_funds_orders,
+    "funds_retry_all": _funds_retry_all,
+    "price_sync_now": _price_sync_now,
+    "rate_now": _rate_update_now,
+    "settings": _show_settings,
+    "webhook": _show_webhook,
+    "webhook_del": _webhook_delete,
+    "webhook_test": _webhook_test,
+    "webhook_secret": _webhook_regenerate_secret,
+    "webhook_log": _webhook_deliveries,
+    "create_lot": _fzr_start_create_lot,
+    "create_lot_sku_catalog": _fzr_open_sku_catalog_for_create_lot,
+    "create_lot_skip_sku": _fzr_skip_sku_step,
+    "create_lot_skip_title": _fzr_skip_title,
+    "create_lot_psync": _fzr_toggle_create_psync,
+    "create_lot_amount_edit": _fzr_edit_amount,
+    "create_lot_useprice": _fzr_use_calc_price,
+    "create_lot_go": _fzr_confirm_create_lot,
+    "create_lot_back": _fzr_wizard_back,
+    "create_lot_back_to_wizard": _fzr_wizard_resume,
+    "create_lot_fix": _fzr_fix_failed_lot,
+    "orders_purge_foreign": _orders_purge_foreign,
+    "metrics": _show_metrics,
+    "backup": _show_backup_menu,
+    "readiness": _show_readiness,
+    "mappings_wipe": _mappings_delete_all_prompt,
+    "import": _import_prompt,
+    "import_apply": _import_apply,
+    "import_backups": _import_backups_list,
+    }
+
+
+_CALLBACK_ROUTE_LOCK = threading.RLock()
+_CALLBACK_ARG_HANDLERS: Dict[str, Callable[..., object]] = {}
+_CALLBACK_NOARG_HANDLERS: Dict[str, Callable[..., object]] = {}
+
+_CALLBACK_EXPORT_ACTIONS = {
+    "exp_pick", "exp_all", "exp_none", "exp_on", "exp_off", "exp_mode",
+}
+
+
+def _ensure_callback_routes() -> None:
+    if _CALLBACK_ARG_HANDLERS and _CALLBACK_NOARG_HANDLERS:
+        return
+    with _CALLBACK_ROUTE_LOCK:
+        if not _CALLBACK_ARG_HANDLERS:
+            _CALLBACK_ARG_HANDLERS.update(_build_callback_arg_handlers())
+        if not _CALLBACK_NOARG_HANDLERS:
+            _CALLBACK_NOARG_HANDLERS.update(_build_callback_noarg_handlers())
+
+
+def _dispatch_special_callback(
+    c: "Cardinal",
+    call: object,
+    action: str,
+    arg: str,
+    user_id: Optional[int],
+) -> bool:
+    if action == "menu":
+        _send_or_edit(c, call, _main_menu_text(), kb=_main_keyboard())
+    elif action == "close":
+        try:
+            c.telegram.bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            _send_or_edit(c, call, "↩️", kb=None)
+    elif action == "apikey":
+        set_state(call.from_user.id, "apikey")
+        _send_or_edit(
+            c, call,
+            "🔑 <b>API-ключ FazerCards</b>\n\n"
+            "Пришлите ключ (обычно начинается с <code>live_</code> или <code>test_</code>):",
+        )
+    elif action == "mappings_page":
+        try:
+            page = int(arg)
+        except ValueError:
+            page = 0
+        _show_mappings(c, call, page)
+    elif action == "mapping_add":
+        set_state(call.from_user.id, "mapping_sku")
+        _send_or_edit(
+            c, call,
+            "➕ <b>Новая привязка</b>\n\n"
+            "Пришлите <b>SKU FazerCards</b> в формате "
+            "<code>kind:category_id:offer_id</code>\n"
+            "(например <code>giftcards:123:456</code>):",
+        )
+    elif action == "mapping_del_yes":
+        mapping = _get_mapping_by_id(arg)
+        if mapping:
+            _db_delete_mapping(arg)
+            _send_or_edit(
+                c, call,
+                f"✅ <b>Привязка <code>{_esc(mapping.get('fzr_sku_id'))}</code> удалена.</b>",
+                kb=_main_keyboard(),
+            )
+        else:
+            _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
+    elif action == "relink_apply":
+        _relink_apply(c, call, enable=(arg == "1"))
+    elif action == "mapping_markup_reset":
+        _mapping_markup_set(
+            c, call, arg, None, None,
+            "<b>Наценка сброшена</b> — привязка снова использует общую наценку.",
+        )
+    elif action == "mapping_markup_zero":
+        _mapping_markup_set(
+            c, call, arg, 0.0, 0.0,
+            "<b>Установлена наценка 0%</b> — цена для привязки считается без наценки.",
+        )
+    elif action == "webhook_set":
+        set_state(call.from_user.id, "webhook_url")
+        _send_or_edit(
+            c, call,
+            "🔗 <b>Webhook</b>\n\n"
+            "Пришлите <b>HTTPS URL</b>, на который FazerCards будет отправлять статусы заказов "
+            "(например <code>https://example.com/fzr-hook</code>).",
+        )
+    elif action == "lotcat":
+        try:
+            cat_id, page = arg.split(":", 1)
+            _fzr_open_category(c, call, int(cat_id), int(page))
+        except Exception as ex:
+            logger.warning("lotcat parse error", extra={"error": _redact_sensitive(str(ex))})
+            _send_or_edit(c, call, "❌ Некорректные данные категории.")
+    elif action == "lotcat_page":
+        try:
+            page = int(arg)
+        except ValueError:
+            page = 0
+        _send_or_edit(
+            c, call,
+            "🛒 <b>Создание лота</b>\n\n<i>Выберите игру (категорию):</i>",
+            kb=_fzr_categories_kb(c, page),
+        )
+    elif action == "lotsub":
+        try:
+            subcat_id, _page = arg.split(":", 1)
+            _fzr_select_subcategory(c, call, int(subcat_id))
+        except Exception as ex:
+            logger.warning("lotsub parse error", extra={"error": _redact_sensitive(str(ex))})
+            _send_or_edit(c, call, "❌ Некорректные данные подкатегории.")
+    elif action == "lotsub_page":
+        try:
+            cat_id, page = arg.split(":", 1)
+            _fzr_open_category(c, call, int(cat_id), int(page))
+        except Exception as ex:
+            logger.warning("lotsub_page parse error", extra={"error": _redact_sensitive(str(ex))})
+            _send_or_edit(c, call, "❌ Некорректные данные категории.")
+    elif action in ("orders", "orders_filter"):
+        try:
+            filter_status, page_raw = arg.split(":", 1)
+            page = int(page_raw)
+        except Exception:
+            filter_status = "all"
+            page = 0
+        _show_orders(c, call, filter_status, page)
+    elif action == "search":
+        try:
+            mode, payload = arg.split(":", 1)
+            _fzr_search_prompt(c, call, mode, json.loads(payload))
+        except Exception as ex:
+            logger.warning("search callback parse error", extra={"error": _redact_sensitive(str(ex))})
+            _send_or_edit(c, call, "❌ Ошибка параметров поиска.")
+    elif action == "search_page":
+        try:
+            delta = int(arg)
+        except ValueError:
+            delta = 0
+        state = get_state(user_id)
+        if state and state.get("state") == "search":
+            state["data"]["page"] = max(0, state["data"].get("page", 0) + delta)
+            _fzr_show_search_results(c, call, state)
+    elif action == "metrics_reset":
+        _reset_metrics()
+        _show_metrics(c, call)
+    elif action in _CALLBACK_EXPORT_ACTIONS:
+        _export_pick_action(c, call, action, arg)
+    elif action == "export_secret":
+        _do_export(c, call, _EXPORT_KIND_FULL, with_secrets=True)
+    elif action == "import_lots":
+        _import_replan(c, call, keep_lots=(arg == "1"))
+    elif action == "import_key":
+        _import_replan(c, call, toggle_key=True)
+    elif action == "noop":
+        pass
+    else:
+        return False
+    return True
+
+
+def cbq_dispatcher(c: "Cardinal", call: Any) -> None:
+    if not _is_admin(c, call):
+        try:
+            c.telegram.bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        return
+    try:
+        c.telegram.bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    raw_data = _unpack_callback_data(call.data)
+    if raw_data is None:
+        _send_or_edit(c, call, "❌ <b>Кнопка устарела.</b>\n\nОткройте меню заново.")
+        return
+    parts = raw_data.split(":", 2)
+    if len(parts) < 2 or parts[0] != CB_PREFIX:
+        return
+    action = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    user_id = call.from_user.id
+    if action not in _STATE_PRESERVING_ACTIONS:
+        clear_state(user_id)
+
+    try:
+        _ensure_callback_routes()
+        arg_handler = _CALLBACK_ARG_HANDLERS.get(action)
+        if arg_handler is not None:
+            arg_handler(c, call, arg)
+            return
+        noarg_handler = _CALLBACK_NOARG_HANDLERS.get(action)
+        if noarg_handler is not None:
+            noarg_handler(c, call)
+            return
+        if not _dispatch_special_callback(c, call, action, arg, user_id):
+            _send_or_edit(c, call, "❌ <b>Неизвестная команда.</b>")
+    except Exception as ex:
+        logger.exception("cbq_dispatcher failed", extra={
+            "action": action,
+            "error": repr(ex),
+        })
+        try:
+            c.telegram.bot.send_message(
+                call.message.chat.id,
+                f"❌ Ошибка: {_esc(ex)}",
+            )
+        except Exception:
+            pass
+
 
 def _handle_step(c: "Cardinal", message: Any, state: Optional[Dict[str, Any]]) -> None:
     user_id = getattr(getattr(message, "from_user", None), "id", None)
@@ -15483,7 +16332,8 @@ def _mapping_markup_set(c: "Cardinal", call: Any, mapping_id: str,
     if fresh.get("price_sync") and fresh.get("funpay_lot_id"):
         _submit_task(
             _sync_lot_prices_after_setting_change,
-            c, cfg, "mapping_markup", mapping_id)
+            c, cfg, "mapping_markup", mapping_id,
+            task_key=f"price-sync:mapping:{mapping_id}:{_RUNTIME.mapping_revision}")
 
 
 def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
@@ -15528,7 +16378,8 @@ def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]
     if fresh.get("price_sync") and fresh.get("funpay_lot_id"):
         _submit_task(
             _sync_lot_prices_after_setting_change,
-            c, cfg, "mapping_markup", mapping_id)
+            c, cfg, "mapping_markup", mapping_id,
+            task_key=f"price-sync:mapping:{mapping_id}:{_RUNTIME.mapping_revision}")
 
 # =============================================================================
 # импорт / экспорт настроек и привязок (v3.8)
@@ -17921,7 +18772,13 @@ def _step_settings_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> N
     logger.info("setting changed", extra={"key": key, "old": old, "new": value})
     if old != value and key in ("markup_percent", "markup_fixed",
                                 "exchange_rate", "price_round"):
-        _submit_task(_sync_lot_prices_after_setting_change, c, cfg, key)
+        _submit_task(
+            _sync_lot_prices_after_setting_change,
+            c,
+            cfg,
+            key,
+            task_key=f"price-sync:config:{_RUNTIME.config_revision}",
+        )
     # интервал обновления курса применяем сразу, не ждём старого цикла
     if key == "exchange_rate_interval":
         _ensure_exchange_rate_updater(c)
@@ -18361,7 +19218,14 @@ def _resume_pending_orders(c: "Cardinal") -> None:
                     if mapping_id and sku_id and order_json:
                         mapping = _get_mapping_by_id(mapping_id)
                         if mapping and mapping.get("fzr_sku_id") == sku_id:
-                            _submit_task(_process_order_creation, c, order_json, mapping, {})
+                            _submit_task(
+                                _process_order_creation,
+                                c,
+                                order_json,
+                                mapping,
+                                {},
+                                task_key=f"order-create:{funpay_order_id}",
+                            )
                             restarted_creation += 1
                         else:
                             _db_update_order(funpay_order_id, status="needs_review", error="mapping/sku mismatch on resume")
@@ -18428,7 +19292,6 @@ def _resume_pending_orders(c: "Cardinal") -> None:
         logger.exception("resume pending orders failed", extra={"error": repr(e)})
 def init_telegram(c: "Cardinal") -> None:
     logger.info("FazerCards Reseller Telegram handlers registering")
-    _SHUTDOWN_EVENT.clear()
 
     if c.telegram and c.telegram.bot:
         bot = c.telegram.bot
@@ -18503,8 +19366,9 @@ def init_telegram(c: "Cardinal") -> None:
 
 def init_plugin(c: "Cardinal") -> None:
     logger.info("FazerCards Reseller plugin initializing")
+    _RUNTIME.restart()
 
-    account_id = getattr(getattr(c, "account", None), "id", None)
+    account_id = c.account.id if c.account is not None else None
     _rebind_paths_for_account(account_id)
 
     _db_init()
@@ -18514,9 +19378,11 @@ def init_plugin(c: "Cardinal") -> None:
     load_config()
     _load_metrics()
 
-    threading.Thread(target=_prefetch_steam_gifts_catalog, daemon=True).start()
-
     _start_executor()
+    _submit_io_task(
+        _prefetch_steam_gifts_catalog,
+        task_key="catalog-prefetch:steam-gifts",
+    )
     _start_exchange_rate_updater(c)
     _start_poll_worker(c)
     _start_dialog_timeout_watcher(c)
@@ -18530,7 +19396,7 @@ def init_plugin(c: "Cardinal") -> None:
     logger.info("FazerCards Reseller plugin initialized", extra={"account_id": account_id})
 def cleanup(c: "Cardinal", *args: Any) -> None:
     logger.info("FazerCards Reseller plugin shutting down")
-    _SHUTDOWN_EVENT.set()
+    _RUNTIME.stop()
     # будим ожидающие потоки, чтобы не держать остановку до конца тика
     _POLL_WAKE.set()
     _EXCHANGE_RATE_WAKE.set()
@@ -18543,12 +19409,7 @@ def cleanup(c: "Cardinal", *args: Any) -> None:
             except Exception:
                 pass
     _REGISTERED_HANDLERS.clear()
-    _stop_executor(wait=True)
     _stop_exchange_rate_updater()
-    with _FZR_CLIENTS_LOCK:
-        _FZR_CLIENTS.clear()
-    _db_close_conn()
-
     if _POLL_THREAD and _POLL_THREAD.is_alive():
         try:
             _POLL_THREAD.join(timeout=5.0)
@@ -18569,6 +19430,11 @@ def cleanup(c: "Cardinal", *args: Any) -> None:
             _HEALTH_THREAD.join(timeout=5.0)
         except Exception:
             pass
+    _stop_executor(wait=True)
+    with _FZR_CLIENTS_LOCK:
+        _FZR_CLIENTS.clear()
+    _PRICE_CATALOG_CACHE.clear()
+    _db_close_conn()
     with _MANUAL_CHAT_LOCK:
         _MANUAL_CHAT_STATE.clear()
         _MANUAL_CHAT_SKIP.clear()
@@ -20796,6 +21662,136 @@ def _run_smoke_tests() -> None:
         # чужой номинал не находим
         assert _find_lot_by_title(_lots_live, "💙123 АЛМАЗОВ💙АВТОВЫДАЧА 24/7💙")[0] == []
         print("_find_lot_by_title (live) OK")
+
+        _RUNTIME.restart()
+        _runtime_before = _RUNTIME.snapshot()
+        _RUNTIME.mark_config_changed()
+        _RUNTIME.mark_mappings_changed()
+        _runtime_after = _RUNTIME.snapshot()
+        assert _runtime_after["generation"] == _runtime_before["generation"]
+        assert _runtime_after["config_revision"] == _runtime_before["config_revision"] + 1
+        assert _runtime_after["mapping_revision"] == _runtime_before["mapping_revision"] + 1
+        _RUNTIME.stop()
+        assert _RUNTIME.snapshot()["shutting_down"] is True
+        _RUNTIME.restart()
+        assert _RUNTIME.snapshot()["shutting_down"] is False
+        print("PluginRuntime OK")
+
+        _db_connect()
+        _connection_ids: List[int] = []
+        _connection_errors: List[str] = []
+        _connection_lock = threading.Lock()
+        _connection_barrier = threading.Barrier(3)
+
+        def _thread_connection_probe() -> None:
+            try:
+                connection = _db_connect()
+                _connection_barrier.wait(timeout=5)
+                connection.execute("SELECT COUNT(*) FROM mappings").fetchone()
+                with _connection_lock:
+                    _connection_ids.append(id(connection))
+            except Exception as ex:
+                with _connection_lock:
+                    _connection_errors.append(str(ex))
+            finally:
+                _SQLITE_RUNTIME.close_current()
+
+        _connection_threads = [
+            threading.Thread(target=_thread_connection_probe)
+            for _ in range(2)
+        ]
+        for _thread in _connection_threads:
+            _thread.start()
+        _connection_barrier.wait(timeout=5)
+        for _thread in _connection_threads:
+            _thread.join(timeout=5)
+        assert not _connection_errors, _connection_errors
+        assert len(_connection_ids) == 2
+        assert len(set(_connection_ids)) == 2
+        print("SQLiteRuntime per-thread connections OK")
+
+        _dedupe_executor = BoundedExecutor(2, 2, "fzr_smoke")
+        _dedupe_gate = threading.Event()
+        _dedupe_calls: List[int] = []
+
+        def _dedupe_probe(value: int) -> int:
+            _dedupe_calls.append(value)
+            _dedupe_gate.wait(timeout=5)
+            return value
+
+        _dedupe_first = _dedupe_executor.submit(
+            _dedupe_probe, 7, task_key="same-task")
+        _dedupe_second = _dedupe_executor.submit(
+            _dedupe_probe, 9, task_key="same-task")
+        assert _dedupe_first is _dedupe_second
+        _dedupe_gate.set()
+        assert _dedupe_first.result(timeout=5) == 7
+        _dedupe_snapshot = _dedupe_executor.snapshot()
+        assert _dedupe_calls == [7]
+        assert _dedupe_snapshot["submitted"] == 1
+        assert _dedupe_snapshot["reused"] == 1
+        _dedupe_executor.stop()
+        print("BoundedExecutor deduplication OK")
+
+        class _CatalogProbe:
+            api_key = "smoke-key"
+            base_url = "https://example.invalid/api"
+
+            def __init__(self) -> None:
+                self.calls: List[Tuple[str, str]] = []
+
+            def get_offers(self, kind: str, category_id: str) -> Dict[str, object]:
+                self.calls.append((kind, category_id))
+                return {
+                    "offers": [
+                        {"offer_id": "one", "price_usd": "1.25"},
+                        {"offer_id": "two", "price_usd": "2.50"},
+                    ],
+                }
+
+        _PRICE_CATALOG_CACHE.clear()
+        _catalog_api = _CatalogProbe()
+        _catalog_mappings = [
+            {
+                "id": "catalog-one",
+                "category_kind": "giftcards",
+                "category_id": "shared",
+                "offer_id": "one",
+            },
+            {
+                "id": "catalog-two",
+                "category_kind": "giftcards",
+                "category_id": "shared",
+                "offer_id": "two",
+            },
+        ]
+        _catalog_prices = _fetch_current_prices_usd(
+            _catalog_api, _catalog_mappings)
+        assert _catalog_prices == {
+            "catalog-one": "1.25",
+            "catalog-two": "2.50",
+        }
+        assert _catalog_api.calls == [("giftcards", "shared")]
+        assert _fetch_current_prices_usd(
+            _catalog_api, _catalog_mappings) == _catalog_prices
+        assert _catalog_api.calls == [("giftcards", "shared")]
+        _PRICE_CATALOG_CACHE.clear()
+        print("price catalog grouping and cache OK")
+
+        _ensure_callback_routes()
+        assert not (
+            set(_CALLBACK_ARG_HANDLERS)
+            & set(_CALLBACK_NOARG_HANDLERS)
+        )
+        assert {
+            "catalog", "mapping_open", "settings_edit", "order_view",
+            "export", "mappings", "price_sync_now", "create_lot",
+            "metrics", "import_apply",
+        }.issubset(
+            set(_CALLBACK_ARG_HANDLERS)
+            | set(_CALLBACK_NOARG_HANDLERS)
+        )
+        print("declarative callback routing OK")
 
         print("ALL SMOKE TESTS PASSED")
     finally:
