@@ -38,8 +38,12 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.22.1"
+VERSION = "3.22.2"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.22.2: синхронизация сравнивает расчёт с живой ценой FunPay, "
+               "ручная проверка обходит пороги, а отчёт показывает причины "
+               "пропуска и источник наценки. Старые импортированные нулевые "
+               "наценки безопасно переводятся на глобальные.\n"
                "v3.22.1: giftcards-коды читаются из поля cards; изменение "
                "наценки сразу пересчитывает цены привязанных лотов, а импорт "
                "включает синхронизацию цен по умолчанию.\n"
@@ -731,6 +735,8 @@ def _db_init() -> None:
             funpay_title TEXT,
             markup_percent REAL,
             markup_fixed REAL,
+            markup_percent_custom INTEGER DEFAULT 0,
+            markup_fixed_custom INTEGER DEFAULT 0,
             metadata_key TEXT,
             metadata_prompt TEXT,
             metadata_validation TEXT,
@@ -827,12 +833,14 @@ def _db_ensure_schema_version(conn: sqlite3.Connection) -> None:
     except Exception:
         row = None
     version = row[0] if row else 0
-    target = 5
+    target = 6
     _db_migrate_columns(conn)
     if version < 4:
         _db_migrate_markup_nulls(conn)
     if version < 5:
         _db_migrate_price_sync_defaults(conn)
+    if version < 6:
+        _db_migrate_markup_sources(conn)
     if version < target:
         conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (target,))
 
@@ -880,6 +888,30 @@ def _db_migrate_price_sync_defaults(conn: sqlite3.Connection) -> None:
                        extra={"error": repr(e)})
 
 
+def _db_migrate_markup_sources(conn: sqlite3.Connection) -> None:
+    """
+    Явно отмечает индивидуальные наценки и чинит старые импорты.
+
+    В старых файлах ноль часто означал значение по умолчанию. Ненулевые
+    значения сохраняются как индивидуальные, а нули снова наследуют глобальную
+    наценку. После миграции явный ноль хранится вместе с custom-флагом.
+    """
+    changed: Dict[str, int] = {}
+    try:
+        for key in ("markup_percent", "markup_fixed"):
+            flag = f"{key}_custom"
+            cur = conn.execute(
+                f"UPDATE mappings SET {flag}=CASE "
+                f"WHEN {key} IS NULL OR TRIM(CAST({key} AS TEXT)) "
+                f"IN ('', '0', '0.0') THEN 0 ELSE 1 END"
+            )
+            changed[flag] = max(0, cur.rowcount)
+            conn.execute(f"UPDATE mappings SET {key}=NULL WHERE {flag}=0")
+        logger.info("markup source flags migrated", extra=changed)
+    except Exception as e:
+        logger.warning("markup source migration failed", extra={"error": repr(e)})
+
+
 # Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS не
 # обновляет существующие таблицы, поэтому при апгрейде плагина их нужно доливать
 # через ALTER TABLE, иначе запросы упадут на "no such column".
@@ -899,6 +931,8 @@ _DB_ADDED_COLUMNS: Dict[str, List[Tuple[str, str]]] = {
         ("last_price_usd", "TEXT"),      # v3.5: закупка на момент последней синхронизации
         ("last_lot_price", "REAL"),      # v3.5: цена, которую поставили на лот
         ("price_synced_at", "REAL"),
+        ("markup_percent_custom", "INTEGER DEFAULT 0"),
+        ("markup_fixed_custom", "INTEGER DEFAULT 0"),
         ("greeting_template", "TEXT"),   # v3.5: приветствие покупателю
         ("ask_template", "TEXT"),        # v3.5: свой запрос данных под категорию
         ("review_template", "TEXT"),     # v3.17: своя просьба об отзыве
@@ -976,6 +1010,7 @@ _MAPPING_COLUMNS = [
     "id", "fzr_sku_id", "category_kind", "category_id", "offer_id", "offer_name",
     "price_usd", "stock", "min_quantity", "max_quantity", "fields_json", "funpay_lot_id",
     "funpay_subcategory_id", "funpay_title", "markup_percent", "markup_fixed",
+    "markup_percent_custom", "markup_fixed_custom",
     "metadata_key", "metadata_prompt", "metadata_validation", "metadata_fields_json",
     "delivery_template", "enabled", "validate_id", "units_per_item",
     "price_sync", "last_price_usd", "last_lot_price", "price_synced_at",
@@ -5204,9 +5239,11 @@ def _prepare_mapping_row(mapping: Dict[str, Any]) -> Dict[str, Any]:
     row["units_per_item"] = _upi if _upi > 0 else 1
     # price_sync: по умолчанию ВЫКЛЮЧЕНА — цену лота меняем только по разрешению
     row["price_sync"] = 1 if mapping.get("price_sync") in (1, "1", True) else 0
-    # наценка: None = «наследовать глобальную», число (в т.ч. 0) = своё значение
+    # custom-флаг отличает явный ноль от наследования глобальной наценки.
     for _mk in ("markup_percent", "markup_fixed"):
-        row[_mk] = _markup_own(mapping, _mk)
+        _custom = _markup_is_custom(mapping, _mk)
+        row[f"{_mk}_custom"] = 1 if _custom else 0
+        row[_mk] = _markup_own(mapping, _mk) if _custom else None
     if row.get("created_at") is None:
         row["created_at"] = time.time()
     row["updated_at"] = time.time()
@@ -5223,6 +5260,9 @@ def _row_to_mapping(row: sqlite3.Row) -> Dict[str, Any]:
         _upi = 1
     d["units_per_item"] = _upi if _upi > 0 else 1
     d["price_sync"] = 1 if d.get("price_sync") in (1, "1", True) else 0
+    for _mk in ("markup_percent", "markup_fixed"):
+        _flag = f"{_mk}_custom"
+        d[_flag] = 1 if d.get(_flag) in (1, "1", True) else 0
     d["fields"] = _from_json(d.pop("fields_json", None))
     d["metadata_fields"] = _from_json(d.pop("metadata_fields_json", None))
     return d
@@ -7760,6 +7800,19 @@ def _refresh_mapping_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
         return _build_metadata_fields(mapping)
 
 
+def _markup_is_custom(mapping: Dict[str, Any], key: str) -> bool:
+    flag = f"{key}_custom"
+    if flag in mapping and mapping.get(flag) is not None:
+        return mapping.get(flag) in (1, "1", True)
+    return mapping.get(key) not in (None, "")
+
+
+def _set_markup_value(mapping: Dict[str, Any], key: str,
+                      value: Optional[float]) -> None:
+    mapping[key] = value
+    mapping[f"{key}_custom"] = 0 if value is None else 1
+
+
 def _markup_own(mapping: Dict[str, Any], key: str) -> Optional[float]:
     """
     Своя наценка привязки или None, если наследуется из настроек.
@@ -7768,6 +7821,8 @@ def _markup_own(mapping: Dict[str, Any], key: str) -> Optional[float]:
     До этого 0 трактовался как «не задано», и лот нельзя было продавать без
     наценки, когда в настройках она не нулевая.
     """
+    if not _markup_is_custom(mapping, key):
+        return None
     raw = mapping.get(key)
     if raw is None or raw == "":
         return None
@@ -10262,13 +10317,54 @@ def _price_sync_candidates() -> List[Dict[str, Any]]:
             if m.get("price_sync") and m.get("funpay_lot_id")]
 
 
+def _price_sync_inventory() -> Dict[str, int]:
+    mappings = _db_get_mappings()
+    linked = [m for m in mappings if m.get("funpay_lot_id")]
+    ready = [m for m in linked if m.get("price_sync")]
+    return {
+        "total": len(mappings),
+        "linked": len(linked),
+        "ready": len(ready),
+        "without_lot": len(mappings) - len(linked),
+        "sync_off": len(linked) - len(ready),
+        "custom_markup": sum(
+            1 for m in ready
+            if (_markup_is_custom(m, "markup_percent") or
+                _markup_is_custom(m, "markup_fixed"))
+        ),
+    }
+
+
+def _markup_source_summary(mapping: Dict[str, Any],
+                           cfg: Dict[str, Any]) -> str:
+    percent = _markup_own(mapping, "markup_percent")
+    fixed = _markup_own(mapping, "markup_fixed")
+    if percent is None and fixed is None:
+        return (
+            f"глобальная {_markup_effective(mapping, cfg, 'markup_percent'):g}%"
+            f" + {_markup_effective(mapping, cfg, 'markup_fixed'):g} ₽"
+        )
+    parts = []
+    parts.append(
+        f"{percent:g}% индивидуальная" if percent is not None
+        else f"{_markup_effective(mapping, cfg, 'markup_percent'):g}% глобальная"
+    )
+    parts.append(
+        f"{fixed:g} ₽ индивидуальная" if fixed is not None
+        else f"{_markup_effective(mapping, cfg, 'markup_fixed'):g} ₽ глобальная"
+    )
+    return " + ".join(parts)
+
+
 def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
-                       fresh_usd: Optional[str]) -> Dict[str, Any]:
+                       fresh_usd: Optional[str],
+                       current_lot_price: Optional[float] = None,
+                       force: bool = False) -> Dict[str, Any]:
     """
     Считает новую цену лота и решает, надо ли её менять.
 
-    Возвращает dict с полями: skip (причина отказа), old/new (цена),
-    delta_pct, reason (курс/закупка/наценка), usd.
+    В автоматическом режиме соблюдает порог и лимит скачка. Ручной force
+    подтверждает изменение и обходит оба ограничения.
     """
     usd = fresh_usd if fresh_usd is not None else mapping.get("price_usd")
     try:
@@ -10276,44 +10372,66 @@ def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
     except (TypeError, ValueError):
         rate = 0.0
     target = _apply_markup(usd, mapping, cfg, rate)
-    result: Dict[str, Any] = {"usd": usd, "rate": rate, "new": target,
-                              "old": None, "delta_pct": None, "skip": None,
-                              "reasons": []}
+    result: Dict[str, Any] = {
+        "usd": usd, "rate": rate, "new": target,
+        "old": None, "cached_old": None, "delta_pct": None, "skip": None,
+        "reasons": [], "markup_source": _markup_source_summary(mapping, cfg),
+    }
     if target is None:
         result["skip"] = "нет цены закупки или курса"
         return result
 
-    # с чем сравниваем: с ценой, которую сами ставили в прошлый раз
     try:
-        last_lot = float(mapping.get("last_lot_price") or 0) or None
+        cached_lot = float(mapping.get("last_lot_price") or 0) or None
     except (TypeError, ValueError):
-        last_lot = None
-    result["old"] = last_lot
+        cached_lot = None
+    result["cached_old"] = cached_lot
+    try:
+        live_lot = (float(current_lot_price)
+                    if current_lot_price not in (None, "") else None)
+    except (TypeError, ValueError):
+        live_lot = None
+    result["old"] = live_lot if live_lot is not None else cached_lot
 
-    # что именно изменилось — для внятного сообщения продавцу
     old_usd = str(mapping.get("last_price_usd") or "")
+    if fresh_usd is None and mapping.get("price_usd") not in (None, ""):
+        result["reasons"].append(
+            f"FazerCards недоступен — использована сохранённая закупка "
+            f"{mapping.get('price_usd')} USD")
     if fresh_usd is not None and old_usd and str(fresh_usd) != old_usd:
         result["reasons"].append(f"закупка {old_usd} → {fresh_usd} USD")
-    if last_lot is not None and target != last_lot:
-        result["reasons"].append(f"курс {rate:.2f}")
+    if live_lot is not None and cached_lot is not None and not math.isclose(
+            live_lot, cached_lot, abs_tol=0.001):
+        result["reasons"].append(
+            f"живая цена {live_lot:g} ₽ отличается от кэша {cached_lot:g} ₽")
 
-    if last_lot is None:
-        # первая синхронизация: цену знаем, но с чем сравнивать — нет
+    old_lot = result["old"]
+    if old_lot is None:
         result["delta_pct"] = None
         return result
+    if not math.isclose(target, old_lot, abs_tol=0.001):
+        result["reasons"].append(
+            f"расчёт: курс {rate:g}, наценка {result['markup_source']}")
 
-    if last_lot <= 0:
-        result["skip"] = "прошлая цена нулевая"
+    if old_lot <= 0:
+        result["skip"] = "текущая цена FunPay нулевая или недействительна"
         return result
 
-    delta_pct = (target - last_lot) / last_lot * 100.0
+    digits = max(0, int(cfg["settings"].get("price_round", 2) or 0))
+    if math.isclose(target, round(old_lot, digits),
+                    abs_tol=10 ** (-digits) / 2 if digits else 0.5):
+        result["skip"] = (
+            f"цена уже {target:g} ₽; наценка: {result['markup_source']}")
+        return result
+
+    delta_pct = (target - old_lot) / old_lot * 100.0
     result["delta_pct"] = delta_pct
 
     try:
         threshold = float(cfg["settings"].get("price_sync_threshold", 1.0) or 0)
     except (TypeError, ValueError):
         threshold = 1.0
-    if abs(delta_pct) < threshold:
+    if not force and abs(delta_pct) < threshold:
         result["skip"] = f"отклонение {delta_pct:+.2f}% меньше порога {threshold}%"
         return result
 
@@ -10321,8 +10439,7 @@ def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
         max_step = float(cfg["settings"].get("price_sync_max_step", 30.0) or 0)
     except (TypeError, ValueError):
         max_step = 30.0
-    if max_step > 0 and abs(delta_pct) > max_step:
-        # скорее всего в каталоге аномалия — молча менять цену опасно
+    if not force and max_step > 0 and abs(delta_pct) > max_step:
         result["skip"] = (f"скачок {delta_pct:+.1f}% больше лимита {max_step}% "
                           f"— нужна ручная проверка")
         result["needs_review"] = True
@@ -10330,17 +10447,34 @@ def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
     return result
 
 
-def _apply_lot_price(c: "Cardinal", mapping: Dict[str, Any], new_price: float) -> Tuple[bool, Optional[str]]:
-    """Ставит новую цену лоту на FunPay (читаем поля, меняем price, сохраняем)."""
+def _load_lot_fields(c: "Cardinal", mapping: Dict[str, Any]
+                     ) -> Tuple[Optional[Any], Optional[float], Optional[str]]:
     lot_id = mapping.get("funpay_lot_id")
     try:
         lot_id_int = int(lot_id)
     except (TypeError, ValueError):
-        return False, f"некорректный ID лота: {lot_id}"
+        return None, None, f"некорректный ID лота: {lot_id}"
     try:
-        lf = c.account.get_lot_fields(lot_id_int)
+        lot_fields = c.account.get_lot_fields(lot_id_int)
     except Exception as ex:
-        return False, f"не удалось получить лот: {_redact_sensitive(str(ex))}"
+        return None, None, f"не удалось получить лот: {_redact_sensitive(str(ex))}"
+    try:
+        price = float(lot_fields.price)
+    except (TypeError, ValueError):
+        return lot_fields, None, "FunPay не вернул текущую цену лота"
+    return lot_fields, price, None
+
+
+def _apply_lot_price(c: "Cardinal", mapping: Dict[str, Any],
+                     new_price: float,
+                     lot_fields: Optional[Any] = None
+                     ) -> Tuple[bool, Optional[str]]:
+    """Ставит новую цену лоту на FunPay (читаем поля, меняем price, сохраняем)."""
+    lf = lot_fields
+    if lf is None:
+        lf, _price, error = _load_lot_fields(c, mapping)
+        if error:
+            return False, error
     try:
         lf.price = new_price
         lf.renew_fields()
@@ -10356,11 +10490,16 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
     """
     Один проход синхронизации цен.
 
-    force=True — запуск из ПУ («Проверить сейчас»), игнорирует интервал.
+    force=True — подтверждённый ручной запуск, игнорирует порог и лимит скачка.
     only_mapping_id — пересчитать одну привязку (кнопка в её карточке).
     """
-    report: Dict[str, Any] = {"checked": 0, "changed": [], "skipped": [],
-                              "failed": [], "review": [], "dry_run": False}
+    report: Dict[str, Any] = {
+        "checked": 0, "changed": [], "skipped": [],
+        "failed": [], "review": [], "dry_run": False,
+        "inventory": _price_sync_inventory(),
+        "global_enabled": bool(cfg["settings"].get("price_sync")),
+        "forced": force,
+    }
     if not cfg.get("api_key"):
         report["error"] = "API-ключ не задан"
         return report
@@ -10379,12 +10518,22 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
         report["checked"] += 1
         name = _mapping_display_name(mapping)
         fresh_usd = _fetch_current_price_usd(api, mapping)
-        plan = _plan_price_change(mapping, cfg, fresh_usd)
+        lot_fields, current_price, lot_error = _load_lot_fields(c, mapping)
+        if lot_error:
+            report["failed"].append({
+                "name": name, "id": mapping.get("id"), "error": lot_error,
+                "new": None,
+            })
+            continue
+        plan = _plan_price_change(
+            mapping, cfg, fresh_usd, current_price, force=force)
         new_price = plan["new"]
 
         if plan["skip"]:
             entry = {"name": name, "id": mapping.get("id"), "reason": plan["skip"],
-                     "old": plan["old"], "new": new_price}
+                     "old": plan["old"], "new": new_price,
+                     "markup_source": plan.get("markup_source"),
+                     "reasons": plan.get("reasons") or []}
             if plan.get("needs_review"):
                 report["review"].append(entry)
                 # аномалия — сообщаем, но не чаще раза в сутки на привязку,
@@ -10407,20 +10556,28 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
                 # «прошлой» и в следующем отчёте причина будет наоборот
                 continue
             report["skipped"].append(entry)
-            # цену не меняем, но свежую закупку запоминаем — чтобы в следующий
-            # раз «причина» показывала реальное изменение
-            if fresh_usd is not None and str(fresh_usd) != str(mapping.get("last_price_usd") or ""):
-                _db_save_mapping({**mapping, "last_price_usd": str(fresh_usd)})
+            _db_save_mapping({
+                **mapping,
+                "last_price_usd": str(
+                    fresh_usd if fresh_usd is not None
+                    else mapping.get("price_usd") or ""),
+                "price_usd": (str(fresh_usd) if fresh_usd is not None
+                              else mapping.get("price_usd")),
+                "last_lot_price": current_price,
+                "price_synced_at": time.time(),
+            })
             continue
 
         first_run = plan["old"] is None
         if dry_run:
             report["skipped"].append({"name": name, "id": mapping.get("id"),
                                       "reason": "dry-run: цена не менялась",
-                                      "old": plan["old"], "new": new_price})
+                                      "old": plan["old"], "new": new_price,
+                                      "markup_source": plan.get("markup_source"),
+                                      "reasons": plan.get("reasons") or []})
             continue
 
-        ok, err = _apply_lot_price(c, mapping, new_price)
+        ok, err = _apply_lot_price(c, mapping, new_price, lot_fields)
         if not ok:
             report["failed"].append({"name": name, "id": mapping.get("id"),
                                      "error": err, "new": new_price})
@@ -10439,7 +10596,8 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
                  "lot_id": mapping.get("funpay_lot_id"),
                  "old": plan["old"], "new": new_price,
                  "delta_pct": plan["delta_pct"],
-                 "reasons": plan["reasons"], "first_run": first_run}
+                 "reasons": plan["reasons"], "first_run": first_run,
+                 "markup_source": plan.get("markup_source")}
         report["changed"].append(entry)
         logger.info("lot price synced", extra={
             "mapping_id": mapping.get("id"), "lot_id": mapping.get("funpay_lot_id"),
@@ -10453,8 +10611,10 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
 
 def _sync_lot_prices_after_setting_change(c: "Cardinal",
                                           cfg: Dict[str, Any],
-                                          setting: str) -> None:
-    report = _sync_lot_prices(c, cfg, force=True)
+                                          setting: str,
+                                          mapping_id: Optional[str] = None) -> None:
+    report = _sync_lot_prices(
+        c, cfg, force=True, only_mapping_id=mapping_id)
     logger.info("price sync after setting change", extra={
         "setting": setting,
         "checked": report.get("checked", 0),
@@ -10462,8 +10622,7 @@ def _sync_lot_prices_after_setting_change(c: "Cardinal",
         "failed": len(report.get("failed") or []),
         "error": report.get("error"),
     })
-    if report.get("error") or report.get("failed"):
-        _notify_admin(c, _price_sync_report_html(report))
+    _notify_admin(c, _price_sync_report_html(report))
 
 
 def _price_sync_summary(report: Dict[str, Any]) -> str:
@@ -14654,8 +14813,17 @@ def _price_sync_report_html(report: Dict[str, Any]) -> str:
     """Подробный отчёт синхронизации для ПУ."""
     if report.get("error"):
         return f"❌ <b>{_esc(report['error'])}</b>"
+    inventory = report.get("inventory") or {}
     lines = [f"💱 <b>Синхронизация цен</b>",
-             f"<i>проверено привязок: {report.get('checked', 0)}</i>"]
+             f"<i>проверено: {report.get('checked', 0)}; "
+             f"всего: {inventory.get('total', 0)}; "
+             f"с лотом: {inventory.get('linked', 0)}; "
+             f"автосинхронизация: {inventory.get('ready', 0)}; "
+             f"со своей наценкой: {inventory.get('custom_markup', 0)}</i>"]
+    if not report.get("global_enabled", True):
+        lines.append("⚠️ <i>Фоновая синхронизация цен выключена глобально.</i>")
+    if report.get("forced"):
+        lines.append("🛠 <i>Подтверждённый пересчёт: порог и лимит скачка не применяются.</i>")
     if report.get("dry_run"):
         lines.append("🧪 <i>режим проверки: лоты не менялись</i>")
     lines.append("")
@@ -14672,6 +14840,8 @@ def _price_sync_report_html(report: Dict[str, Any]) -> str:
         block = f"<blockquote>✅ {head}\n{body}"
         if reasons:
             block += f"\n<i>{_esc(reasons)}</i>"
+        if item.get("markup_source"):
+            block += f"\n<i>Наценка: {_esc(item['markup_source'])}</i>"
         lines.append(block + "</blockquote>")
     for item in report.get("review", [])[:5]:
         lines.append(f"<blockquote>⚠️ <b>{_esc(item['name'])}</b>\n"
@@ -14683,26 +14853,33 @@ def _price_sync_report_html(report: Dict[str, Any]) -> str:
     skipped = report.get("skipped") or []
     if skipped:
         lines.append(f"<blockquote expandable><b>Без изменений: {len(skipped)}</b>\n" +
-                     "\n".join(f"• {_esc(s['name'])} — {_esc(s.get('reason'))}"
-                               for s in skipped[:15]) + "</blockquote>")
+                     "\n".join(
+                         f"• {_esc(s['name'])} — {_esc(s.get('reason'))}"
+                         + (f"\n  <i>{_esc(', '.join(s.get('reasons') or []))}</i>"
+                            if s.get("reasons") else "")
+                         for s in skipped[:15]
+                     ) + "</blockquote>")
     if not report.get("changed") and not report.get("failed") and not report.get("review"):
-        lines.append("<i>Менять нечего: все цены в пределах порога.</i>")
+        if not report.get("checked"):
+            details = []
+            if inventory.get("sync_off"):
+                details.append(
+                    f"у {inventory['sync_off']} привязок выключена синхронизация")
+            if inventory.get("without_lot"):
+                details.append(
+                    f"у {inventory['without_lot']} привязок нет ID лота")
+            lines.append(
+                "<i>Нет привязок для проверки"
+                + (": " + "; ".join(details) if details else "")
+                + ".</i>")
+        elif skipped:
+            lines.append("<i>Обновлений нет; точная причина указана у каждого лота выше.</i>")
     return "\n".join(lines)
 
 
 def _price_sync_now(c: "Cardinal", call: Any) -> None:
     """Кнопка «Проверить цены сейчас» из настроек."""
     cfg = load_config()
-    candidates = _price_sync_candidates()
-    if not candidates:
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(_inline_button("🔗 К привязкам", callback_data=f"{CB_PREFIX}:mappings"))
-        kb.add(_inline_button("🔙 Настройки", callback_data=f"{CB_PREFIX}:settings_sec:price"))
-        _send_or_edit(c, call,
-                      "💱 <b>Синхронизация цен</b>\n\n"
-                      "<blockquote>Ни у одной привязки не включена синхронизация.\n\n"
-                      "Откройте привязку → «🔄 Вкл. синхронизацию цены».</blockquote>", kb=kb)
-        return
     report = _sync_lot_prices(c, cfg, force=True)
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(_inline_button("🔄 Ещё раз", callback_data=f"{CB_PREFIX}:price_sync_now"))
@@ -15288,20 +15465,25 @@ def _mapping_markup_set(c: "Cardinal", call: Any, mapping_id: str,
     if not mapping:
         _send_or_edit(c, call, "❌ <b>Привязка не найдена.</b>")
         return
-    mapping["markup_percent"] = percent
-    mapping["markup_fixed"] = fixed
+    _set_markup_value(mapping, "markup_percent", percent)
+    _set_markup_value(mapping, "markup_fixed", fixed)
     _db_save_mapping(mapping)
     clear_state(getattr(getattr(call, "from_user", None), "id", None))
     logger.info("mapping markup set", extra={"mapping_id": mapping_id,
                                              "percent": percent, "fixed": fixed})
     fresh = _get_mapping_by_id(mapping_id) or mapping
-    bd = _markup_breakdown(fresh.get("price_usd"), fresh, load_config())
+    cfg = load_config()
+    bd = _markup_breakdown(fresh.get("price_usd"), fresh, cfg)
     price_txt = (f"\n🏷 Цена лота: <b>{_esc(bd['price_rub'])}₽</b>"
                  if bd["price_rub"] is not None else "")
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(_inline_button("💰 Наценка", callback_data=f"{CB_PREFIX}:mapping_markup:{mapping_id}"),
            _inline_button("🔙 Привязка", callback_data=f"{CB_PREFIX}:mapping_open:{mapping_id}"))
     _send_or_edit(c, call, f"✅ {note}{price_txt}", kb=kb)
+    if fresh.get("price_sync") and fresh.get("funpay_lot_id"):
+        _submit_task(
+            _sync_lot_prices_after_setting_change,
+            c, cfg, "mapping_markup", mapping_id)
 
 
 def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]) -> None:
@@ -15315,9 +15497,9 @@ def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]
     if error:
         _send_telegram_message(c, message.chat.id, f"❌ {error}", reply_to=message)
         return
-    mapping["markup_percent"] = percent
+    _set_markup_value(mapping, "markup_percent", percent)
     if fixed is not _KEEP:
-        mapping["markup_fixed"] = fixed
+        _set_markup_value(mapping, "markup_fixed", fixed)
     _db_save_mapping(mapping)
     clear_state(message.from_user.id)
     cfg = load_config()
@@ -15343,6 +15525,10 @@ def _step_mapping_markup_edit(c: "Cardinal", message: Any, state: Dict[str, Any]
         f"➕ Фикс: {_fmt_side(_markup_own(fresh, 'markup_fixed'), cfg['settings'].get('markup_fixed'), '₽')}"
         f"{price_txt}",
         kb=kb)
+    if fresh.get("price_sync") and fresh.get("funpay_lot_id"):
+        _submit_task(
+            _sync_lot_prices_after_setting_change,
+            c, cfg, "mapping_markup", mapping_id)
 
 # =============================================================================
 # импорт / экспорт настроек и привязок (v3.8)
@@ -15588,9 +15774,10 @@ def _export_mapping(mapping: Dict[str, Any],
         if key == "funpay_title":
             continue        # уже отдали как funpay_lot_title
         out[key] = value
-    # наценка: None должен остаться None (наследование), а не превратиться в 0
+    # custom-флаги сохраняют различие между наследованием и явным нулём.
     for key in ("markup_percent", "markup_fixed"):
         out[key] = _markup_own(mapping, key)
+        out[f"{key}_custom"] = 1 if _markup_is_custom(mapping, key) else 0
     return out
 
 
@@ -15608,6 +15795,8 @@ _EXPORT_README = [
     "После импорта нажмите «Проверить выдачу» в разделе «Экспорт/импорт»: "
     "она прогоняет каждый лот так же, как реальный заказ.",
     "Привязка ищется по fzr_sku_id — его менять не нужно, иначе создастся новая.",
+    "markup_percent_custom/markup_fixed_custom: 0 = брать общую наценку, "
+    "1 = использовать значение этой привязки, включая явный ноль.",
     "Копируете блок привязки для нового товара — смените fzr_sku_id И id "
     "(или удалите строку id: плагин выдаст новый).",
     "markup_percent/markup_fixed: null = взять общую наценку из настроек, "
@@ -15874,9 +16063,17 @@ def _validate_import_mappings(raw: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
             mid = str(uuid.uuid4())
         clean["id"] = mid
         seen_ids.add(mid)
-        # наценка: пусто/None = наследовать, число = своё (в т.ч. 0)
+        # Новые экспорты содержат custom-флаг. В старых ноль обычно был
+        # техническим default и должен наследовать глобальную наценку.
         for key in ("markup_percent", "markup_fixed"):
-            clean[key] = _markup_own(clean, key)
+            flag = f"{key}_custom"
+            if flag in item:
+                own = _markup_own(clean, key)
+            else:
+                own = _markup_own(clean, key)
+                if own == 0:
+                    own = None
+            _set_markup_value(clean, key, own)
         out.append(clean)
     if skipped_no_sku:
         warnings.append(f"привязок без SKU пропущено: {skipped_no_sku}")
@@ -18714,11 +18911,33 @@ def _run_smoke_tests() -> None:
         _conn.execute("DELETE FROM mappings WHERE id LIKE 'psync-%'")
         print("_db_migrate_price_sync_defaults OK")
 
+        _conn.execute(
+            "INSERT INTO mappings "
+            "(id, markup_percent, markup_fixed, "
+            "markup_percent_custom, markup_fixed_custom) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("markup-legacy", 0, 5, 1, 0))
+        _db_migrate_markup_sources(_conn)
+        _legacy = _conn.execute(
+            "SELECT markup_percent, markup_fixed, "
+            "markup_percent_custom, markup_fixed_custom "
+            "FROM mappings WHERE id='markup-legacy'").fetchone()
+        assert _legacy[0] is None and _legacy[2] == 0, _legacy
+        assert _legacy[1] == 5 and _legacy[3] == 1, _legacy
+        _conn.execute("DELETE FROM mappings WHERE id='markup-legacy'")
+        print("_db_migrate_markup_sources OK")
+
         # validate_id доживает до БД и обратно
         _m_vid = _row_to_mapping(_prepare_mapping_row({"id": "m1", "validate_id": 0}))
         assert _m_vid["validate_id"] == 0
         _m_vid2 = _row_to_mapping(_prepare_mapping_row({"id": "m2"}))
         assert _m_vid2["validate_id"] == 1
+        _m_zero = _row_to_mapping(_prepare_mapping_row({
+            "id": "m3", "markup_percent": 0, "markup_percent_custom": 1}))
+        assert _markup_own(_m_zero, "markup_percent") == 0
+        _m_inherit = _row_to_mapping(_prepare_mapping_row({
+            "id": "m4", "markup_percent": 0, "markup_percent_custom": 0}))
+        assert _markup_own(_m_inherit, "markup_percent") is None
         print("mapping validate_id round-trip OK")
 
         # --- v3.2: Steam Top-up ---
@@ -19066,7 +19285,7 @@ def _run_smoke_tests() -> None:
                 "last_price_usd": "1.0", "last_lot_price": 100.0}
         # курс тот же, закупка та же -> менять нечего
         _plan = _plan_price_change(_m_p, _cfg_p, "1.0")
-        assert _plan["skip"] and "порога" in _plan["skip"], _plan
+        assert _plan["skip"] and "цена уже" in _plan["skip"], _plan
         # закупка выросла на 10% -> цена должна вырасти
         _plan = _plan_price_change(_m_p, _cfg_p, "1.1")
         assert _plan["skip"] is None and _plan["new"] == 110.0, _plan
@@ -19086,6 +19305,27 @@ def _run_smoke_tests() -> None:
         _plan = _plan_price_change(_m_p, _cfg_p, "2.0")
         assert _plan["skip"] is None and _plan["new"] == 200.0
         _cfg_p["settings"]["price_sync_max_step"] = 30.0
+        # ручной запуск подтверждает большой скачок
+        _plan = _plan_price_change(
+            _m_p, _cfg_p, "2.0", current_lot_price=100.0, force=True)
+        assert _plan["skip"] is None and not _plan.get("needs_review"), _plan
+        # сравниваем с живой ценой FunPay, даже если кэш говорит обратное
+        _plan = _plan_price_change(
+            _m_p, _cfg_p, "1.0", current_lot_price=150.0, force=True)
+        assert _plan["old"] == 150.0 and _plan["new"] == 100.0
+        assert _plan["skip"] is None
+        assert any("отличается от кэша" in r for r in _plan["reasons"]), _plan
+        # явный индивидуальный ноль диагностируется как override
+        _m_custom_zero = {
+            **_m_p, "markup_percent": 0, "markup_percent_custom": 1,
+            "markup_fixed": None, "markup_fixed_custom": 0,
+        }
+        _cfg_p["settings"]["markup_percent"] = 20
+        _plan = _plan_price_change(
+            _m_custom_zero, _cfg_p, "1.0", current_lot_price=100.0,
+            force=True)
+        assert _plan["skip"] and "индивидуальная" in _plan["skip"], _plan
+        _cfg_p["settings"]["markup_percent"] = 0
         # первая синхронизация: сравнивать не с чем, но цену ставим
         _plan = _plan_price_change({"id": "p2", "price_usd": "1.0"}, _cfg_p, None)
         assert _plan["skip"] is None and _plan["old"] is None and _plan["new"] == 100.0
@@ -19093,6 +19333,64 @@ def _run_smoke_tests() -> None:
         _cfg_p["settings"]["exchange_rate"] = 0
         assert _plan_price_change(_m_p, _cfg_p, "1.0")["skip"] == "нет цены закупки или курса"
         print("_plan_price_change OK")
+
+        # полный проход использует живую цену и не загружает лот второй раз
+        class _PriceLot:
+            def __init__(self):
+                self.price = 150.0
+
+            def renew_fields(self):
+                return None
+
+        class _PriceAccount:
+            def __init__(self):
+                self.calls = 0
+                self.lot = _PriceLot()
+
+            def get_lot_fields(self, lot_id):
+                assert lot_id == 1
+                self.calls += 1
+                return self.lot
+
+        class _PriceCardinal:
+            def __init__(self):
+                self.account = _PriceAccount()
+
+        _orig_get_maps = globals()["_db_get_mappings"]
+        _orig_get_client = globals()["get_fzr_client"]
+        _orig_fetch_price = globals()["_fetch_current_price_usd"]
+        _orig_save_mapping = globals()["_db_save_mapping"]
+        _orig_save_lot = globals()["_fzr_save_lot_fields"]
+        _sync_mapping = {
+            **_m_p, "price_sync": 1, "enabled": True,
+            "markup_percent": None, "markup_percent_custom": 0,
+            "markup_fixed": None, "markup_fixed_custom": 0,
+        }
+        _saved_mappings: List[Dict[str, Any]] = []
+        try:
+            globals()["_db_get_mappings"] = lambda *a, **kw: [_sync_mapping]
+            globals()["get_fzr_client"] = lambda *a, **kw: object()
+            globals()["_fetch_current_price_usd"] = lambda *a, **kw: "1.0"
+            globals()["_db_save_mapping"] = lambda m: _saved_mappings.append(m)
+            globals()["_fzr_save_lot_fields"] = (
+                lambda *a, **kw: (True, None, []))
+            _cfg_sync = create_default_config()
+            _cfg_sync["api_key"] = "k"
+            _cfg_sync["settings"]["exchange_rate"] = 100.0
+            _cardinal = _PriceCardinal()
+            _report = _sync_lot_prices(_cardinal, _cfg_sync, force=True)
+            assert len(_report["changed"]) == 1, _report
+            assert _report["changed"][0]["old"] == 150.0
+            assert _report["changed"][0]["new"] == 100.0
+            assert _cardinal.account.calls == 1
+            assert _saved_mappings[-1]["last_lot_price"] == 100.0
+        finally:
+            globals()["_db_get_mappings"] = _orig_get_maps
+            globals()["get_fzr_client"] = _orig_get_client
+            globals()["_fetch_current_price_usd"] = _orig_fetch_price
+            globals()["_db_save_mapping"] = _orig_save_mapping
+            globals()["_fzr_save_lot_fields"] = _orig_save_lot
+        print("_sync_lot_prices live price OK")
 
         # тексты под категорию
         assert _kind_profile("steam-topup")["name"] == "пополнение Steam"
@@ -19314,6 +19612,8 @@ def _run_smoke_tests() -> None:
         # валидация привязок: SKU обязателен, id генерируем, дубли расшиваем
         _maps, _mw = _validate_import_mappings([
             {"fzr_sku_id": "topups:g:o", "markup_percent": 0},
+            {"fzr_sku_id": "topups:g:z", "markup_percent": 0,
+             "markup_percent_custom": 1},
             {"category_kind": "topups", "category_id": "g2", "offer_id": "o2"},
             {"offer_name": "без sku"},
             {"fzr_sku_id": "мусор"},
@@ -19321,10 +19621,13 @@ def _run_smoke_tests() -> None:
             {"id": "dup", "fzr_sku_id": "topups:g:a"},
             {"id": "dup", "fzr_sku_id": "topups:g:b"},
         ])
-        assert len(_maps) == 4, [m["fzr_sku_id"] for m in _maps]
-        assert _maps[1]["fzr_sku_id"] == "topups:g2:o2"     # собрали из частей
-        assert _maps[0]["markup_percent"] == 0.0            # ноль сохранён
-        assert len({m["id"] for m in _maps}) == 4           # id уникальны
+        assert len(_maps) == 5, [m["fzr_sku_id"] for m in _maps]
+        assert _maps[2]["fzr_sku_id"] == "topups:g2:o2"     # собрали из частей
+        assert _maps[0]["markup_percent"] is None            # старый default
+        assert _maps[0]["markup_percent_custom"] == 0
+        assert _maps[1]["markup_percent"] == 0.0             # явный ноль
+        assert _maps[1]["markup_percent_custom"] == 1
+        assert len({m["id"] for m in _maps}) == 5           # id уникальны
         assert len(_mw) == 2, _mw
         print("_validate_import_mappings OK")
 
@@ -19340,6 +19643,8 @@ def _run_smoke_tests() -> None:
                                 "funpay_title": "Мой лот", "offer_name": "ML 500"})
         assert "stock" not in _exp and "price_synced_at" not in _exp
         assert _exp["markup_percent"] is None and _exp["markup_fixed"] == 0.0
+        assert _exp["markup_percent_custom"] == 0
+        assert _exp["markup_fixed_custom"] == 1
         # v3.9: человекочитаемые поля идут первыми — файл правят руками
         assert list(_exp)[:3] == ["funpay_lot_title", "funpay_lot_id", "funpay_lot_url"]
         assert _exp["funpay_lot_title"] == "Мой лот" and _exp["fzr_offer_name"] == "ML 500"
