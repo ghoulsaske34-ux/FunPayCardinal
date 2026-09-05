@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.24.2"
+VERSION = "3.24.3"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.24.3: Mobile Legends запрашивает Player ID и Server ID одним "
+               "сообщением, без отдельного вопроса и подтверждения Server ID.\n"
                "v3.24.2: добавлена совместимость со старыми привязками "
                "Mobile Legends и восстановление активного диалога ID.\n"
                "v3.24.1: исправлен разбор Player ID (Server ID) для "
@@ -2581,7 +2583,15 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
     у select-полей (там уже до 16 строк вариантов) подсказку не добавляем,
     а счётчик шагов встраиваем в ту же строку.
     """
-    label = field.get("label") or field.get("key") or "данные"
+    mobile_legends_ids = bool(
+        mapping and _is_mobile_legends_diamonds(mapping)
+        and index in (None, 0)
+    )
+    label = (
+        "Player ID и Server ID"
+        if mobile_legends_ids
+        else field.get("label") or field.get("key") or "данные"
+    )
     tpl = _effective_template(cfg, mapping, "ask_template")
     try:
         base = render_template(tpl, default=DEFAULT_CONFIG["templates"]["ask_metadata"],
@@ -2591,7 +2601,7 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
     except Exception:
         base = f"Для выдачи заказа укажите, пожалуйста: {label}."
     # несколько полей — показываем прогресс, чтобы покупатель не думал, что всё
-    if index is not None and total and total > 1:
+    if index is not None and total and total > 1 and not mobile_legends_ids:
         base = f"[{index + 1}/{total}] {base}"
     # select-поле: показываем нумерованный список вариантов, ответ — номер
     if _is_select_field(field):
@@ -2600,13 +2610,14 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
             return (f"{base}\n\n{options_text}\n\n"
                     f"Отправьте номер нужного варианта (например: 1).")
         return base
-    if mapping and _is_mobile_legends_diamonds(mapping) and index in (None, 0):
+    if mobile_legends_ids:
         base = (
             f"{base}\n\n"
             "Отправьте Player ID и Server ID одним сообщением в формате: "
             "Player ID (Server ID).\n"
             "Например: 1751269989 (6865)."
         )
+        return base
     hint = _field_hint(field)
     if hint and cfg["settings"].get("show_field_hints", True):
         return f"{base}\n\n{hint}"
@@ -11617,9 +11628,21 @@ def _send_dialog_reminder(c: "Cardinal", p: Dict[str, Any], cfg: Dict[str, Any])
     values = data.get("metadata_values") or {}
     labels = data.get("metadata_labels") or {}
     idx = data.get("metadata_index", 0)
+    player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
+    missing_mobile_legends_ids = bool(
+        mapping and _is_mobile_legends_diamonds(mapping)
+        and player_field and server_field
+        and not (
+            values.get(str(player_field.get("key") or ""))
+            and values.get(str(server_field.get("key") or ""))
+        )
+    )
     # v3.14: диалог мог остановиться на подтверждении — напоминаем именно о нём,
     # иначе покупатель получает вопрос о поле, которое он уже прислал
-    if data.get("awaiting_summary"):
+    if missing_mobile_legends_ids and player_field:
+        prompt = _format_metadata_prompt(
+            cfg, player_field, mapping, index=0, total=1)
+    elif data.get("awaiting_summary"):
         prompt = _summary_question(meta_fields, values, labels)
     elif isinstance(data.get("awaiting_confirm"), dict) and meta_fields:
         confirm = data["awaiting_confirm"]
@@ -11952,6 +11975,33 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
     metadata_values: Dict[str, str] = data.get("metadata_values", {}) or {}
     labels: Dict[str, Any] = data.get("metadata_labels") or {}
     autofilled_keys = set(data.get("autofilled_keys") or [])
+    player_field: Optional[Dict[str, Any]] = None
+    server_field: Optional[Dict[str, Any]] = None
+    mobile_legends_ids_complete = False
+    if _is_mobile_legends_diamonds(mapping):
+        player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
+        if player_field and server_field:
+            player_key = str(player_field.get("key") or "")
+            server_key = str(server_field.get("key") or "")
+            mobile_legends_ids_complete = bool(
+                metadata_values.get(player_key)
+                and metadata_values.get(server_key)
+            )
+            if not mobile_legends_ids_complete:
+                metadata_values.pop(player_key, None)
+                metadata_values.pop(server_key, None)
+                labels.pop(player_key, None)
+                labels.pop(server_key, None)
+                data["metadata_values"] = metadata_values
+                data["metadata_labels"] = labels
+                data.pop("awaiting_confirm", None)
+                data.pop("awaiting_summary", None)
+                idx = next(
+                    (field_idx for field_idx, candidate in enumerate(meta_fields)
+                     if candidate is player_field),
+                    0,
+                )
+                data["metadata_index"] = idx
     # Скользящее окно таймаута: покупатель только что писал — заказ отменять
     # нельзя. Записываем сразу, потому что часть ветвей ниже выходит по return
     # (ошибка валидации, непонятный ответ) и до финального _save_pending не
@@ -11960,10 +12010,7 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
     _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
 
     combined_ids = _parse_mobile_legends_combined_id(mapping, text)
-    player_field: Optional[Dict[str, Any]] = None
-    server_field: Optional[Dict[str, Any]] = None
     if combined_ids:
-        player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
         confirm = data.get("awaiting_confirm")
         active_idx = idx
         if isinstance(confirm, dict):
@@ -12037,6 +12084,17 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
                 c, cfg, mapping, funpay_order_id, order_info,
                 chat_id, buyer, metadata_values, labels,
                 prefix="Распознал ID игрока и сервера.",
+            )
+            return
+    if player_field and server_field and not mobile_legends_ids_complete:
+        if not (_is_smalltalk(text)
+                and cfg["settings"].get("smalltalk_filter", True)):
+            prompt = _format_metadata_prompt(
+                cfg, player_field, mapping, index=0, total=1)
+            _send_buyer(
+                c, chat_id,
+                "Нужно отправить оба значения одним сообщением.\n\n" + prompt,
+                buyer,
             )
             return
 
@@ -16447,22 +16505,55 @@ def _mapping_preview_texts(c: "Cardinal", call: Any, mapping_id: str) -> None:
     if cfg["settings"].get("auto_select_single", True):
         _autofill_single_options(fields, values)
     asked = [f for f in fields if str(f.get("key") or "") not in values]
-    for i, field in enumerate(asked[:3]):
-        prompt = _as_sent(_format_metadata_prompt(cfg, field, mapping, index=i, total=len(asked)))
-        blocks.append(f"<blockquote><b>{step}. Вопрос {i + 1}</b>\n{_esc(prompt)}</blockquote>")
+    ml_player, ml_server = _mobile_legends_metadata_fields(asked)
+    combined_mobile_legends = bool(
+        _is_mobile_legends_diamonds(mapping) and ml_player and ml_server)
+    preview_fields = asked
+    if combined_mobile_legends and ml_player and ml_server:
+        prompt = _as_sent(_format_metadata_prompt(
+            cfg, ml_player, mapping, index=0, total=1))
+        blocks.append(
+            f"<blockquote><b>{step}. Вопрос 1</b>\n"
+            f"{_esc(prompt)}</blockquote>")
         step += 1
-    if len(asked) > 3:
-        blocks.append(f"<i>…и ещё вопросов: {len(asked) - 3}</i>")
+        preview_fields = [
+            field for field in asked
+            if field is not ml_player and field is not ml_server
+        ]
+    for i, field in enumerate(preview_fields[:3]):
+        question_number = i + 2 if combined_mobile_legends else i + 1
+        prompt = _as_sent(_format_metadata_prompt(
+            cfg, field, mapping, index=i, total=len(preview_fields)))
+        blocks.append(
+            f"<blockquote><b>{step}. Вопрос {question_number}</b>\n"
+            f"{_esc(prompt)}</blockquote>")
+        step += 1
+    if len(preview_fields) > 3:
+        blocks.append(
+            f"<i>…и ещё вопросов: {len(preview_fields) - 3}</i>")
 
     if asked:
-        # v3.14: покупатель теперь подтверждает каждое значение — продавец должен
-        # видеть это в предпросмотре, иначе новые сообщения станут сюрпризом
-        if _confirm_enabled(cfg, "confirm_metadata"):
+        if combined_mobile_legends:
+            if (_confirm_enabled(cfg, "confirm_metadata")
+                    or _confirm_enabled(cfg, "confirm_summary")):
+                demo_values = {
+                    str(field.get("key") or ""): "значение"
+                    for field in asked
+                }
+                summary_demo = _as_sent(_summary_question(
+                    asked, demo_values))
+                blocks.append(
+                    f"<blockquote><b>{step}. Подтверждение</b>\n"
+                    f"{_esc(summary_demo)}</blockquote>")
+                step += 1
+        elif _confirm_enabled(cfg, "confirm_metadata"):
             confirm_demo = _as_sent(_confirm_question(asked[-1], "значение"))
             blocks.append(f"<blockquote><b>{step}. Подтверждение</b>\n"
                           f"{_esc(confirm_demo)}</blockquote>")
             step += 1
-        if _confirm_enabled(cfg, "confirm_summary") and len(asked) > 1:
+        if (not combined_mobile_legends
+                and _confirm_enabled(cfg, "confirm_summary")
+                and len(asked) > 1):
             demo_values = {str(f.get("key") or ""): "значение" for f in asked}
             summary_demo = _as_sent(_summary_question(asked, demo_values))
             blocks.append(f"<blockquote><b>{step}. Итоговая сводка</b>\n"
@@ -16470,9 +16561,14 @@ def _mapping_preview_texts(c: "Cardinal", call: Any, mapping_id: str) -> None:
             step += 1
         progress = _as_sent(_progress_text(cfg, mapping))
         if progress:
-            blocks.append(f"<blockquote><b>{step}. Данные получены</b>\n"
-                          f"✔ {_esc(asked[-1].get('label') or '')}: …\n\n"
-                          f"{_esc(progress)}</blockquote>")
+            accepted_demo = (
+                ""
+                if combined_mobile_legends
+                else f"✔ {_esc(asked[-1].get('label') or '')}: …\n\n"
+            )
+            blocks.append(
+                f"<blockquote><b>{step}. Данные получены</b>\n"
+                f"{accepted_demo}{_esc(progress)}</blockquote>")
             step += 1
 
     # выдача: с кодом и без — зависит от типа товара
@@ -20475,6 +20571,9 @@ def _run_smoke_tests() -> None:
         )
         assert "Player ID и Server ID одним сообщением" in _ml_prompt
         assert "Player ID (Server ID)" in _ml_prompt
+        assert "Player ID и Server ID" in _ml_prompt
+        assert "[1/2]" not in _ml_prompt
+        assert "числовой ID игрока" not in _ml_prompt
         print("Mobile Legends combined ID parsing OK")
 
         # --- v3.1: quantity для topups через несколько заказов ---
