@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.25.0"
+VERSION = "3.25.1"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.25.1: просмотр лота дополнительно определяется по панели чата "
+               "FunPay, с диагностикой причин пропуска автоответа.\n"
                "v3.25.0: автоответ посетителю привязанного лота с автовыдачей "
                "без повторных сообщений и без отправки покупателям.\n"
                "v3.24.3: Mobile Legends запрашивает Player ID и Server ID одним "
@@ -7739,6 +7741,71 @@ def _send_buyer(c: "Cardinal", chat_id: Any, text: str, username: Optional[str] 
         return False
 
 
+def _lot_id_from_viewing_link(link: Optional[str]) -> Optional[int | str]:
+    if not link:
+        return None
+    parsed = urllib.parse.urlparse(link)
+    values = urllib.parse.parse_qs(parsed.query).get("id") or []
+    raw_id = values[0].strip() if values else ""
+    if not raw_id:
+        match = re.search(r"(?:[?&]|^)id=([^&#]+)", link)
+        raw_id = urllib.parse.unquote(match.group(1)).strip() if match else ""
+    if not raw_id:
+        return None
+    return int(raw_id) if raw_id.isdigit() else raw_id
+
+
+def _resolve_viewing_lot_id(
+    c: "Cardinal",
+    msg: fp_types.Message,
+) -> Optional[int | str]:
+    viewing = msg.buyer_viewing
+    if viewing and viewing.is_viewing_lot:
+        lot_id = _lot_id_from_viewing_link(viewing.link)
+        if lot_id is not None:
+            logger.info(
+                "viewing lot resolved",
+                extra={"source": "message", "lot_id": str(lot_id)},
+            )
+            return lot_id
+
+    try:
+        viewing = c.account.get_buyer_viewing(msg.author_id)
+        if viewing and viewing.is_viewing_lot:
+            lot_id = _lot_id_from_viewing_link(viewing.link)
+            if lot_id is not None:
+                logger.info(
+                    "viewing lot resolved",
+                    extra={"source": "buyer_api", "lot_id": str(lot_id)},
+                )
+                return lot_id
+    except Exception as ex:
+        logger.info(
+            "buyer viewing lookup failed",
+            extra={"buyer_id": msg.author_id, "error": repr(ex)},
+        )
+
+    try:
+        chat = c.account.get_chat(int(msg.chat_id), with_history=False)
+        lot_id = _lot_id_from_viewing_link(chat.looking_link)
+        if lot_id is not None:
+            logger.info(
+                "viewing lot resolved",
+                extra={"source": "chat_panel", "lot_id": str(lot_id)},
+            )
+        return lot_id
+    except Exception as ex:
+        logger.info(
+            "chat viewing lookup failed",
+            extra={
+                "buyer_id": msg.author_id,
+                "chat_id": str(msg.chat_id),
+                "error": repr(ex),
+            },
+        )
+        return None
+
+
 def _maybe_send_viewing_autoreply(c: "Cardinal", msg: fp_types.Message) -> bool:
     cfg = load_config()
     settings = cfg.get("settings") or {}
@@ -7750,26 +7817,52 @@ def _maybe_send_viewing_autoreply(c: "Cardinal", msg: fp_types.Message) -> bool:
 
     buyer_id = msg.author_id
     chat_id = msg.chat_id
-    viewing = msg.buyer_viewing
-    if viewing is None:
-        try:
-            viewing = c.account.get_buyer_viewing(buyer_id)
-        except Exception as ex:
-            logger.info(
-                "viewing autoreply lookup failed",
-                extra={"buyer_id": buyer_id, "error": repr(ex)},
-            )
-            return False
-    lot_id = viewing.lot_id if viewing and viewing.is_viewing_lot else None
+    lot_id = _resolve_viewing_lot_id(c, msg)
     if lot_id is None:
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "no_viewing_lot",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+            },
+        )
         return False
     mapping = _db_get_mapping_by_lot_id(lot_id)
     if not mapping:
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "mapping_missing_or_disabled",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+                "lot_id": str(lot_id),
+            },
+        )
         return False
     mapping_id = str(mapping.get("id") or "")
     if not mapping_id:
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "mapping_id_missing",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+                "lot_id": str(lot_id),
+            },
+        )
         return False
     if _db_has_order_for_mapping(buyer_id, chat_id, mapping_id):
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "matching_order_exists",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+                "lot_id": str(lot_id),
+                "mapping_id": mapping_id,
+            },
+        )
         return False
     if not _db_claim_viewing_autoreply(
         buyer_id,
@@ -7777,6 +7870,16 @@ def _maybe_send_viewing_autoreply(c: "Cardinal", msg: fp_types.Message) -> bool:
         chat_id,
         msg.id,
     ):
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "already_sent",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+                "lot_id": str(lot_id),
+                "mapping_id": mapping_id,
+            },
+        )
         return False
 
     template = str(
@@ -7792,6 +7895,16 @@ def _maybe_send_viewing_autoreply(c: "Cardinal", msg: fp_types.Message) -> bool:
     )
     if not sent:
         _db_release_viewing_autoreply(buyer_id, lot_id)
+        logger.info(
+            "viewing autoreply skipped",
+            extra={
+                "reason": "send_failed",
+                "buyer_id": buyer_id,
+                "chat_id": str(chat_id),
+                "lot_id": str(lot_id),
+                "mapping_id": mapping_id,
+            },
+        )
         return False
     logger.info(
         "viewing autoreply sent",
@@ -23090,6 +23203,55 @@ def _run_smoke_tests() -> None:
         assert _maybe_send_viewing_autoreply(
             _viewing_cardinal, _fallback_message)
 
+        _db_save_mapping({
+            "id": "viewing-autoreply-chat-panel",
+            "fzr_sku_id": "steam-gifts:smoke:standard",
+            "funpay_lot_id": "76331687",
+            "enabled": True,
+        })
+        _db_save_mapping({
+            "id": "viewing-autoreply-other-order",
+            "fzr_sku_id": "services:smoke:other",
+            "funpay_lot_id": "111222",
+            "enabled": True,
+        })
+        assert _db_insert_order({
+            "funpay_order_id": "VIEWING-OTHER-ORDER",
+            "status": "completed",
+            "buyer_id": 9005,
+            "chat_id": "7005",
+            "mapping_id": "viewing-autoreply-other-order",
+        })
+
+        def _failed_buyer_viewing(buyer_id: int) -> fp_types.BuyerViewing:
+            raise RuntimeError(f"smoke lookup failure for {buyer_id}")
+
+        _chat_panel_cardinal = _ViewingAutoreplyCardinal()
+        _chat_panel_cardinal.account = _SimpleNamespace(
+            get_buyer_viewing=_failed_buyer_viewing,
+            get_chat=lambda chat_id, with_history=False: fp_types.Chat(
+                chat_id,
+                "buyer-five",
+                "https://funpay.com/lots/offer?id=76331687&utm_source=chat",
+                "How to Fish",
+                "",
+            ),
+        )
+        _chat_panel_message = fp_types.Message(
+            1005,
+            "Привет",
+            7005,
+            "buyer-five",
+            9005,
+            "buyer-five",
+            9005,
+            "",
+            determine_msg_type=False,
+        )
+        assert _maybe_send_viewing_autoreply(
+            _chat_panel_cardinal, _chat_panel_message)
+        assert len(_chat_panel_cardinal.messages) == 1
+
         _not_viewing_cardinal = _ViewingAutoreplyCardinal()
         _not_viewing_cardinal.account = _SimpleNamespace(
             get_buyer_viewing=lambda buyer_id: fp_types.BuyerViewing(
@@ -23143,6 +23305,68 @@ def _run_smoke_tests() -> None:
         )
         assert not _maybe_send_viewing_autoreply(
             _viewing_cardinal, _bought_message)
+        assert len(_viewing_cardinal.messages) == 2
+
+        class _RetryViewingCardinal(_ViewingAutoreplyCardinal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts = 0
+
+            def send_message(
+                self,
+                chat_id: int | str,
+                text: str,
+                username: Optional[str],
+                watermark: bool = True,
+            ) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("smoke send failure")
+                super().send_message(chat_id, text, username, watermark)
+
+        _retry_cardinal = _RetryViewingCardinal()
+        _retry_message = fp_types.Message(
+            1006,
+            "Привет",
+            7006,
+            "buyer-six",
+            9006,
+            "buyer-six",
+            9006,
+            "",
+            determine_msg_type=False,
+        )
+        assert not _maybe_send_viewing_autoreply(
+            _retry_cardinal, _retry_message)
+        assert _maybe_send_viewing_autoreply(
+            _retry_cardinal, _retry_message)
+        assert len(_retry_cardinal.messages) == 1
+
+        _db_save_mapping({
+            "id": "viewing-autoreply-disabled",
+            "fzr_sku_id": "gamekeys:smoke:disabled",
+            "funpay_lot_id": "999000",
+            "enabled": False,
+        })
+        _disabled_message = fp_types.Message(
+            1007,
+            "Привет",
+            7007,
+            "buyer-seven",
+            9007,
+            "buyer-seven",
+            9007,
+            "",
+            determine_msg_type=False,
+        )
+        _disabled_message.buyer_viewing = fp_types.BuyerViewing(
+            9007,
+            "https://funpay.com/lots/offer?id=999000",
+            "Disabled smoke lot",
+            "smoke",
+        )
+        assert not _maybe_send_viewing_autoreply(
+            _viewing_cardinal, _disabled_message)
         assert len(_viewing_cardinal.messages) == 2
         print("viewing autoreply visitor and buyer guards OK")
 
