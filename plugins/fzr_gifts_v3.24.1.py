@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.24.0"
+VERSION = "3.24.1"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.24.1: исправлен разбор Player ID (Server ID) для "
+               "Mobile Legends и добавлена явная подсказка формата.\n"
                "v3.24.0: профили категорий FunPay с отдельными наценками и "
                "шаблонами, экспорт/импорт и авторазбор Mobile Legends ID.\n"
                "v3.23.0: типизированное ядро, отдельные SQLite-подключения "
@@ -2429,8 +2431,8 @@ def _effective_template(
     return str((cfg.get("templates") or {}).get(global_key) or "")
 
 
-_MOBILE_LEGENDS_DIAMONDS_SKU_RE = re.compile(
-    r"^topups:mobile_legends_ru:[^:]+_diamonds$",
+_MOBILE_LEGENDS_DIAMONDS_OFFER_RE = re.compile(
+    r"^[^:]+_diamonds$",
     re.IGNORECASE,
 )
 _MOBILE_LEGENDS_COMBINED_ID_RE = re.compile(
@@ -2438,9 +2440,29 @@ _MOBILE_LEGENDS_COMBINED_ID_RE = re.compile(
 )
 
 
+def _normalized_sku_part(value: object) -> str:
+    return re.sub(
+        r"[\s\u200b-\u200d\ufeff]+", "", str(value or "")
+    ).casefold()
+
+
+def _mapping_sku_parts(mapping: Dict[str, Any]) -> Tuple[str, str, str]:
+    sku_parts = str(mapping.get("fzr_sku_id") or "").split(":", 2)
+    sku_parts += [""] * (3 - len(sku_parts))
+    return (
+        _normalized_sku_part(mapping.get("category_kind") or sku_parts[0]),
+        _normalized_sku_part(mapping.get("category_id") or sku_parts[1]),
+        _normalized_sku_part(mapping.get("offer_id") or sku_parts[2]),
+    )
+
+
 def _is_mobile_legends_diamonds(mapping: Dict[str, Any]) -> bool:
-    return bool(_MOBILE_LEGENDS_DIAMONDS_SKU_RE.fullmatch(
-        str(mapping.get("fzr_sku_id") or "").strip()))
+    kind, category_id, offer_id = _mapping_sku_parts(mapping)
+    return (
+        kind == "topups"
+        and category_id == "mobile_legends_ru"
+        and bool(_MOBILE_LEGENDS_DIAMONDS_OFFER_RE.fullmatch(offer_id))
+    )
 
 
 def _parse_mobile_legends_combined_id(
@@ -2528,6 +2550,13 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
             return (f"{base}\n\n{options_text}\n\n"
                     f"Отправьте номер нужного варианта (например: 1).")
         return base
+    if mapping and _is_mobile_legends_diamonds(mapping) and index in (None, 0):
+        base = (
+            f"{base}\n\n"
+            "Отправьте данные одним сообщением в формате: "
+            "Player ID (Server ID).\n"
+            "Например: 1751269989 (6865)."
+        )
     hint = _field_hint(field)
     if hint and cfg["settings"].get("show_field_hints", True):
         return f"{base}\n\n{hint}"
@@ -11536,7 +11565,7 @@ def _send_dialog_reminder(c: "Cardinal", p: Dict[str, Any], cfg: Dict[str, Any])
         if not (0 <= idx < len(meta_fields)):
             idx = _next_unfilled_index(meta_fields, values)
         field = meta_fields[idx] if idx < len(meta_fields) else meta_fields[0]
-        prompt = _format_metadata_prompt(cfg, field)
+        prompt = _format_metadata_prompt(cfg, field, mapping)
     else:
         prompt = cfg["templates"]["ask_metadata"]
     order_proxy = _order_proxy(order)
@@ -20298,6 +20327,15 @@ def _run_smoke_tests() -> None:
             "  123456789012345   (  7  ) ",
         ) == ("123456789012345", "7")
         assert _parse_mobile_legends_combined_id(
+            {
+                "fzr_sku_id": "",
+                "category_kind": " topups ",
+                "category_id": "mobile_legends_ru",
+                "offer_id": "35_diamonds",
+            },
+            "1751269989 (6865)",
+        ) == ("1751269989", "6865")
+        assert _parse_mobile_legends_combined_id(
             _ml_mapping, "2237306259 6652"
         ) is None
         assert _parse_mobile_legends_combined_id(
@@ -20312,6 +20350,14 @@ def _run_smoke_tests() -> None:
         assert _server_field and _server_field["key"] == "zone_id"
         assert _validate_metadata_value(
             "user_id", "2237306259", "player_id") is None
+        _ml_prompt = _format_metadata_prompt(
+            create_default_config(),
+            {"key": "user_id", "label": "Player ID"},
+            _ml_mapping,
+            index=0,
+            total=2,
+        )
+        assert "Player ID (Server ID)" in _ml_prompt
         print("Mobile Legends combined ID parsing OK")
 
         # --- v3.1: quantity для topups через несколько заказов ---
