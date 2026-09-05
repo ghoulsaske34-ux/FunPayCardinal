@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.25.1"
+VERSION = "3.25.2"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.25.2: Mobile Legends Global и импортированные региональные "
+               "привязки используют единый ввод ID.\n"
                "v3.25.1: просмотр лота дополнительно определяется по панели чата "
                "FunPay, с диагностикой причин пропуска автоответа.\n"
                "v3.25.0: автоответ посетителю привязанного лота с автовыдачей "
@@ -2492,7 +2494,10 @@ def _is_mobile_legends_diamonds(mapping: Dict[str, Any]) -> bool:
     kind, category_id, offer_id = _mapping_sku_parts(mapping)
     return (
         kind == "topups"
-        and category_id == "mobile_legends_ru"
+        and (
+            category_id == "mobile_legends"
+            or category_id.startswith("mobile_legends_")
+        )
         and bool(_MOBILE_LEGENDS_DIAMONDS_OFFER_RE.fullmatch(offer_id))
     )
 
@@ -20765,6 +20770,45 @@ def _run_smoke_tests() -> None:
             {"fzr_sku_id": "topups:mobile_legends_ru:1000_diamonds"},
             "  123456789012345   (  7  ) ",
         ) == ("123456789012345", "7")
+        _exported_global_ml = {
+            "fzr_sku_id": "topups:mobile_legends_global:1084_diamonds",
+            "metadata_key": "player_id",
+            "metadata_prompt": "Player ID",
+            "metadata_fields": [
+                {
+                    "key": "player_id",
+                    "label": "Player ID",
+                    "validation": "player_id",
+                },
+                {
+                    "key": "server_id",
+                    "label": "Server ID",
+                    "validation": "nonempty",
+                },
+            ],
+        }
+        assert _parse_mobile_legends_combined_id(
+            _exported_global_ml, "1751269989 (6865)"
+        ) == ("1751269989", "6865")
+        _global_import, _global_import_warnings = _validate_import_mappings([
+            _exported_global_ml,
+        ])
+        assert not _global_import_warnings
+        assert _is_mobile_legends_diamonds(_global_import[0])
+        _global_fields = _build_metadata_fields(_global_import[0])
+        _global_player, _global_server = _mobile_legends_metadata_fields(
+            _global_fields)
+        assert _global_player and _global_player["key"] == "player_id"
+        assert _global_server and _global_server["key"] == "server_id"
+        _global_prompt = _format_metadata_prompt(
+            create_default_config(),
+            _global_player,
+            _global_import[0],
+            index=0,
+            total=len(_global_fields),
+        )
+        assert "Player ID (Server ID)" in _global_prompt
+        assert "[1/2]" not in _global_prompt
         assert _parse_mobile_legends_combined_id(
             {
                 "fzr_sku_id": "",
