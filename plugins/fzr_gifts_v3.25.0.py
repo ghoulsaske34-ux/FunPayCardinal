@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.24.3"
+VERSION = "3.25.0"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.25.0: автоответ посетителю привязанного лота с автовыдачей "
+               "без повторных сообщений и без отправки покупателям.\n"
                "v3.24.3: Mobile Legends запрашивает Player ID и Server ID одним "
                "сообщением, без отдельного вопроса и подтверждения Server ID.\n"
                "v3.24.2: добавлена совместимость со старыми привязками "
@@ -72,6 +74,7 @@ CB_PREFIX = "fzr"
 
 class PluginSettings(TypedDict, total=False):
     auto_delivery: bool
+    viewing_autoreply: bool
     poll_interval: float
     poll_timeout: float
     exchange_rate: float
@@ -516,6 +519,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "base_url": "https://api.fzr.cards/api/v2",
     "settings": {
         "auto_delivery": True,
+        "viewing_autoreply": True,
         "poll_interval": 5,
         "poll_timeout": 300,
         "ask_metadata": True,
@@ -595,6 +599,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "balance_alert_cooldown": 60,    # не чаще одного повторного алерта в N минут
     },
     "templates": {
+        "viewing_autoreply": (
+            "Здравствуйте! На товаре стоит авто-выдача 24/7, можете покупать."
+        ),
         "delivery": (
             "Спасибо за покупку!\n\n"
             "Ваш товар:\n{code}\n\n"
@@ -1109,6 +1116,17 @@ def _db_init() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_pending_buyer ON pending_dialogs(buyer_id);
         CREATE INDEX IF NOT EXISTS idx_pending_step ON pending_dialogs(step);
+
+        CREATE TABLE IF NOT EXISTS viewing_autoreplies (
+            buyer_id INTEGER NOT NULL,
+            funpay_lot_id TEXT NOT NULL,
+            chat_id TEXT,
+            message_id TEXT,
+            sent_at REAL NOT NULL,
+            PRIMARY KEY (buyer_id, funpay_lot_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_viewing_autoreplies_sent
+            ON viewing_autoreplies(sent_at);
 
         CREATE TABLE IF NOT EXISTS mappings (
             id TEXT PRIMARY KEY,
@@ -5809,6 +5827,67 @@ def _db_get_pending_by_buyer(buyer_id: Any, chat_id: Optional[Any] = None) -> Op
         d = dict(row)
         d["data"] = _from_json(d.pop("data_json", None))
         return d
+
+
+def _db_has_order_for_mapping(
+    buyer_id: int,
+    chat_id: int | str | None,
+    mapping_id: str,
+) -> bool:
+    if not _DB_INITIALIZED:
+        _db_init()
+    clauses = ["mapping_id=?"]
+    params: List[object] = [mapping_id]
+    identities = ["buyer_id=?"]
+    params.append(buyer_id)
+    if chat_id not in (None, ""):
+        identities.append("chat_id=?")
+        params.append(str(chat_id))
+    clauses.append(f"({' OR '.join(identities)})")
+    sql = f"SELECT 1 FROM orders WHERE {' AND '.join(clauses)} LIMIT 1"
+    with _DB_LOCK:
+        return _db_connect().execute(sql, params).fetchone() is not None
+
+
+def _db_claim_viewing_autoreply(
+    buyer_id: int,
+    lot_id: int | str,
+    chat_id: int | str | None,
+    message_id: int,
+) -> bool:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        cursor = _db_connect().execute(
+            """
+            INSERT OR IGNORE INTO viewing_autoreplies
+                (buyer_id, funpay_lot_id, chat_id, message_id, sent_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                buyer_id,
+                str(lot_id),
+                None if chat_id is None else str(chat_id),
+                None if message_id is None else str(message_id),
+                time.time(),
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def _db_release_viewing_autoreply(
+    buyer_id: int,
+    lot_id: int | str,
+) -> None:
+    if not _DB_INITIALIZED:
+        _db_init()
+    with _DB_LOCK:
+        _db_connect().execute(
+            "DELETE FROM viewing_autoreplies WHERE buyer_id=? AND funpay_lot_id=?",
+            (buyer_id, str(lot_id)),
+        )
+
+
 def _db_remove_pending(funpay_order_id: Any) -> None:
     if not _DB_INITIALIZED:
         _db_init()
@@ -7658,6 +7737,74 @@ def _send_buyer(c: "Cardinal", chat_id: Any, text: str, username: Optional[str] 
     except Exception as e:
         logger.error("send_buyer failed", extra={"chat_id": str(chat_id), "error": repr(e)})
         return False
+
+
+def _maybe_send_viewing_autoreply(c: "Cardinal", msg: fp_types.Message) -> bool:
+    cfg = load_config()
+    settings = cfg.get("settings") or {}
+    if (
+        not settings.get("auto_delivery", True)
+        or not settings.get("viewing_autoreply", True)
+    ):
+        return False
+
+    buyer_id = msg.author_id
+    chat_id = msg.chat_id
+    viewing = msg.buyer_viewing
+    if viewing is None:
+        try:
+            viewing = c.account.get_buyer_viewing(buyer_id)
+        except Exception as ex:
+            logger.info(
+                "viewing autoreply lookup failed",
+                extra={"buyer_id": buyer_id, "error": repr(ex)},
+            )
+            return False
+    lot_id = viewing.lot_id if viewing and viewing.is_viewing_lot else None
+    if lot_id is None:
+        return False
+    mapping = _db_get_mapping_by_lot_id(lot_id)
+    if not mapping:
+        return False
+    mapping_id = str(mapping.get("id") or "")
+    if not mapping_id:
+        return False
+    if _db_has_order_for_mapping(buyer_id, chat_id, mapping_id):
+        return False
+    if not _db_claim_viewing_autoreply(
+        buyer_id,
+        lot_id,
+        chat_id,
+        msg.id,
+    ):
+        return False
+
+    template = str(
+        (cfg.get("templates") or {}).get("viewing_autoreply")
+        or DEFAULT_CONFIG["templates"]["viewing_autoreply"]
+    )
+    sent = _send_buyer(
+        c,
+        chat_id,
+        template,
+        msg.chat_name,
+        watermark=False,
+    )
+    if not sent:
+        _db_release_viewing_autoreply(buyer_id, lot_id)
+        return False
+    logger.info(
+        "viewing autoreply sent",
+        extra={
+            "buyer_id": buyer_id,
+            "chat_id": str(chat_id),
+            "lot_id": str(lot_id),
+            "mapping_id": str(mapping.get("id") or ""),
+        },
+    )
+    return True
+
+
 def _notify_admin(c: "Cardinal", text: str) -> None:
     if not getattr(c, "telegram", None):
         return
@@ -11897,6 +12044,7 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
         return
     pending = _db_get_pending_by_buyer(buyer_id, chat_id)
     if not pending:
+        _maybe_send_viewing_autoreply(c, msg)
         return
 
     # Sync chat_id: messages arrive with numeric chat_id, orders store chat_id as string.
@@ -22869,6 +23017,134 @@ def _run_smoke_tests() -> None:
         assert _catalog_api.calls == [("giftcards", "shared")]
         _PRICE_CATALOG_CACHE.clear()
         print("price catalog grouping and cache OK")
+
+        class _ViewingAutoreplyCardinal:
+            def __init__(self) -> None:
+                self.account = _SimpleNamespace(
+                    get_buyer_viewing=lambda buyer_id: fp_types.BuyerViewing(
+                        buyer_id,
+                        "https://funpay.com/lots/offer?id=445566",
+                        "Smoke lot",
+                        "smoke",
+                    )
+                )
+                self.messages: List[
+                    Tuple[int | str, str, Optional[str], bool]
+                ] = []
+
+            def send_message(
+                self,
+                chat_id: int | str,
+                text: str,
+                username: Optional[str],
+                watermark: bool = True,
+            ) -> None:
+                self.messages.append((chat_id, text, username, watermark))
+
+        _db_save_mapping({
+            "id": "viewing-autoreply",
+            "fzr_sku_id": "gamekeys:smoke:one",
+            "funpay_lot_id": "445566",
+            "enabled": True,
+        })
+        _viewing_cardinal = _ViewingAutoreplyCardinal()
+        _viewing_message = fp_types.Message(
+            1001,
+            "Здравствуйте",
+            7001,
+            "buyer",
+            9001,
+            "buyer",
+            9001,
+            "",
+            determine_msg_type=False,
+        )
+        _viewing_message.buyer_viewing = fp_types.BuyerViewing(
+            9001,
+            "https://funpay.com/lots/offer?id=445566",
+            "Smoke lot",
+            "smoke",
+        )
+        assert _maybe_send_viewing_autoreply(
+            _viewing_cardinal, _viewing_message)
+        assert _viewing_cardinal.messages == [(
+            7001,
+            DEFAULT_CONFIG["templates"]["viewing_autoreply"],
+            "buyer",
+            False,
+        )]
+        assert not _maybe_send_viewing_autoreply(
+            _viewing_cardinal, _viewing_message)
+
+        _fallback_message = fp_types.Message(
+            1003,
+            "Подскажите",
+            7003,
+            "buyer-three",
+            9003,
+            "buyer-three",
+            9003,
+            "",
+            determine_msg_type=False,
+        )
+        assert _maybe_send_viewing_autoreply(
+            _viewing_cardinal, _fallback_message)
+
+        _not_viewing_cardinal = _ViewingAutoreplyCardinal()
+        _not_viewing_cardinal.account = _SimpleNamespace(
+            get_buyer_viewing=lambda buyer_id: fp_types.BuyerViewing(
+                buyer_id, None, None, "smoke"
+            )
+        )
+        _not_viewing_message = fp_types.Message(
+            1004,
+            "Добрый день",
+            7004,
+            "buyer-four",
+            9004,
+            "buyer-four",
+            9004,
+            "",
+            determine_msg_type=False,
+        )
+        assert not _maybe_send_viewing_autoreply(
+            _not_viewing_cardinal, _not_viewing_message)
+        assert not _not_viewing_cardinal.messages
+
+        _db_save_mapping({
+            "id": "viewing-autoreply-bought",
+            "fzr_sku_id": "gamekeys:smoke:two",
+            "funpay_lot_id": "778899",
+            "enabled": True,
+        })
+        assert _db_insert_order({
+            "funpay_order_id": "VIEWING-BOUGHT",
+            "status": "completed",
+            "buyer_id": 9002,
+            "chat_id": "7002",
+            "mapping_id": "viewing-autoreply-bought",
+        })
+        _bought_message = fp_types.Message(
+            1002,
+            "Есть вопрос",
+            7002,
+            "buyer-two",
+            9002,
+            "buyer-two",
+            9002,
+            "",
+            determine_msg_type=False,
+        )
+        _bought_message.buyer_viewing = fp_types.BuyerViewing(
+            9002,
+            "https://funpay.com/lots/offer?id=778899",
+            "Purchased smoke lot",
+            "smoke",
+        )
+        assert not _maybe_send_viewing_autoreply(
+            _viewing_cardinal, _bought_message)
+        assert len(_viewing_cardinal.messages) == 2
+        print("viewing autoreply visitor and buyer guards OK")
 
         _ensure_callback_routes()
         assert not (
