@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.24.1"
+VERSION = "3.24.2"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.24.2: добавлена совместимость со старыми привязками "
+               "Mobile Legends и восстановление активного диалога ID.\n"
                "v3.24.1: исправлен разбор Player ID (Server ID) для "
                "Mobile Legends и добавлена явная подсказка формата.\n"
                "v3.24.0: профили категорий FunPay с отдельными наценками и "
@@ -2316,14 +2318,18 @@ def _build_metadata_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     fields = mapping.get("metadata_fields")
     if fields and isinstance(fields, list):
-        return _with_implicit(_enrich_fields_with_options(fields, mapping))
+        return _complete_mobile_legends_metadata_fields(
+            mapping, _with_implicit(_enrich_fields_with_options(fields, mapping)))
     if mapping.get("metadata_key"):
         key = mapping["metadata_key"]
         label = mapping.get("metadata_prompt") or key
-        return _with_implicit(_enrich_fields_with_options(
-            [{"key": key, "label": label, "validation": mapping.get("metadata_validation") or _infer_validation(key, label)}],
+        return _complete_mobile_legends_metadata_fields(
             mapping,
-        ))
+            _with_implicit(_enrich_fields_with_options(
+                [{"key": key, "label": label, "validation": mapping.get("metadata_validation") or _infer_validation(key, label)}],
+                mapping,
+            )),
+        )
     offer_fields = mapping.get("fields") or []
     if offer_fields and isinstance(offer_fields, list):
         result: List[Dict[str, Any]] = []
@@ -2333,9 +2339,13 @@ def _build_metadata_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not key:
                 continue
             result.append(_make_metadata_field(key, label, f))
-        return _with_implicit(result)
+        return _complete_mobile_legends_metadata_fields(
+            mapping, _with_implicit(result))
     # привязка добавлена вручную по SKU: полей нет, но тип требует логин/ник
-    return [_make_metadata_field(f["key"], f["label"], f) for f in implicit]
+    return _complete_mobile_legends_metadata_fields(
+        mapping,
+        [_make_metadata_field(f["key"], f["label"], f) for f in implicit],
+    )
 
 
 _CATEGORY_TEMPLATE_KEYS = {
@@ -2448,11 +2458,11 @@ def _normalized_sku_part(value: object) -> str:
 
 def _mapping_sku_parts(mapping: Dict[str, Any]) -> Tuple[str, str, str]:
     sku_parts = str(mapping.get("fzr_sku_id") or "").split(":", 2)
-    sku_parts += [""] * (3 - len(sku_parts))
-    return (
-        _normalized_sku_part(mapping.get("category_kind") or sku_parts[0]),
-        _normalized_sku_part(mapping.get("category_id") or sku_parts[1]),
-        _normalized_sku_part(mapping.get("offer_id") or sku_parts[2]),
+    if len(sku_parts) == 3 and all(part.strip() for part in sku_parts):
+        return tuple(_normalized_sku_part(part) for part in sku_parts)
+    return tuple(
+        _normalized_sku_part(mapping.get(key))
+        for key in ("category_kind", "category_id", "offer_id")
     )
 
 
@@ -2512,6 +2522,46 @@ def _mobile_legends_metadata_fields(
     return player, server
 
 
+def _complete_mobile_legends_metadata_fields(
+    mapping: Dict[str, Any],
+    fields: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not _is_mobile_legends_diamonds(mapping):
+        return fields
+    result = [dict(field) for field in fields]
+    player, server = _mobile_legends_metadata_fields(result)
+    if player and server:
+        return result
+    supplier_fields: List[Dict[str, Any]] = []
+    for field in mapping.get("fields") or []:
+        if not isinstance(field, dict):
+            continue
+        key = field.get("code") or field.get("key") or ""
+        label = field.get("name") or field.get("label") or key
+        if key:
+            supplier_fields.append(_make_metadata_field(key, label, field))
+    supplier_player, supplier_server = _mobile_legends_metadata_fields(
+        supplier_fields)
+    existing_keys = {str(field.get("key") or "") for field in result}
+    if not player:
+        candidate = supplier_player or {
+            "key": "user_id",
+            "label": "Player ID",
+            "validation": "player_id",
+        }
+        if str(candidate.get("key") or "") not in existing_keys:
+            result.insert(0, dict(candidate))
+    if not server:
+        candidate = supplier_server or {
+            "key": "zone_id",
+            "label": "Server ID",
+            "validation": "digits",
+        }
+        if str(candidate.get("key") or "") not in existing_keys:
+            result.append(dict(candidate))
+    return result
+
+
 def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
                             mapping: Optional[Dict[str, Any]] = None,
                             index: Optional[int] = None,
@@ -2553,7 +2603,7 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
     if mapping and _is_mobile_legends_diamonds(mapping) and index in (None, 0):
         base = (
             f"{base}\n\n"
-            "Отправьте данные одним сообщением в формате: "
+            "Отправьте Player ID и Server ID одним сообщением в формате: "
             "Player ID (Server ID).\n"
             "Например: 1751269989 (6865)."
         )
@@ -5805,6 +5855,22 @@ def _prepare_mapping_row(mapping: Dict[str, Any]) -> Dict[str, Any]:
             row["fields_json"] = _to_json(v)
         elif k == "metadata_fields":
             row["metadata_fields_json"] = _to_json(v)
+    sku_parts = str(mapping.get("fzr_sku_id") or "").split(":", 2)
+    if len(sku_parts) == 3 and all(part.strip() for part in sku_parts):
+        kind, category_id, offer_id = (part.strip() for part in sku_parts)
+        row["fzr_sku_id"] = f"{kind}:{category_id}:{offer_id}"
+        row["category_kind"] = kind
+        row["category_id"] = category_id
+        row["offer_id"] = offer_id
+    elif all(mapping.get(key) not in (None, "") for key in (
+            "category_kind", "category_id", "offer_id")):
+        kind = str(mapping["category_kind"]).strip()
+        category_id = str(mapping["category_id"]).strip()
+        offer_id = str(mapping["offer_id"]).strip()
+        row["fzr_sku_id"] = f"{kind}:{category_id}:{offer_id}"
+        row["category_kind"] = kind
+        row["category_id"] = category_id
+        row["offer_id"] = offer_id
     row["enabled"] = 1 if mapping.get("enabled", True) else 0
     # validate_id: по умолчанию включена (None у старых привязок трактуем как 1)
     row["validate_id"] = 0 if mapping.get("validate_id") in (0, "0", False) else 1
@@ -11852,12 +11918,15 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
             meta_fields = enriched
             data["metadata_fields"] = meta_fields
 
-    # legacy pending without fields
-    if not meta_fields and mapping.get("metadata_key"):
-        key = mapping["metadata_key"]
-        label = mapping.get("metadata_prompt") or key
-        meta_fields = _enrich_fields_with_options(
-            [{"key": key, "label": label, "validation": _infer_validation(key, label)}], mapping)
+    completed_fields = _complete_mobile_legends_metadata_fields(
+        mapping, meta_fields)
+    if completed_fields != meta_fields:
+        meta_fields = completed_fields
+        data["metadata_fields"] = meta_fields
+
+    if not meta_fields:
+        meta_fields = _build_metadata_fields(mapping)
+    if meta_fields and not data.get("metadata_fields"):
         data["metadata_fields"] = meta_fields
         data["metadata_index"] = idx = 0
         data["metadata_values"] = {}
@@ -11890,24 +11959,28 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
     data["last_buyer_msg_at"] = time.time()
     _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
 
-    combined_ids = None
+    combined_ids = _parse_mobile_legends_combined_id(mapping, text)
     player_field: Optional[Dict[str, Any]] = None
     server_field: Optional[Dict[str, Any]] = None
-    if not data.get("awaiting_summary") and not isinstance(
-            data.get("awaiting_confirm"), dict):
-        combined_ids = _parse_mobile_legends_combined_id(mapping, text)
-        if combined_ids:
-            player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
-            current_key = (
-                str(meta_fields[idx].get("key") or "")
-                if 0 <= idx < len(meta_fields) else ""
-            )
-            expected_keys = {
-                str((player_field or {}).get("key") or ""),
-                str((server_field or {}).get("key") or ""),
-            }
-            if current_key not in expected_keys:
-                combined_ids = None
+    if combined_ids:
+        player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
+        confirm = data.get("awaiting_confirm")
+        active_idx = idx
+        if isinstance(confirm, dict):
+            try:
+                active_idx = int(confirm.get("index", idx) or 0)
+            except (TypeError, ValueError):
+                active_idx = idx
+        current_key = (
+            str(meta_fields[active_idx].get("key") or "")
+            if 0 <= active_idx < len(meta_fields) else ""
+        )
+        expected_keys = {
+            str((player_field or {}).get("key") or ""),
+            str((server_field or {}).get("key") or ""),
+        }
+        if not data.get("awaiting_summary") and current_key not in expected_keys:
+            combined_ids = None
     if combined_ids and player_field and server_field:
         player_id, server_id = combined_ids
         player_error = _validate_metadata_value(
@@ -11929,6 +12002,7 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
                 server_field.get("validation"), server_id)
             data["metadata_values"] = metadata_values
             data.pop("awaiting_confirm", None)
+            data.pop("awaiting_summary", None)
             next_idx = _next_unfilled_index(meta_fields, metadata_values, 0)
             data["metadata_index"] = next_idx
             data["prompt_sent_at"] = time.time()
@@ -17329,12 +17403,20 @@ def _validate_import_mappings(
         if not sku:
             skipped_no_sku += 1
             continue
-        if not (kind and category_id and offer_id):
-            try:
-                kind, category_id, offer_id = _parse_sku(sku)
-            except ValueError:
+        raw_sku_parts = sku.split(":", 2)
+        if len(raw_sku_parts) == 3:
+            sku = ":".join(part.strip() for part in raw_sku_parts)
+        try:
+            kind, category_id, offer_id = _parse_sku(sku)
+            kind, category_id, offer_id = (
+                part.strip() for part in (kind, category_id, offer_id)
+            )
+            sku = f"{kind}:{category_id}:{offer_id}"
+        except ValueError:
+            if not (kind and category_id and offer_id):
                 skipped_bad += 1
                 continue
+            sku = f"{kind}:{category_id}:{offer_id}"
         has_price_sync = "price_sync" in item
         clean = {k: v for k, v in item.items() if k in allowed}
         clean["fzr_sku_id"] = sku
@@ -20335,6 +20417,29 @@ def _run_smoke_tests() -> None:
             },
             "1751269989 (6865)",
         ) == ("1751269989", "6865")
+        _legacy_ml_mapping = {
+            "fzr_sku_id": " topups : mobile_legends_ru : 35_diamonds ",
+            "category_kind": "legacy-topup",
+            "category_id": "legacy-category",
+            "offer_id": "legacy-offer",
+        }
+        assert _parse_mobile_legends_combined_id(
+            _legacy_ml_mapping, "1751269989 (6865)"
+        ) == ("1751269989", "6865")
+        _legacy_ml_row = _prepare_mapping_row({
+            "id": "legacy-ml",
+            **_legacy_ml_mapping,
+        })
+        assert _legacy_ml_row["category_kind"] == "topups"
+        assert _legacy_ml_row["category_id"] == "mobile_legends_ru"
+        assert _legacy_ml_row["offer_id"] == "35_diamonds"
+        _legacy_import, _legacy_warnings = _validate_import_mappings([
+            {"id": "legacy-import", **_legacy_ml_mapping},
+        ])
+        assert not _legacy_warnings
+        assert _legacy_import[0]["category_kind"] == "topups"
+        assert _legacy_import[0]["category_id"] == "mobile_legends_ru"
+        assert _legacy_import[0]["offer_id"] == "35_diamonds"
         assert _parse_mobile_legends_combined_id(
             _ml_mapping, "2237306259 6652"
         ) is None
@@ -20350,6 +20455,17 @@ def _run_smoke_tests() -> None:
         assert _server_field and _server_field["key"] == "zone_id"
         assert _validate_metadata_value(
             "user_id", "2237306259", "player_id") is None
+        _legacy_fields = _build_metadata_fields({
+            **_ml_mapping,
+            "metadata_key": "user_id",
+            "metadata_prompt": "Player ID",
+            "metadata_validation": "player_id",
+        })
+        _legacy_player, _legacy_server = _mobile_legends_metadata_fields(
+            _legacy_fields)
+        assert _legacy_player and _legacy_player["key"] == "user_id"
+        assert _legacy_server and _legacy_server["key"] == "zone_id"
+        assert len(_legacy_fields) == 2
         _ml_prompt = _format_metadata_prompt(
             create_default_config(),
             {"key": "user_id", "label": "Player ID"},
@@ -20357,6 +20473,7 @@ def _run_smoke_tests() -> None:
             index=0,
             total=2,
         )
+        assert "Player ID и Server ID одним сообщением" in _ml_prompt
         assert "Player ID (Server ID)" in _ml_prompt
         print("Mobile Legends combined ID parsing OK")
 
