@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 
 NAME = "FazerCards Reseller"
-VERSION = "3.23.0"
+VERSION = "3.24.0"
 DESCRIPTION = ("Автовыдача цифровых товаров через FazerCards Reseller API (v2).\n"
+               "v3.24.0: профили категорий FunPay с отдельными наценками и "
+               "шаблонами, экспорт/импорт и авторазбор Mobile Legends ID.\n"
                "v3.23.0: типизированное ядро, отдельные SQLite-подключения "
                "для потоков, ограниченный планировщик, кэш каталога и "
                "декларативная маршрутизация Telegram.\n"
@@ -122,6 +124,18 @@ class MappingRecord(TypedDict, total=False):
     refund_template: str
     created_at: float
     updated_at: float
+
+
+class CategoryProfileRecord(TypedDict, total=False):
+    subcategory_id: str
+    name: str
+    markup_percent: float
+    markup_fixed: float
+    greeting_template: str
+    ask_template: str
+    delivery_template: str
+    review_template: str
+    refund_template: str
 
 
 class PriceSyncPlan(TypedDict, total=False):
@@ -638,6 +652,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "подскажу альтернативу."
         ),
     },
+    "category_profiles": {},
     "mappings": [],
 }
 
@@ -2321,6 +2336,160 @@ def _build_metadata_fields(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [_make_metadata_field(f["key"], f["label"], f) for f in implicit]
 
 
+_CATEGORY_TEMPLATE_KEYS = {
+    "greeting_template": "greeting",
+    "ask_template": "ask_metadata",
+    "delivery_template": "delivery",
+    "review_template": "review_request",
+    "refund_template": "refund_notice",
+}
+
+
+def _category_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(int(text))
+    except (TypeError, ValueError):
+        return text
+
+
+def _category_profiles(cfg: Dict[str, Any]) -> Dict[str, CategoryProfileRecord]:
+    raw = cfg.get("category_profiles")
+    if not isinstance(raw, dict):
+        return {}
+    profiles: Dict[str, CategoryProfileRecord] = {}
+    for raw_key, raw_profile in raw.items():
+        if not isinstance(raw_profile, dict):
+            continue
+        key = _category_key(
+            raw_profile.get("subcategory_id")
+            if raw_profile.get("subcategory_id") not in (None, "")
+            else raw_key
+        )
+        if key:
+            profiles[key] = raw_profile
+    return profiles
+
+
+def _mapping_category_key(mapping: Optional[Dict[str, Any]]) -> str:
+    return _category_key((mapping or {}).get("funpay_subcategory_id"))
+
+
+def _category_profile(
+    cfg: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+) -> Optional[CategoryProfileRecord]:
+    key = _mapping_category_key(mapping)
+    return _category_profiles(cfg).get(key) if key else None
+
+
+def _category_profile_name(
+    cfg: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+) -> str:
+    profile = _category_profile(cfg, mapping) or {}
+    return str(profile.get("name") or _mapping_category_key(mapping) or "FunPay")
+
+
+def _category_profile_value(
+    cfg: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+    key: str,
+) -> object:
+    profile = _category_profile(cfg, mapping)
+    if not profile:
+        return None
+    value = profile.get(key)
+    return value if value not in (None, "") else None
+
+
+def _template_override(
+    cfg: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+    mapping_key: str,
+) -> str:
+    own = (mapping or {}).get(mapping_key)
+    if isinstance(own, str) and own.strip():
+        return own
+    category_value = _category_profile_value(cfg, mapping, mapping_key)
+    return str(category_value) if category_value is not None else ""
+
+
+def _effective_template(
+    cfg: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+    mapping_key: str,
+) -> str:
+    override = _template_override(cfg, mapping, mapping_key)
+    if override:
+        return override
+    global_key = _CATEGORY_TEMPLATE_KEYS[mapping_key]
+    return str((cfg.get("templates") or {}).get(global_key) or "")
+
+
+_MOBILE_LEGENDS_DIAMONDS_SKU_RE = re.compile(
+    r"^topups:mobile_legends_ru:[^:]+_diamonds$",
+    re.IGNORECASE,
+)
+_MOBILE_LEGENDS_COMBINED_ID_RE = re.compile(
+    r"^\s*(\d+)\s*\(\s*(\d+)\s*\)\s*$"
+)
+
+
+def _is_mobile_legends_diamonds(mapping: Dict[str, Any]) -> bool:
+    return bool(_MOBILE_LEGENDS_DIAMONDS_SKU_RE.fullmatch(
+        str(mapping.get("fzr_sku_id") or "").strip()))
+
+
+def _parse_mobile_legends_combined_id(
+    mapping: Dict[str, Any],
+    text: str,
+) -> Optional[Tuple[str, str]]:
+    if not _is_mobile_legends_diamonds(mapping):
+        return None
+    match = _MOBILE_LEGENDS_COMBINED_ID_RE.fullmatch(text or "")
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _mobile_legends_metadata_fields(
+    fields: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    player_aliases = {
+        "playerid", "userid", "gameid", "accountid", "mlbbid",
+        "roleid", "openid",
+    }
+    server_aliases = {"serverid", "zoneid", "server", "zone"}
+    player: Optional[Dict[str, Any]] = None
+    server: Optional[Dict[str, Any]] = None
+    for field in fields:
+        key = str(field.get("key") or "")
+        label = str(field.get("label") or "")
+        key_norm = re.sub(r"[^a-zа-я0-9]+", "", key.casefold())
+        text_norm = re.sub(
+            r"[^a-zа-я0-9]+", " ", f"{key} {label}".casefold())
+        if server is None and (
+            key_norm in server_aliases
+            or any(word in text_norm for word in ("server", "zone", "сервер", "зона"))
+        ):
+            server = field
+            continue
+        if player is None and (
+            key_norm in player_aliases
+            or any(word in text_norm for word in (
+                "player", "user", "account", "игрок", "пользователь",
+            ))
+        ):
+            player = field
+    if len(fields) == 2:
+        if player is None and server is not None:
+            player = next((field for field in fields if field is not server), None)
+        if server is None and player is not None:
+            server = next((field for field in fields if field is not player), None)
+    return player, server
+
+
 def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
                             mapping: Optional[Dict[str, Any]] = None,
                             index: Optional[int] = None,
@@ -2341,7 +2510,7 @@ def _format_metadata_prompt(cfg: Dict[str, Any], field: Dict[str, Any],
     а счётчик шагов встраиваем в ту же строку.
     """
     label = field.get("label") or field.get("key") or "данные"
-    tpl = (mapping or {}).get("ask_template") or cfg["templates"]["ask_metadata"]
+    tpl = _effective_template(cfg, mapping, "ask_template")
     try:
         base = render_template(tpl, default=DEFAULT_CONFIG["templates"]["ask_metadata"],
                                prompt=label,
@@ -2375,7 +2544,7 @@ def _greeting_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
     ошибка покупателя необратима (пополнение не на тот аккаунт и т. п.).
     """
     profile = _kind_profile((mapping or {}).get("category_kind"))
-    tpl = (mapping or {}).get("greeting_template") or cfg["templates"].get("greeting") or ""
+    tpl = _effective_template(cfg, mapping, "greeting_template")
     if not tpl:
         return ""
     name = _mapping_display_name(mapping)
@@ -2431,7 +2600,7 @@ def _delivery_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
     profile = _kind_profile(kind)
     codes = [str(x) for x in (codes or []) if str(x).strip()]
     code = "\n".join(codes) if codes else ""
-    own_tpl = (mapping or {}).get("delivery_template")
+    own_tpl = _template_override(cfg, mapping, "delivery_template")
 
     if own_tpl:
         try:
@@ -8217,14 +8386,29 @@ def _markup_own(mapping: Dict[str, Any], key: str) -> Optional[float]:
 
 
 def _markup_effective(mapping: Dict[str, Any], cfg: Dict[str, Any], key: str) -> float:
-    """Наценка, которая реально применится: своя, иначе глобальная."""
+    """Effective markup: mapping override, category profile, global setting."""
+    value, _source = _markup_effective_source(mapping, cfg, key)
+    return value
+
+
+def _markup_effective_source(
+    mapping: Dict[str, Any],
+    cfg: Dict[str, Any],
+    key: str,
+) -> Tuple[float, str]:
     own = _markup_own(mapping, key)
     if own is not None:
-        return own
+        return own, "mapping"
+    category_value = _category_profile_value(cfg, mapping, key)
+    if category_value is not None:
+        try:
+            return float(category_value), "category"
+        except (TypeError, ValueError):
+            pass
     try:
-        return float(cfg["settings"].get(key) or 0)
+        return float(cfg["settings"].get(key) or 0), "global"
     except (TypeError, ValueError):
-        return 0.0
+        return 0.0, "global"
 
 
 def _apply_markup(price_usd: Union[str, float, None], mapping: Dict[str, Any], cfg: Dict[str, Any],
@@ -9478,7 +9662,7 @@ def _fzr_refund_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
     Причину отказа поставщика покупателю НЕ пересылаем: там бывает название
     поставщика и внутренние коды.
     """
-    tpl = (mapping or {}).get("refund_template") or cfg["templates"].get("refund_notice") or ""
+    tpl = _effective_template(cfg, mapping, "refund_template")
     if not tpl.strip():
         return ""
     name = _mapping_display_name(mapping) if mapping else "заказ"
@@ -9663,7 +9847,7 @@ def _review_request_text(cfg: Dict[str, Any], mapping: Optional[Dict[str, Any]],
     вместе с кодом.
     """
     link = _funpay_order_url(funpay_order_id)
-    tpl = (mapping or {}).get("review_template") or cfg["templates"].get("review_request") or ""
+    tpl = _effective_template(cfg, mapping, "review_template")
     if not tpl.strip():
         return ""
     text = render_template(
@@ -10835,23 +11019,22 @@ def _price_sync_inventory(
 
 def _markup_source_summary(mapping: Dict[str, Any],
                            cfg: Dict[str, Any]) -> str:
-    percent = _markup_own(mapping, "markup_percent")
-    fixed = _markup_own(mapping, "markup_fixed")
-    if percent is None and fixed is None:
-        return (
-            f"глобальная {_markup_effective(mapping, cfg, 'markup_percent'):g}%"
-            f" + {_markup_effective(mapping, cfg, 'markup_fixed'):g} ₽"
-        )
-    parts = []
-    parts.append(
-        f"{percent:g}% индивидуальная" if percent is not None
-        else f"{_markup_effective(mapping, cfg, 'markup_percent'):g}% глобальная"
+    percent, percent_source = _markup_effective_source(
+        mapping, cfg, "markup_percent")
+    fixed, fixed_source = _markup_effective_source(
+        mapping, cfg, "markup_fixed")
+
+    def _source_label(source: str) -> str:
+        if source == "mapping":
+            return "индивидуальная"
+        if source == "category":
+            return f"категория «{_category_profile_name(cfg, mapping)}»"
+        return "глобальная"
+
+    return (
+        f"{percent:g}% {_source_label(percent_source)}"
+        f" + {fixed:g} ₽ {_source_label(fixed_source)}"
     )
-    parts.append(
-        f"{fixed:g} ₽ индивидуальная" if fixed is not None
-        else f"{_markup_effective(mapping, cfg, 'markup_fixed'):g} ₽ глобальная"
-    )
-    return " + ".join(parts)
 
 
 def _plan_price_change(mapping: Dict[str, Any], cfg: Dict[str, Any],
@@ -10983,7 +11166,9 @@ def _apply_lot_price(c: "Cardinal", mapping: Dict[str, Any],
 
 
 def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
-                     force: bool = False, only_mapping_id: Optional[str] = None
+                     force: bool = False,
+                     only_mapping_id: Optional[str] = None,
+                     only_category_id: Optional[str] = None,
                      ) -> Dict[str, Any]:
     """
     Один проход синхронизации цен.
@@ -10992,6 +11177,9 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
     only_mapping_id — пересчитать одну привязку (кнопка в её карточке).
     """
     all_mappings = _db_get_mappings()
+    lots = _lots_index(c)
+    for existing_mapping in all_mappings:
+        _refresh_mapping_category(c, existing_mapping, lots)
     report: Dict[str, Any] = {
         "checked": 0, "changed": [], "skipped": [],
         "failed": [], "review": [], "dry_run": False,
@@ -11006,6 +11194,12 @@ def _sync_lot_prices(c: "Cardinal", cfg: Dict[str, Any],
     mappings = _price_sync_candidates(all_mappings)
     if only_mapping_id:
         mappings = [m for m in all_mappings if m.get("id") == only_mapping_id]
+    elif only_category_id:
+        category_key = _category_key(only_category_id)
+        mappings = [
+            m for m in mappings
+            if _mapping_category_key(m) == category_key
+        ]
     if not mappings:
         return report
 
@@ -11133,6 +11327,23 @@ def _sync_lot_prices_after_setting_change(c: "Cardinal",
         c, cfg, force=True, only_mapping_id=mapping_id)
     logger.info("price sync after setting change", extra={
         "setting": setting,
+        "checked": report.get("checked", 0),
+        "changed": len(report.get("changed") or []),
+        "failed": len(report.get("failed") or []),
+        "error": report.get("error"),
+    })
+    _notify_admin(c, _price_sync_report_html(report))
+
+
+def _sync_category_prices_after_setting_change(
+    c: "Cardinal",
+    cfg: Dict[str, Any],
+    category_id: str,
+) -> None:
+    report = _sync_lot_prices(
+        c, cfg, force=True, only_category_id=category_id)
+    logger.info("category price sync after setting change", extra={
+        "category_id": category_id,
         "checked": report.get("checked", 0),
         "changed": len(report.get("changed") or []),
         "failed": len(report.get("failed") or []),
@@ -11400,6 +11611,7 @@ def _handle_new_order_inner(c: "Cardinal", e: NewOrderEvent) -> None:
         logger.info("no mapping for order", extra={"funpay_order_id": order_id, "description": order_info.get("description")})
         return
 
+    mapping = _refresh_mapping_category(c, mapping)
     _db_update_order(order_id, mapping_id=mapping.get("id"), sku_id=mapping.get("fzr_sku_id"))
     _db_log_event(order_id, "mapping_matched", {"mapping_id": mapping.get("id"), "sku_id": mapping.get("fzr_sku_id")})
     _inc_metric("orders_matched")
@@ -11511,7 +11723,7 @@ def _finish_metadata_dialog(c: "Cardinal", cfg: Dict[str, Any], mapping: Dict[st
         order_info,
         mapping,
         metadata_values,
-        task_key=f"order-create:{order_id}",
+        task_key=f"order-create:{funpay_order_id}",
     )
 
 
@@ -11648,6 +11860,82 @@ def _handle_new_message_inner(c: "Cardinal", e: NewMessageEvent) -> None:
     # доходит — раньше такие диалоги умирали по таймауту «от создания заказа».
     data["last_buyer_msg_at"] = time.time()
     _save_pending(funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+
+    combined_ids = None
+    player_field: Optional[Dict[str, Any]] = None
+    server_field: Optional[Dict[str, Any]] = None
+    if not data.get("awaiting_summary") and not isinstance(
+            data.get("awaiting_confirm"), dict):
+        combined_ids = _parse_mobile_legends_combined_id(mapping, text)
+        if combined_ids:
+            player_field, server_field = _mobile_legends_metadata_fields(meta_fields)
+            current_key = (
+                str(meta_fields[idx].get("key") or "")
+                if 0 <= idx < len(meta_fields) else ""
+            )
+            expected_keys = {
+                str((player_field or {}).get("key") or ""),
+                str((server_field or {}).get("key") or ""),
+            }
+            if current_key not in expected_keys:
+                combined_ids = None
+    if combined_ids and player_field and server_field:
+        player_id, server_id = combined_ids
+        player_error = _validate_metadata_value(
+            str(player_field.get("key") or ""),
+            player_id,
+            player_field.get("validation"),
+        )
+        server_error = _validate_metadata_value(
+            str(server_field.get("key") or ""),
+            server_id,
+            server_field.get("validation"),
+        )
+        if not player_error and not server_error:
+            player_key = str(player_field.get("key") or "")
+            server_key = str(server_field.get("key") or "")
+            metadata_values[player_key] = _normalize_metadata_value(
+                player_field.get("validation"), player_id)
+            metadata_values[server_key] = _normalize_metadata_value(
+                server_field.get("validation"), server_id)
+            data["metadata_values"] = metadata_values
+            data.pop("awaiting_confirm", None)
+            next_idx = _next_unfilled_index(meta_fields, metadata_values, 0)
+            data["metadata_index"] = next_idx
+            data["prompt_sent_at"] = time.time()
+            _db_log_event(
+                funpay_order_id,
+                "mobile_legends_ids_split",
+                {"player_key": player_key, "server_key": server_key},
+            )
+            if next_idx < len(meta_fields):
+                _save_pending(
+                    funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+                _ask_field(
+                    c, cfg, mapping, meta_fields, metadata_values, next_idx,
+                    chat_id, buyer,
+                    prefix="Распознал ID игрока и сервера.",
+                )
+                return
+            if _confirm_enabled(cfg, "confirm_summary") or \
+                    _confirm_enabled(cfg, "confirm_metadata"):
+                data["awaiting_summary"] = True
+                _save_pending(
+                    funpay_order_id, buyer_id, chat_id, mapping["id"], data)
+                _send_buyer(
+                    c, chat_id,
+                    "Распознал ID игрока и сервера.\n\n"
+                    + _summary_question(
+                        meta_fields, metadata_values, labels),
+                    buyer,
+                )
+                return
+            _finish_metadata_dialog(
+                c, cfg, mapping, funpay_order_id, order_info,
+                chat_id, buyer, metadata_values, labels,
+                prefix="Распознал ID игрока и сервера.",
+            )
+            return
 
     # -------------------------------------------------------------------------
     # v3.14, шаг 1: ждём подтверждение финальной сводки
@@ -13409,6 +13697,10 @@ def _build_callback_arg_handlers() -> Dict[str, Callable[..., object]]:
     "mapping_refund": _mapping_refund_prompt,
     "tpl_edit": _tpl_edit_prompt,
     "mapping_texts": _mapping_preview_texts,
+    "category_open": _category_open,
+    "category_markup": _category_markup_prompt,
+    "category_markup_reset": _category_markup_reset,
+    "category_template": _category_template_prompt,
     "settings_sec": _show_settings,
     "settings_edit": _start_settings_edit,
     "settings_toggle": _toggle_setting,
@@ -13445,6 +13737,8 @@ def _build_callback_noarg_handlers() -> Dict[str, Callable[..., object]]:
     "price_sync_now": _price_sync_now,
     "rate_now": _rate_update_now,
     "settings": _show_settings,
+    "categories": _show_categories,
+    "categories_refresh": _refresh_categories,
     "webhook": _show_webhook,
     "webhook_del": _webhook_delete,
     "webhook_test": _webhook_test,
@@ -13709,6 +14003,8 @@ def _handle_step(c: "Cardinal", message: Any, state: Optional[Dict[str, Any]]) -
         "mapping_ask_edit": _step_mapping_ask_edit,
         "mapping_review_edit": _step_mapping_review_edit,
         "mapping_refund_edit": _step_mapping_refund_edit,
+        "category_markup_edit": _step_category_markup_edit,
+        "category_template_edit": _step_category_template_edit,
         "tpl_edit": _step_tpl_edit,
         "bal_topup": _step_balance_topup,
         "bal_correct": _step_balance_correct,
@@ -16443,6 +16739,7 @@ def _export_settings_payload(cfg: Dict[str, Any], with_secrets: bool = False) ->
         "base_url": cfg.get("base_url") or DEFAULT_CONFIG["base_url"],
         "settings": copy.deepcopy(cfg.get("settings") or {}),
         "templates": copy.deepcopy(cfg.get("templates") or {}),
+        "category_profiles": copy.deepcopy(_category_profiles(cfg)),
     }
     if with_secrets and cfg.get("api_key"):
         out["api_key"] = cfg["api_key"]
@@ -16594,6 +16891,80 @@ def _lots_index(c: Optional["Cardinal"], force: bool = False) -> Dict[str, Any]:
     return _LOTS_INDEX_CACHE
 
 
+def _refresh_mapping_category(
+    c: Optional["Cardinal"],
+    mapping: Dict[str, Any],
+    lots: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    lot_id = str(mapping.get("funpay_lot_id") or "")
+    if not lot_id:
+        return mapping
+    live = (((lots or _lots_index(c)).get("by_id") or {}).get(lot_id) or {})
+    subcategory_id = live.get("subcategory_id")
+    if subcategory_id in (None, ""):
+        return mapping
+    live_key = _category_key(subcategory_id)
+    if live_key == _mapping_category_key(mapping):
+        return mapping
+    mapping["funpay_subcategory_id"] = subcategory_id
+    _db_save_mapping(mapping)
+    return mapping
+
+
+def _discover_categories(
+    c: Optional["Cardinal"],
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    cfg = load_config()
+    profiles = _category_profiles(cfg)
+    lots = _lots_index(c, force=force)
+    inventory: Dict[str, Dict[str, Any]] = {}
+    for mapping in _db_get_mappings():
+        _refresh_mapping_category(c, mapping, lots)
+        key = _mapping_category_key(mapping)
+        if not key:
+            continue
+        live = ((lots.get("by_id") or {}).get(
+            str(mapping.get("funpay_lot_id") or "")) or {})
+        profile = profiles.get(key) or {"subcategory_id": key}
+        name = str(
+            live.get("subcategory_name")
+            or profile.get("name")
+            or f"Категория FunPay {key}"
+        )
+        item = inventory.setdefault(
+            key, {"id": key, "name": name, "mappings": 0})
+        item["mappings"] += 1
+        if live.get("subcategory_name"):
+            item["name"] = name
+    for key, profile in profiles.items():
+        inventory.setdefault(
+            key,
+            {
+                "id": key,
+                "name": str(profile.get("name") or f"Категория FunPay {key}"),
+                "mappings": 0,
+            },
+        )
+    changed = False
+    for key, item in inventory.items():
+        profile = dict(profiles.get(key) or {})
+        if profile.get("subcategory_id") != key:
+            profile["subcategory_id"] = key
+            changed = True
+        if item["name"] and profile.get("name") != item["name"]:
+            profile["name"] = item["name"]
+            changed = True
+        profiles[key] = profile
+    if changed:
+        cfg["category_profiles"] = profiles
+        save_config(cfg)
+    return sorted(
+        inventory.values(),
+        key=lambda item: (str(item["name"]).casefold(), str(item["id"])),
+    )
+
+
 def _lot_url(lot_id: Any) -> str:
     return f"https://funpay.com/lots/offer?id={lot_id}" if lot_id else ""
 
@@ -16634,6 +17005,8 @@ def _export_mapping(mapping: Dict[str, Any],
 
 _EXPORT_README = [
     "Файл настроек плагина FazerCards Reseller. Можно править в текстовом редакторе.",
+    "category_profiles: настройки по подкатегории FunPay. Привязка имеет "
+    "приоритет над профилем категории, профиль категории — над общими настройками.",
     "ПЕРЕНОС НА ДРУГОЙ АККАУНТ: в каждой привязке впишите funpay_lot_title как "
     "называется лот на НОВОМ аккаунте, а funpay_lot_id поставьте null.",
     "Название сверяется без учёта регистра, лишних пробелов и знаков "
@@ -16772,6 +17145,56 @@ def _normalize_import_payload(data: Dict[str, Any], kind: str) -> Dict[str, Any]
     return {"config": config, "mappings": mappings}
 
 
+def _validate_category_profiles(
+    raw: object,
+) -> Tuple[Dict[str, CategoryProfileRecord], List[str]]:
+    warnings: List[str] = []
+    clean: Dict[str, CategoryProfileRecord] = {}
+    if raw in (None, {}):
+        return clean, warnings
+    if not isinstance(raw, dict):
+        return clean, ["профили категорий пропущены: ожидался объект"]
+    template_keys = set(_CATEGORY_TEMPLATE_KEYS)
+    for raw_key, raw_profile in raw.items():
+        if not isinstance(raw_profile, dict):
+            warnings.append(f"профиль категории {raw_key} пропущен")
+            continue
+        key = _category_key(
+            raw_profile.get("subcategory_id")
+            if raw_profile.get("subcategory_id") not in (None, "")
+            else raw_key
+        )
+        if not key:
+            warnings.append("профиль категории без ID пропущен")
+            continue
+        profile: CategoryProfileRecord = {"subcategory_id": key}
+        name = raw_profile.get("name")
+        if isinstance(name, str) and name.strip():
+            profile["name"] = name.strip()[:300]
+        for markup_key in ("markup_percent", "markup_fixed"):
+            value = raw_profile.get(markup_key)
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"категория {key}: некорректное значение {markup_key} пропущено")
+                continue
+            _label, _caster, min_v, max_v = _SETTINGS_EDITABLE[markup_key]
+            if number < min_v or number > max_v:
+                warnings.append(
+                    f"категория {key}: {markup_key} вне допустимых границ")
+                continue
+            profile[markup_key] = number
+        for template_key in template_keys:
+            value = raw_profile.get(template_key)
+            if isinstance(value, str) and value.strip():
+                profile[template_key] = value[:4000]
+        clean[key] = profile
+    return clean, warnings
+
+
 def _validate_import_settings(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
     Отбираем из файла только известные настройки и проверяем значения.
@@ -16846,10 +17269,17 @@ def _validate_import_settings(config: Dict[str, Any]) -> Tuple[Dict[str, Any], L
 
     if config.get("api_key"):
         clean["api_key"] = str(config["api_key"])
+    profiles, profile_warnings = _validate_category_profiles(
+        config.get("category_profiles"))
+    if profiles:
+        clean["category_profiles"] = profiles
+    warnings.extend(profile_warnings)
     return clean, warnings
 
 
-def _validate_import_mappings(raw: List[Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _validate_import_mappings(
+    raw: List[Any],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Оставляем только пригодные привязки: с SKU и разобранным kind/category/offer."""
     warnings: List[str] = []
     out: List[Dict[str, Any]] = []
@@ -16918,12 +17348,9 @@ def _validate_import_mappings(raw: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
         # техническим default и должен наследовать глобальную наценку.
         for key in ("markup_percent", "markup_fixed"):
             flag = f"{key}_custom"
-            if flag in item:
-                own = _markup_own(clean, key)
-            else:
-                own = _markup_own(clean, key)
-                if own == 0:
-                    own = None
+            own = _markup_own(clean, key)
+            if flag not in item and own == 0:
+                own = None
             _set_markup_value(clean, key, own)
         out.append(clean)
     if skipped_no_sku:
@@ -17013,7 +17440,8 @@ def _plan_import(payload: Dict[str, Any], kind: str,
     """
     plan: Dict[str, Any] = {
         "kind": kind, "warnings": [], "settings": {}, "settings_diff": [],
-        "templates_diff": [], "mappings_new": [], "mappings_update": [],
+        "templates_diff": [], "category_profiles_diff": [],
+        "mappings_new": [], "mappings_update": [],
         "mappings_conflict": [], "has_api_key": False, "keep_lots": keep_lots,
         "lot_notes": [], "lots_known": 0,
     }
@@ -17031,6 +17459,10 @@ def _plan_import(payload: Dict[str, Any], kind: str,
         for key, value in (clean.get("templates") or {}).items():
             if (cfg["templates"].get(key) or "") != value:
                 plan["templates_diff"].append(key)
+        current_profiles = _category_profiles(cfg)
+        for key, profile in (clean.get("category_profiles") or {}).items():
+            if current_profiles.get(key) != profile:
+                plan["category_profiles_diff"].append(key)
         if clean.get("base_url") and clean["base_url"] != cfg.get("base_url"):
             plan["settings_diff"].append(("base_url", cfg.get("base_url"), clean["base_url"]))
 
@@ -17102,6 +17534,7 @@ def _plan_import(payload: Dict[str, Any], kind: str,
 def _apply_import(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Применяем подготовленный план. Бэкап делается вызывающей стороной."""
     result = {"settings_changed": 0, "templates_changed": 0,
+              "category_profiles_changed": 0,
               "mappings_added": 0, "mappings_updated": 0, "api_key_set": False,
               "lots_relinked": 0, "disabled": 0}
     kind = plan["kind"]
@@ -17117,6 +17550,12 @@ def _apply_import(plan: Dict[str, Any]) -> Dict[str, Any]:
             if (cfg["templates"].get(key) or "") != value:
                 cfg["templates"][key] = value
                 result["templates_changed"] += 1
+        profiles = _category_profiles(cfg)
+        for key, profile in (clean.get("category_profiles") or {}).items():
+            if profiles.get(key) != profile:
+                profiles[key] = profile
+                result["category_profiles_changed"] += 1
+        cfg["category_profiles"] = profiles
         if clean.get("base_url"):
             cfg["base_url"] = clean["base_url"]
         if clean.get("api_key") and plan.get("import_api_key"):
@@ -17273,6 +17712,10 @@ def _import_plan_text(plan: Dict[str, Any], file_name: str = "") -> str:
         if plan["templates_diff"]:
             lines.append(f"📝 Шаблонов изменится: <b>{len(plan['templates_diff'])}</b> "
                          f"({_esc(', '.join(plan['templates_diff'][:4]))})")
+        if plan["category_profiles_diff"]:
+            lines.append(
+                f"🗂 Профилей категорий изменится: "
+                f"<b>{len(plan['category_profiles_diff'])}</b>")
 
     if plan["kind"] in (_EXPORT_KIND_MAPPINGS, _EXPORT_KIND_FULL):
         lines.append(f"🔗 Привязок в файле: <b>{plan.get('mappings_total', 0)}</b>")
@@ -17321,6 +17764,7 @@ def _import_plan_text(plan: Dict[str, Any], file_name: str = "") -> str:
             lines.append(f"• {_esc(w)}")
 
     nothing = (not plan["settings_diff"] and not plan["templates_diff"]
+               and not plan["category_profiles_diff"]
                and not plan["mappings_update"] and not plan["mappings_new"]
                and not plan["mappings_conflict"])
     if nothing:
@@ -17951,6 +18395,7 @@ def _import_handle_document(c: "Cardinal", message: Any) -> None:
 def _import_plan_kb(plan: Dict[str, Any]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     nothing = (not plan["settings_diff"] and not plan["templates_diff"]
+               and not plan["category_profiles_diff"]
                and not plan["mappings_update"] and not plan["mappings_new"]
                and not plan["mappings_conflict"])
     if not nothing:
@@ -18141,6 +18586,283 @@ def _on_off(value: Any) -> str:
     return "🟢 вкл" if value else "🔴 выкл"
 
 
+_CATEGORY_TEMPLATE_LABELS = {
+    "greeting_template": "👋 Приветствие",
+    "ask_template": "❓ Запрос данных",
+    "delivery_template": "🎁 Выдача",
+    "review_template": "⭐ Просьба об отзыве",
+    "refund_template": "↩️ Возврат",
+}
+
+
+def _category_profile_by_id(
+    cfg: Dict[str, Any],
+    category_id: str,
+) -> CategoryProfileRecord:
+    key = _category_key(category_id)
+    profiles = _category_profiles(cfg)
+    profile = dict(profiles.get(key) or {"subcategory_id": key})
+    profile["subcategory_id"] = key
+    return profile
+
+
+def _show_categories(c: "Cardinal", call: Any) -> None:
+    categories = _discover_categories(c)
+    kb = InlineKeyboardMarkup(row_width=1)
+    for category in categories[:80]:
+        name = str(category["name"])
+        count = int(category["mappings"])
+        kb.add(_inline_button(
+            f"{name[:42]} · {count}",
+            callback_data=f"{CB_PREFIX}:category_open:{category['id']}",
+        ))
+    kb.add(_inline_button(
+        "🔄 Обновить категории",
+        callback_data=f"{CB_PREFIX}:categories_refresh",
+    ))
+    kb.add(_inline_button(
+        "🔙 Настройки",
+        callback_data=f"{CB_PREFIX}:settings",
+    ))
+    text = (
+        "🗂 <b>Категории FunPay</b>\n\n"
+        "Категория определяется по ID привязанного лота. Настройки категории "
+        "действуют на все её привязки, кроме полей с индивидуальными значениями.\n\n"
+        f"<blockquote>Найдено категорий: <b>{len(categories)}</b>\n"
+        f"Привязок с категорией: <b>{sum(int(x['mappings']) for x in categories)}</b>"
+        "</blockquote>\n\n"
+        "<i>Приоритет: привязка → категория → общие настройки.</i>"
+    )
+    if not categories:
+        text += (
+            "\n\n<i>Сначала привяжите ID лотов FunPay или нажмите обновление, "
+            "чтобы прочитать категории из аккаунта.</i>"
+        )
+    _send_or_edit(c, call, text, kb=kb)
+
+
+def _refresh_categories(c: "Cardinal", call: Any) -> None:
+    _discover_categories(c, force=True)
+    _show_categories(c, call)
+
+
+def _category_open(c: "Cardinal", call: Any, category_id: str) -> None:
+    key = _category_key(category_id)
+    _discover_categories(c)
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    mappings = [
+        m for m in _db_get_mappings()
+        if _mapping_category_key(m) == key
+    ]
+    percent = profile.get("markup_percent")
+    fixed = profile.get("markup_fixed")
+    global_percent = cfg["settings"].get("markup_percent", 0)
+    global_fixed = cfg["settings"].get("markup_fixed", 0)
+
+    def _markup_line(value: object, global_value: object, unit: str) -> str:
+        if value in (None, ""):
+            return f"<i>общая {global_value}{unit}</i>"
+        return f"<b>{value}{unit}</b>"
+
+    overrides = [
+        label for field, label in _CATEGORY_TEMPLATE_LABELS.items()
+        if profile.get(field)
+    ]
+    text = (
+        f"🗂 <b>{_esc(profile.get('name') or f'Категория FunPay {key}')}</b>\n"
+        f"<code>{_esc(key)}</code>\n\n"
+        f"<blockquote>🔗 Привязок: <b>{len(mappings)}</b>\n"
+        f"📈 Наценка: {_markup_line(percent, global_percent, '%')} + "
+        f"{_markup_line(fixed, global_fixed, '₽')}\n"
+        f"💬 Свои тексты: "
+        f"{_esc(', '.join(overrides)) if overrides else '<i>нет, используются общие</i>'}"
+        "</blockquote>\n\n"
+        "<i>Индивидуальные настройки конкретной привязки всегда имеют приоритет.</i>"
+    )
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(_inline_button(
+        "💰 Наценка",
+        callback_data=f"{CB_PREFIX}:category_markup:{key}",
+    ))
+    for field, label in _CATEGORY_TEMPLATE_LABELS.items():
+        kb.add(_inline_button(
+            label,
+            callback_data=f"{CB_PREFIX}:category_template:{key}|{field}",
+        ))
+    kb.add(_inline_button(
+        "🔙 Категории",
+        callback_data=f"{CB_PREFIX}:categories",
+    ), _inline_button(
+        "🏠 Меню",
+        callback_data=f"{CB_PREFIX}:menu",
+    ))
+    _send_or_edit(c, call, text, kb=kb)
+
+
+def _category_markup_prompt(c: "Cardinal", call: Any, category_id: str) -> None:
+    key = _category_key(category_id)
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    set_state(call.from_user.id, "category_markup_edit", {"category_id": key})
+    kb = InlineKeyboardMarkup(row_width=1)
+    if profile.get("markup_percent") not in (None, "") or \
+            profile.get("markup_fixed") not in (None, ""):
+        kb.add(_inline_button(
+            "↩️ Вернуть общую наценку",
+            callback_data=f"{CB_PREFIX}:category_markup_reset:{key}",
+        ))
+    kb.add(_inline_button(
+        "🔙 Категория",
+        callback_data=f"{CB_PREFIX}:category_open:{key}",
+    ))
+    _send_or_edit(
+        c, call,
+        f"💰 <b>Наценка категории</b>\n"
+        f"{_esc(profile.get('name') or key)}\n\n"
+        "Отправьте процент и фикс через пробел, например <code>20 10</code>.\n"
+        "Можно отправить только процент. Значение <code>0</code> — явный ноль.\n"
+        "<code>-</code> — наследовать общую наценку.",
+        kb=kb,
+    )
+
+
+def _category_markup_reset(c: "Cardinal", call: Any, category_id: str) -> None:
+    key = _category_key(category_id)
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    profile.pop("markup_percent", None)
+    profile.pop("markup_fixed", None)
+    profiles = _category_profiles(cfg)
+    profiles[key] = profile
+    cfg["category_profiles"] = profiles
+    save_config(cfg)
+    clear_state(getattr(getattr(call, "from_user", None), "id", None))
+    _submit_task(
+        _sync_category_prices_after_setting_change,
+        c, cfg, key,
+        task_key=f"price-sync:category:{key}:{time.time_ns()}",
+    )
+    _category_open(c, call, key)
+
+
+def _step_category_markup_edit(
+    c: "Cardinal",
+    message: Any,
+    state: Dict[str, Any],
+) -> None:
+    key = _category_key(state["data"].get("category_id"))
+    percent, fixed, error = _parse_markup_input(message.text or "")
+    if error:
+        _send_telegram_message(c, message.chat.id, f"❌ {error}", reply_to=message)
+        return
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    if percent is None:
+        profile.pop("markup_percent", None)
+    else:
+        profile["markup_percent"] = float(percent)
+    if fixed is not _KEEP:
+        if fixed is None:
+            profile.pop("markup_fixed", None)
+        else:
+            profile["markup_fixed"] = float(fixed)
+    profiles = _category_profiles(cfg)
+    profiles[key] = profile
+    cfg["category_profiles"] = profiles
+    save_config(cfg)
+    clear_state(message.from_user.id)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button(
+        "🔙 Категория",
+        callback_data=f"{CB_PREFIX}:category_open:{key}",
+    ))
+    _send_telegram_message(
+        c, message.chat.id, "✅ Наценка категории сохранена.", kb=kb)
+    _submit_task(
+        _sync_category_prices_after_setting_change,
+        c, cfg, key,
+        task_key=f"price-sync:category:{key}:{time.time_ns()}",
+    )
+
+
+def _category_template_prompt(c: "Cardinal", call: Any, arg: str) -> None:
+    category_id, separator, field = arg.partition("|")
+    key = _category_key(category_id)
+    if not separator or field not in _CATEGORY_TEMPLATE_LABELS:
+        _send_or_edit(c, call, "❌ <b>Неизвестное поле категории.</b>")
+        return
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    current = str(profile.get(field) or "")
+    global_key = _CATEGORY_TEMPLATE_KEYS[field]
+    inherited = str(cfg["templates"].get(global_key) or "")
+    set_state(
+        call.from_user.id,
+        "category_template_edit",
+        {"category_id": key, "field": field},
+    )
+    _send_or_edit(
+        c, call,
+        f"{_CATEGORY_TEMPLATE_LABELS[field]} <b>для категории</b>\n"
+        f"{_esc(profile.get('name') or key)}\n\n"
+        + (
+            f"<blockquote><b>Свой текст:</b>\n{_esc(current)}</blockquote>\n"
+            if current else
+            f"<blockquote><b>Сейчас наследуется общий:</b>\n"
+            f"{_esc(inherited or '(пусто)')}</blockquote>\n"
+        )
+        + "Отправьте новый текст или <code>-</code>, чтобы наследовать общий.",
+        kb=_cancel_kb(),
+    )
+
+
+def _step_category_template_edit(
+    c: "Cardinal",
+    message: Any,
+    state: Dict[str, Any],
+) -> None:
+    key = _category_key(state["data"].get("category_id"))
+    field = str(state["data"].get("field") or "")
+    if field not in _CATEGORY_TEMPLATE_LABELS:
+        clear_state(message.from_user.id)
+        _send_telegram_message(c, message.chat.id, "❌ Ошибка состояния.")
+        return
+    raw = (message.text or "").strip()
+    if raw != "-" and not raw:
+        _send_telegram_message(c, message.chat.id, "❌ Текст не может быть пустым.")
+        return
+    if field == "ask_template" and raw != "-" and "{prompt}" not in raw:
+        _send_telegram_message(
+            c, message.chat.id,
+            "❌ Добавьте <code>{prompt}</code> — сюда подставляется название поля.",
+            reply_to=message,
+        )
+        return
+    cfg = load_config()
+    profile = _category_profile_by_id(cfg, key)
+    if raw == "-":
+        profile.pop(field, None)
+    else:
+        profile[field] = raw[:4000]
+    profiles = _category_profiles(cfg)
+    profiles[key] = profile
+    cfg["category_profiles"] = profiles
+    save_config(cfg)
+    clear_state(message.from_user.id)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(_inline_button(
+        "🔙 Категория",
+        callback_data=f"{CB_PREFIX}:category_open:{key}",
+    ))
+    _send_telegram_message(
+        c, message.chat.id,
+        "✅ Текст категории сброшен на общий."
+        if raw == "-" else "✅ Текст категории сохранён.",
+        kb=kb,
+    )
+
+
 def _settings_root(cfg: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     s = cfg["settings"]
     masked = _mask_api_key(cfg.get("api_key", ""))
@@ -18162,6 +18884,7 @@ def _settings_root(cfg: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
            _inline_button("🔑 API-ключ", callback_data=f"{CB_PREFIX}:apikey"))
     kb.add(_inline_button("💰 Цены и наценка", callback_data=f"{CB_PREFIX}:settings_sec:price"),
            _inline_button("🛡 Проверки", callback_data=f"{CB_PREFIX}:settings_sec:checks"))
+    kb.add(_inline_button("🗂 Категории FunPay", callback_data=f"{CB_PREFIX}:categories"))
     kb.add(_inline_button("⏱ Тайминги", callback_data=f"{CB_PREFIX}:settings_sec:timing"),
            _inline_button("🔌 Интеграции", callback_data=f"{CB_PREFIX}:settings_sec:integr"))
     kb.add(_inline_button("📝 Шаблоны сообщений", callback_data=f"{CB_PREFIX}:settings_sec:tpl"))
@@ -19375,7 +20098,7 @@ def init_plugin(c: "Cardinal") -> None:
     _migrate_legacy_config()
     _migrate_legacy_processed()
 
-    load_config()
+    cfg = load_config()
     _load_metrics()
 
     _start_executor()
@@ -19560,6 +20283,37 @@ def _run_smoke_tests() -> None:
             pass
         print("_coerce_metadata_against_offer OK")
 
+        _ml_mapping = {
+            "fzr_sku_id": "topups:mobile_legends_ru:35_diamonds",
+        }
+        assert _parse_mobile_legends_combined_id(
+            _ml_mapping, "2237306259 (6652)"
+        ) == ("2237306259", "6652")
+        assert _parse_mobile_legends_combined_id(
+            {"fzr_sku_id": "topups:mobile_legends_ru:5_diamonds"},
+            "1(22)",
+        ) == ("1", "22")
+        assert _parse_mobile_legends_combined_id(
+            {"fzr_sku_id": "topups:mobile_legends_ru:1000_diamonds"},
+            "  123456789012345   (  7  ) ",
+        ) == ("123456789012345", "7")
+        assert _parse_mobile_legends_combined_id(
+            _ml_mapping, "2237306259 6652"
+        ) is None
+        assert _parse_mobile_legends_combined_id(
+            {"fzr_sku_id": "topups:other_game:35_diamonds"},
+            "2237306259 (6652)",
+        ) is None
+        _player_field, _server_field = _mobile_legends_metadata_fields([
+            {"key": "user_id", "label": "ID игрока"},
+            {"key": "zone_id", "label": "ID сервера"},
+        ])
+        assert _player_field and _player_field["key"] == "user_id"
+        assert _server_field and _server_field["key"] == "zone_id"
+        assert _validate_metadata_value(
+            "user_id", "2237306259", "player_id") is None
+        print("Mobile Legends combined ID parsing OK")
+
         # --- v3.1: quantity для topups через несколько заказов ---
         assert not _kind_supports_quantity("topups")
         assert not _kind_supports_quantity("manual-services")
@@ -19679,6 +20433,40 @@ def _run_smoke_tests() -> None:
         _bd = _markup_breakdown("2", {"markup_percent": 5}, _cfg_m)
         assert _bd["price_rub"] == 189.0 and _bd["rate"] == 90.0, _bd
         print("_apply_markup / _markup_breakdown OK")
+
+        # category profiles: mapping > category > global
+        _cat_cfg = create_default_config()
+        _cat_cfg["settings"]["exchange_rate"] = 100.0
+        _cat_cfg["settings"]["markup_percent"] = 10.0
+        _cat_cfg["settings"]["markup_fixed"] = 1.0
+        _cat_cfg["templates"]["greeting"] = "global {sku_name}"
+        _cat_cfg["category_profiles"] = {
+            "77": {
+                "subcategory_id": "77",
+                "name": "Mobile Legends",
+                "markup_percent": 25.0,
+                "markup_fixed": 5.0,
+                "greeting_template": "category {sku_name}",
+            },
+        }
+        _cat_mapping = {"funpay_subcategory_id": 77}
+        assert _markup_effective(_cat_mapping, _cat_cfg, "markup_percent") == 25.0
+        assert _markup_effective(_cat_mapping, _cat_cfg, "markup_fixed") == 5.0
+        assert _apply_markup(1.0, _cat_mapping, _cat_cfg) == 130.0
+        assert _effective_template(
+            _cat_cfg, _cat_mapping, "greeting_template"
+        ) == "category {sku_name}"
+        _set_markup_value(_cat_mapping, "markup_percent", 18.0)
+        _cat_mapping["greeting_template"] = "mapping {sku_name}"
+        _cat_cfg["settings"]["markup_percent"] = 40.0
+        assert _markup_effective(_cat_mapping, _cat_cfg, "markup_percent") == 18.0
+        assert _effective_template(
+            _cat_cfg, _cat_mapping, "greeting_template"
+        ) == "mapping {sku_name}"
+        assert _markup_effective({}, _cat_cfg, "markup_percent") == 40.0
+        save_config(_cat_cfg)
+        assert _category_profiles(load_config())["77"]["markup_percent"] == 25.0
+        print("category profile precedence / persistence OK")
 
         # --- v3.1: проверка Player ID ---
         class _VidAPI:
@@ -20243,13 +21031,15 @@ def _run_smoke_tests() -> None:
             _cfg_sync = create_default_config()
             _cfg_sync["api_key"] = "k"
             _cfg_sync["settings"]["exchange_rate"] = 100.0
+            _cfg_sync["settings"]["markup_percent"] = 40.0
             _cardinal = _PriceCardinal()
             _report = _sync_lot_prices(_cardinal, _cfg_sync, force=True)
             assert len(_report["changed"]) == 1, _report
             assert _report["changed"][0]["old"] == 150.0
-            assert _report["changed"][0]["new"] == 100.0
+            assert _report["changed"][0]["new"] == 140.0
+            assert "40%" in _report["changed"][0]["markup_source"]
             assert _cardinal.account.calls == 1
-            assert _saved_mappings[-1]["last_lot_price"] == 100.0
+            assert _saved_mappings[-1]["last_lot_price"] == 140.0
         finally:
             globals()["_db_get_mappings"] = _orig_get_maps
             globals()["get_fzr_client"] = _orig_get_client
@@ -20474,6 +21264,46 @@ def _run_smoke_tests() -> None:
         assert _clean["api_key"] == "k"
         assert len(_warns) >= 3, _warns
         print("_validate_import_settings OK")
+
+        _profile_export_cfg = create_default_config()
+        _profile_export_cfg["category_profiles"] = {
+            "77": {
+                "subcategory_id": "77",
+                "name": "Mobile Legends",
+                "markup_percent": 30.0,
+                "ask_template": "{prompt}",
+            },
+        }
+        _profile_payload = _export_settings_payload(_profile_export_cfg)
+        assert _profile_payload["category_profiles"]["77"]["markup_percent"] == 30.0
+        _profile_clean, _profile_warns = _validate_import_settings({
+            "category_profiles": {
+                "77": {
+                    "subcategory_id": 77,
+                    "name": "Mobile Legends",
+                    "markup_percent": "35",
+                    "markup_fixed": 0,
+                    "ask_template": "Введите {prompt}",
+                },
+                "bad": {"markup_percent": "not-a-number"},
+            },
+        })
+        assert _profile_clean["category_profiles"]["77"]["markup_percent"] == 35.0
+        assert _profile_clean["category_profiles"]["77"]["markup_fixed"] == 0.0
+        assert _profile_warns
+        _existing_cfg = create_default_config()
+        _existing_cfg["category_profiles"] = {
+            "88": {"subcategory_id": "88", "name": "Existing"},
+        }
+        save_config(_existing_cfg)
+        _apply_import({
+            "kind": _EXPORT_KIND_SETTINGS,
+            "settings": _profile_clean,
+        })
+        _imported_profiles = _category_profiles(load_config())
+        assert "88" in _imported_profiles
+        assert _imported_profiles["77"]["markup_percent"] == 35.0
+        print("category profile export / import OK")
 
         # валидация привязок: SKU обязателен, id генерируем, дубли расшиваем
         _maps, _mw = _validate_import_mappings([
@@ -21786,7 +22616,9 @@ def _run_smoke_tests() -> None:
         assert {
             "catalog", "mapping_open", "settings_edit", "order_view",
             "export", "mappings", "price_sync_now", "create_lot",
-            "metrics", "import_apply",
+            "metrics", "import_apply", "categories", "categories_refresh",
+            "category_open", "category_markup", "category_markup_reset",
+            "category_template",
         }.issubset(
             set(_CALLBACK_ARG_HANDLERS)
             | set(_CALLBACK_NOARG_HANDLERS)
